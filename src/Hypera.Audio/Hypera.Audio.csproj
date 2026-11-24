@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Hypera.Core\Hypera.Core.csproj" />
+  </ItemGroup>
+</Project>

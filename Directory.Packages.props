@@ -1,0 +1,16 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="SkiaSharp" Version="4.157.0" />
+    <PackageVersion Include="HarfBuzzSharp" Version="14.4.0.200" />
+    <PackageVersion Include="SkiaSharp.HarfBuzz" Version="4.157.0" />
+    <PackageVersion Include="SkiaSharp.Views.WindowsForms" Version="4.157.0" />
+    <PackageVersion Include="SkiaSharp.Views.WPF" Version="4.157.0" />
+    <PackageVersion Include="System.Text.Encoding.CodePages" Version="10.0.15" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+</Project>

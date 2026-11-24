@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Hypera.Audio/Hypera.Audio.csproj" />
+    <Project Path="src/Hypera.Cli/Hypera.Cli.csproj" />
+    <Project Path="src/Hypera.Core/Hypera.Core.csproj" />
+    <Project Path="src/Hypera.LegacyPluginShim/Hypera.LegacyPluginShim.csproj" />
+    <Project Path="src/Hypera.Views.WinForms/Hypera.Views.WinForms.csproj" />
+    <Project Path="src/Hypera.Views.Wpf/Hypera.Views.Wpf.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Hypera.Tests/Hypera.Tests.csproj" />
+  </Folder>
+</Solution>
