@@ -1,6 +1,7 @@
 using System.Data;
 using System.Drawing;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using Hypera.Rendering;
 using Hypera.Runtime;
 
@@ -78,17 +79,24 @@ public class PluginAPICharContext
 /// Binary-compatible Emuera <see cref="PluginManager"/> shim routed via <see cref="AsyncLocal{T}"/>
 /// so legacy plugins calling <c>PluginManager.GetInstance()</c> stay 100% isolated per <see cref="EmueraEngine"/>.
 /// </summary>
-public sealed class PluginManager : IDisposable
+public sealed class PluginManager : ISharpPluginHost, IDisposable
 {
     private static readonly AsyncLocal<PluginManager?> CurrentAmbient = new();
 
     private readonly EmueraEngine? _engine;
     private readonly Dictionary<string, IPluginMethod> _methods;
     private readonly List<PluginAssemblyLoadContext> _loadContexts = [];
+    private Action<string>? _executeLineHandler;
+    private bool _disposed;
 
-    public PluginManager(EmueraEngine? engine = null)
+    public PluginManager(EmueraEngine? engine = null, Action<string>? executeLineHandler = null)
     {
         _engine = engine;
+        _executeLineHandler = executeLineHandler;
+        CurrentFontName = engine?.Options.FontName ?? "MS Gothic";
+        CurrentBackgroundColorRgba = engine?.Options.BackColorRgba ?? 0x000000FFu;
+        CurrentForegroundColorRgba = engine?.Options.ForeColorRgba ?? 0xC0C0C0FFu;
+
         bool ignoreCase = engine?.Module.CompilerOptions.IgnoreCase ?? true;
         _methods = new Dictionary<string, IPluginMethod>(
             ignoreCase ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
@@ -164,8 +172,23 @@ public sealed class PluginManager : IDisposable
             "No ambient PluginManager is bound to the current async execution flow. Use PluginManager.EnterScope().");
 
     public EmueraEngine? BoundEngine => _engine;
+    public string? PluginsDirectory { get; set; }
+    public string CurrentFontName { get; private set; }
+    public uint CurrentBackgroundColorRgba { get; private set; }
+    public uint CurrentForegroundColorRgba { get; private set; }
+    public Point CurrentMousePosition { get; set; } = Point.Empty;
+    public bool QuitRequested { get; private set; }
+    public bool ForceQuitRequested { get; private set; }
+    public bool TimerForceStopped { get; private set; }
+    public int LoadedAssemblyCount => _loadContexts.Count;
 
-    public AmbientScope EnterScope() => new(this);
+    public void SetExecuteLineHandler(Action<string>? handler) => _executeLineHandler = handler;
+
+    public AmbientScope EnterScope()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return new AmbientScope(this);
+    }
 
     public readonly struct AmbientScope : IDisposable
     {
@@ -183,42 +206,70 @@ public sealed class PluginManager : IDisposable
     public static PluginAPICharContext CreateCharContext(long charId) =>
         new(GetInstance()._engine, charId);
 
-    public void LoadPluginsFromDirectory(string pluginsDirectory)
+    public void LoadPlugins()
     {
-        _methods.Clear();
+        string dir = PluginsDirectory
+            ?? (!string.IsNullOrWhiteSpace(_engine?.FileSystem.RootDescription) && Directory.Exists(_engine.FileSystem.RootDescription)
+                ? Path.Combine(_engine.FileSystem.RootDescription, "Plugins")
+                : Path.Combine(AppContext.BaseDirectory, "Plugins"));
+        LoadPluginsFromDirectory(dir);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public IReadOnlyList<WeakReference> LoadPluginsFromDirectory(string pluginsDirectory)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        UnloadPlugins();
+
         if (!Directory.Exists(pluginsDirectory))
         {
-            return;
+            return [];
         }
 
+        var weakRefs = new List<WeakReference>();
         foreach (string dllPath in Directory.GetFiles(pluginsDirectory, "*.dll"))
         {
             string fullPath = Path.GetFullPath(dllPath);
             var alc = new PluginAssemblyLoadContext(fullPath);
-            _loadContexts.Add(alc);
+            weakRefs.Add(new WeakReference(alc, trackResurrection: true));
 
-            Assembly pluginAssembly = alc.LoadFromAssemblyPath(fullPath);
-            Type? manifestType = pluginAssembly
-                .GetTypes()
-                .FirstOrDefault(static t => t.Name == "PluginManifest" && typeof(PluginManifestAbstract).IsAssignableFrom(t));
+            Assembly pluginAssembly = alc.LoadAssemblyUnlocked(fullPath);
+            Type[] types = pluginAssembly.GetTypes();
+            Type? manifestType =
+                types.FirstOrDefault(static t => t.Name == "PluginManifest" && typeof(PluginManifestAbstract).IsAssignableFrom(t) && !t.IsAbstract)
+                ?? types.FirstOrDefault(static t => typeof(PluginManifestAbstract).IsAssignableFrom(t) && !t.IsAbstract);
 
-            if (manifestType is null)
+            if (manifestType is null || Activator.CreateInstance(manifestType) is not PluginManifestAbstract manifest)
             {
+                alc.Unload();
                 continue;
             }
 
-            if (Activator.CreateInstance(manifestType) is PluginManifestAbstract manifest)
+            _loadContexts.Add(alc);
+            foreach (IPluginMethod method in manifest.GetPluginMethods())
             {
-                foreach (IPluginMethod method in manifest.GetPluginMethods())
-                {
-                    _methods[method.Name] = method;
-                }
+                _methods[method.Name] = method;
             }
         }
+
+        return weakRefs;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public void UnloadPlugins()
+    {
+        _methods.Clear();
+        foreach (PluginAssemblyLoadContext alc in _loadContexts)
+        {
+            alc.Unload();
+        }
+
+        _loadContexts.Clear();
     }
 
     public void RegisterMethod(IPluginMethod method)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(method);
         _methods[method.Name] = method;
     }
@@ -227,38 +278,177 @@ public sealed class PluginManager : IDisposable
 
     public bool HasMethod(string name) => _methods.ContainsKey(name);
 
-    public void ExecuteLine(string line) =>
-        throw new NotSupportedException("ExecuteLine dynamic fallback requires Wave 2 script compiler/evaluator integration.");
+    /// <summary>
+    /// Executes a registered <see cref="IPluginMethod"/> inside an <see cref="EnterScope"/> binding
+    /// and writes mutated <see cref="PluginMethodParameter"/> values back to caller arguments.
+    /// </summary>
+    public PluginMethodParameter[] InvokeMethod(string name, IReadOnlyList<PluginCallArgument> arguments)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(arguments);
+
+        if (!_methods.TryGetValue(name, out IPluginMethod? method))
+        {
+            throw new KeyNotFoundException($"CALLSHARP plugin method '{name}' is not registered.");
+        }
+
+        var parameters = new PluginMethodParameter[arguments.Count];
+        for (int i = 0; i < arguments.Count; i++)
+        {
+            parameters[i] = arguments[i].CreateParameter();
+        }
+
+        using (EnterScope())
+        {
+            method.Execute(parameters);
+        }
+
+        for (int i = 0; i < arguments.Count; i++)
+        {
+            arguments[i].WriteBack(parameters[i]);
+        }
+
+        return parameters;
+    }
+
+    /// <summary>
+    /// Executes a registered <see cref="IPluginMethod"/> directly with <see cref="PluginMethodParameter"/>s
+    /// inside an <see cref="EnterScope"/> binding.
+    /// </summary>
+    public void InvokeMethod(string name, PluginMethodParameter[] parameters)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(parameters);
+
+        if (!_methods.TryGetValue(name, out IPluginMethod? method))
+        {
+            throw new KeyNotFoundException($"CALLSHARP plugin method '{name}' is not registered.");
+        }
+
+        using (EnterScope())
+        {
+            method.Execute(parameters);
+        }
+    }
+
+    void ISharpPluginHost.Invoke(string methodName, SharpPluginArgument[] arguments)
+    {
+        var parameters = new PluginMethodParameter[arguments.Length];
+        for (int i = 0; i < arguments.Length; i++)
+        {
+            parameters[i] = arguments[i].IsString
+                ? new PluginMethodParameter(arguments[i].StrValue)
+                : new PluginMethodParameter(arguments[i].IntValue);
+        }
+
+        InvokeMethod(methodName, parameters);
+    }
+
+    public void ExecuteLine(string line)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_executeLineHandler is not null)
+        {
+            _executeLineHandler(line);
+            return;
+        }
+
+        throw new NotSupportedException("ExecuteLine dynamic fallback requires an active script evaluator handler.");
+    }
 
     public void Print(string text) => AppendText(text);
-    public void PrintError(string text) => AppendText(text);
+    public void PrintError(string text) => AppendText(text, colorOverride: 0xFF4040FFu);
     public void PrintC(string text, bool aligmentRight = false) => AppendText(text);
     public void PrintPlain(string text) => AppendText(text);
     public void PrintPlainWithSingleLine(string text) => AppendText(text);
-    public void PrintSingleLine(string text) => AppendText(text);
-    public void PrintSystemLine(string text) => AppendText(text);
-    public void PrintTemporaryLine(string text) => AppendText(text);
+    public void PrintSingleLine(string text)
+    {
+        AppendText(text);
+        PrintNewLine();
+    }
+
+    public void PrintSystemLine(string text)
+    {
+        AppendText(text);
+        PrintNewLine();
+    }
+
+    public void PrintTemporaryLine(string text)
+    {
+        AppendText(text);
+        PrintNewLine();
+    }
+
     public void PrintButton(string text, long id) =>
-        _engine?.AppendDisplayOperation(new DisplayOperation(DisplayOperationKind.PrintButtonSpan, default, text, ButtonIntValue: id));
+        _engine?.AppendDisplayOperation(new DisplayOperation(
+            DisplayOperationKind.PrintButtonSpan,
+            default,
+            text,
+            ColorRgba: CurrentForegroundColorRgba,
+            FontFamily: CurrentFontName,
+            FontSize: _engine?.Options.FontSize ?? 18,
+            ButtonIntValue: id));
+
     public void PrintButtonC(string text, long id, bool aligmentRight = false) => PrintButton(text, id);
-    public void PrintBar(string text = "", bool isConst = true) => AppendText(string.IsNullOrEmpty(text) ? "----------------" : text);
+
+    public void PrintBar(string text = "", bool isConst = true) =>
+        _engine?.AppendDisplayOperation(new DisplayOperation(
+            DisplayOperationKind.DrawLineRule,
+            default,
+            string.IsNullOrEmpty(text) ? "----------------" : text,
+            ColorRgba: CurrentForegroundColorRgba,
+            FontFamily: CurrentFontName,
+            FontSize: _engine?.Options.FontSize ?? 18));
+
     public void PrintHtml(string htmlText, bool toBuffer = false) => AppendText(htmlText);
+
     public void PrintImage(string resourceName, int width, int height, int y, string? buttonResourceName = null, string? mapResourceName = null) =>
-        _engine?.AppendDisplayOperation(new DisplayOperation(DisplayOperationKind.DrawSprite, new LogicalRect(0, y, width, height), ResourceKey: resourceName));
+        _engine?.AppendDisplayOperation(new DisplayOperation(
+            DisplayOperationKind.DrawSprite,
+            new LogicalRect(0, y, width, height),
+            ResourceKey: resourceName));
+
     public void PrintNewLine() =>
         _engine?.AppendDisplayOperation(new DisplayOperation(DisplayOperationKind.NewLine, default));
-    public void FlushConsole(bool force = false) { }
-    public void DebugPrint(string text) { }
+
+    public void FlushConsole(bool force = false) => _engine?.CaptureSnapshot();
+    public void DebugPrint(string text) => System.Diagnostics.Debug.WriteLine(text);
+
     public void ClearDisplay() =>
         _engine?.AppendDisplayOperation(new DisplayOperation(DisplayOperationKind.ClearAll, default));
-    public void SetBgColor(Color color) { }
-    public void SetFont(string fontName) { }
-    public Point GetMousePosition() => Point.Empty;
-    public void WaitInput(bool oneInput = true, int timelimit = -1) { }
-    public void ReadAnyKey() { }
-    public void Await(int time) { }
-    public void ForceStopTimer() { }
-    public void Quit(bool force = false) { }
+
+    public void SetBgColor(Color color) =>
+        CurrentBackgroundColorRgba = ((uint)color.R << 24) | ((uint)color.G << 16) | ((uint)color.B << 8) | color.A;
+
+    public void SetFont(string fontName)
+    {
+        if (!string.IsNullOrWhiteSpace(fontName))
+        {
+            CurrentFontName = fontName;
+        }
+    }
+
+    public Point GetMousePosition() => CurrentMousePosition;
+
+    public void WaitInput(bool oneInput = true, int timelimit = -1)
+    {
+        _engine?.CaptureSnapshot();
+    }
+
+    public void ReadAnyKey() => _engine?.CaptureSnapshot();
+    public void Await(int time) => _engine?.CaptureSnapshot();
+    public void ForceStopTimer() => TimerForceStopped = true;
+
+    public void Quit(bool force = false)
+    {
+        QuitRequested = true;
+        if (force)
+        {
+            ForceQuitRequested = true;
+        }
+    }
 
     public long[] GetCharacterIDs()
     {
@@ -331,18 +521,30 @@ public sealed class PluginManager : IDisposable
     public IEnumerable<string> GetStackTrace() =>
         _engine?.GetSourceStackTrace().Select(static loc => $"{loc.DisplayName}:{loc.LineNo}") ?? [];
 
-    private void AppendText(string text) =>
-        _engine?.AppendDisplayOperation(new DisplayOperation(DisplayOperationKind.PrintTextSpan, default, text));
+    private void AppendText(string text, uint? colorOverride = null) =>
+        _engine?.AppendDisplayOperation(new DisplayOperation(
+            DisplayOperationKind.PrintTextSpan,
+            default,
+            text,
+            ColorRgba: colorOverride ?? CurrentForegroundColorRgba,
+            FontFamily: CurrentFontName,
+            FontSize: _engine?.Options.FontSize ?? 18));
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
     public void Dispose()
     {
-        _methods.Clear();
-        foreach (PluginAssemblyLoadContext alc in _loadContexts)
+        if (_disposed)
         {
-            alc.Unload();
+            return;
         }
 
-        _loadContexts.Clear();
+        UnloadPlugins();
+        if (ReferenceEquals(CurrentAmbient.Value, this))
+        {
+            CurrentAmbient.Value = null;
+        }
+
+        _disposed = true;
     }
 
     public GlobalInt1dWrapper DAY;

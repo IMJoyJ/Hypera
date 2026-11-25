@@ -111,7 +111,7 @@ public sealed class EncodingDetector : IEncodingDetector
     private static int ScoreShiftJisKanaAndLeadBytes(ReadOnlySpan<byte> data)
     {
         int score = 0;
-        for (int i = 0; i < data.Length - 1; i++)
+        for (int i = 0; i < data.Length; i++)
         {
             byte b0 = data[i];
             if (b0 < 0x80)
@@ -119,17 +119,65 @@ public sealed class EncodingDetector : IEncodingDetector
                 continue;
             }
 
-            byte b1 = data[i + 1];
-            if ((b0 == 0x82 && b1 is >= 0x9F and <= 0xF1) || (b0 == 0x83 && b1 is >= 0x40 and <= 0x96))
+            // GB18030 4-byte sequence: 0x81..0xFE, 0x30..0x39, 0x81..0xFE, 0x30..0x39
+            if (i + 3 < data.Length &&
+                b0 is >= 0x81 and <= 0xFE &&
+                data[i + 1] is >= 0x30 and <= 0x39 &&
+                data[i + 2] is >= 0x81 and <= 0xFE &&
+                data[i + 3] is >= 0x30 and <= 0x39)
             {
-                score += 3;
+                score -= 5;
+                i += 3;
+                continue;
+            }
+
+            if (i + 1 >= data.Length)
+            {
+                break;
+            }
+
+            byte b1 = data[i + 1];
+
+            // Shift-JIS Hiragana (0x829F..0x82F1) and Katakana (0x8340..0x8396)
+            if ((b0 == 0x82 && b1 is >= 0x9F and <= 0xF1) ||
+                (b0 == 0x83 && b1 is >= 0x40 and <= 0x96))
+            {
+                score += 4;
                 i++;
                 continue;
             }
 
-            if (b0 is >= 0xB0 and <= 0xDF && b1 is >= 0xA1 and <= 0xFE)
+            // Shift-JIS common punctuation & fullwidth ASCII (0x8140..0x81AC, 0x824F..0x829A)
+            if ((b0 == 0x81 && b1 is >= 0x40 and <= 0xAC && b1 != 0x7F) ||
+                (b0 == 0x82 && b1 is >= 0x4F and <= 0x9A && b1 != 0x7F))
+            {
+                score += 2;
+                i++;
+                continue;
+            }
+
+            // GB2312/GB18030 Level 1 Simplified Chinese Hanzi (0xB0..0xD7, 0xA1..0xFE)
+            // and GB2312 punctuation (0xA1..0xA9, 0xA1..0xFE)
+            if ((b0 is >= 0xB0 and <= 0xD7 && b1 is >= 0xA1 and <= 0xFE) ||
+                (b0 is >= 0xA1 and <= 0xA9 && b1 is >= 0xA1 and <= 0xFE))
+            {
+                score -= 3;
+                i++;
+                continue;
+            }
+
+            // GB2312 Level 2 Hanzi (0xD8..0xF7, 0xA1..0xFE)
+            if (b0 is >= 0xD8 and <= 0xDF && b1 is >= 0xA1 and <= 0xFE)
             {
                 score -= 2;
+                i++;
+                continue;
+            }
+
+            // Shift-JIS lead bytes with trail byte in 0x40..0x7E (less common in GB2312)
+            if (b0 is (>= 0x88 and <= 0x9F) or (>= 0xE0 and <= 0xEA) && b1 is >= 0x40 and <= 0x7E)
+            {
+                score += 1;
                 i++;
                 continue;
             }

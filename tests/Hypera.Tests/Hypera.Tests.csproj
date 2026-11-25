@@ -15,5 +15,6 @@
     <ProjectReference Include="..\..\src\Hypera.Core\Hypera.Core.csproj" />
     <ProjectReference Include="..\..\src\Hypera.Audio\Hypera.Audio.csproj" />
     <ProjectReference Include="..\..\src\Hypera.LegacyPluginShim\Hypera.LegacyPluginShim.csproj" />
+    <ProjectReference Include="..\..\src\Hypera.Cli\Hypera.Cli.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 </Project>

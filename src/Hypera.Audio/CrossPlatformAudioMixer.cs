@@ -13,163 +13,119 @@ public interface IAudioDeviceSink : IDisposable
 }
 
 /// <summary>
-/// Cross-platform 10 SE + 1 looping BGM software mixer skeleton backed by an instance-scoped <see cref="IVirtualFileSystem"/>.
-/// Supports WAV/MP3/OGG/FLAC/M4A asset resolution and thread-safe channel state management.
+/// Cross-platform 10 SE + 1 looping BGM software mixer backed by an instance-scoped <see cref="IVirtualFileSystem"/>.
+/// Supports WAV PCM decoding, ring-buffer SE allocation, unlocked VFS reads, and pluggable <see cref="IAudioOutputSink"/>.
 /// </summary>
-public sealed class CrossPlatformAudioMixer : IAudioBackend
+public sealed class CrossPlatformAudioMixer : IAudioBackend, IAudioDeviceSink
 {
-    private readonly IVirtualFileSystem? _vfs;
-    private readonly Lock _sync = new();
-    private readonly AudioChannelSnapshot[] _seChannels = new AudioChannelSnapshot[IAudioBackend.SoundEffectChannelCount];
-    private AudioChannelSnapshot _bgmChannel = new(false, null, IAudioBackend.MaxVolume, false);
-    private int _masterVolume = IAudioBackend.MaxVolume;
+    private readonly MixingAudioEngine _engine;
     private bool _disposed;
 
-    public CrossPlatformAudioMixer(IVirtualFileSystem? vfs = null, int sampleRate = 48_000)
+    public CrossPlatformAudioMixer(
+        IVirtualFileSystem? vfs = null,
+        int sampleRate = 48_000,
+        IAudioOutputSink? outputSink = null,
+        IEnumerable<IAudioStreamDecoder>? extraDecoders = null)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sampleRate);
-        _vfs = vfs;
-        SampleRate = sampleRate;
-        for (int i = 0; i < _seChannels.Length; i++)
-        {
-            _seChannels[i] = new AudioChannelSnapshot(false, null, IAudioBackend.MaxVolume, false);
-        }
+        _engine = new MixingAudioEngine(vfs, sampleRate, outputSink, extraDecoders);
     }
 
-    public int SampleRate { get; }
+    public int SampleRate => _engine.SampleRate;
+    public int Channels => _engine.OutputSink.Channels;
+    public IAudioOutputSink OutputSink => _engine.OutputSink;
+    public MixingAudioEngine Engine => _engine;
 
     public int MasterVolume
     {
-        get { lock (_sync) { return _masterVolume; } }
-        set { lock (_sync) { _masterVolume = NullAudioBackend.ClampVolume(value); } }
+        get => _engine.MasterVolume;
+        set => _engine.MasterVolume = value;
+    }
+
+    public int SoundEffectMasterVolume
+    {
+        get => _engine.SoundEffectMasterVolume;
+        set => _engine.SoundEffectMasterVolume = value;
+    }
+
+    public bool ExistSound(string? virtualPathOrName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _engine.ExistSound(virtualPathOrName);
+    }
+
+    public int PlaySoundEffectRing(string virtualPath, int volume = IAudioBackend.MaxVolume, bool loop = false)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _engine.PlaySoundEffectRing(virtualPath, volume, loop);
     }
 
     public void PlaySoundEffect(int channelIndex, string virtualPath, int volume = IAudioBackend.MaxVolume, bool loop = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        ValidateChannel(channelIndex);
-        ArgumentException.ThrowIfNullOrWhiteSpace(virtualPath);
-
-        string normalized = VfsPathNormalizer.Normalize(virtualPath);
-        if (_vfs is not null && !_vfs.FileExists(normalized))
-        {
-            throw new FileNotFoundException($"Audio asset not found in VFS: '{normalized}'.", normalized);
-        }
-
-        lock (_sync)
-        {
-            _seChannels[channelIndex] = new AudioChannelSnapshot(
-                IsPlaying: true,
-                VirtualPath: normalized,
-                Volume: NullAudioBackend.ClampVolume(volume),
-                IsLooping: loop);
-        }
+        _engine.PlaySoundEffect(channelIndex, virtualPath, volume, loop);
     }
 
     public void StopSoundEffect(int channelIndex)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        ValidateChannel(channelIndex);
-
-        lock (_sync)
-        {
-            _seChannels[channelIndex] = _seChannels[channelIndex] with { IsPlaying = false, VirtualPath = null, IsLooping = false };
-        }
+        _engine.StopSoundEffect(channelIndex);
     }
 
     public void StopAllSoundEffects()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        lock (_sync)
-        {
-            for (int i = 0; i < _seChannels.Length; i++)
-            {
-                _seChannels[i] = _seChannels[i] with { IsPlaying = false, VirtualPath = null, IsLooping = false };
-            }
-        }
+        _engine.StopAllSoundEffects();
     }
 
     public void SetSoundEffectVolume(int channelIndex, int volume)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        ValidateChannel(channelIndex);
-
-        lock (_sync)
-        {
-            _seChannels[channelIndex] = _seChannels[channelIndex] with { Volume = NullAudioBackend.ClampVolume(volume) };
-        }
+        _engine.SetSoundEffectVolume(channelIndex, volume);
     }
 
     public AudioChannelSnapshot GetSoundEffectChannel(int channelIndex)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        ValidateChannel(channelIndex);
-        lock (_sync)
-        {
-            return _seChannels[channelIndex];
-        }
+        return _engine.GetSoundEffectChannel(channelIndex);
     }
 
     public void PlayBgm(string virtualPath, int volume = IAudioBackend.MaxVolume, bool loop = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        ArgumentException.ThrowIfNullOrWhiteSpace(virtualPath);
-
-        string normalized = VfsPathNormalizer.Normalize(virtualPath);
-        if (_vfs is not null && !_vfs.FileExists(normalized))
-        {
-            throw new FileNotFoundException($"BGM asset not found in VFS: '{normalized}'.", normalized);
-        }
-
-        lock (_sync)
-        {
-            _bgmChannel = new AudioChannelSnapshot(
-                IsPlaying: true,
-                VirtualPath: normalized,
-                Volume: NullAudioBackend.ClampVolume(volume),
-                IsLooping: loop);
-        }
+        _engine.PlayBgm(virtualPath, volume, loop);
     }
 
     public void StopBgm()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        lock (_sync)
-        {
-            _bgmChannel = _bgmChannel with { IsPlaying = false, VirtualPath = null, IsLooping = false };
-        }
+        _engine.StopBgm();
     }
 
     public void SetBgmVolume(int volume)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        lock (_sync)
-        {
-            _bgmChannel = _bgmChannel with { Volume = NullAudioBackend.ClampVolume(volume) };
-        }
+        _engine.SetBgmVolume(volume);
     }
 
     public AudioChannelSnapshot GetBgmChannel()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        lock (_sync)
-        {
-            return _bgmChannel;
-        }
+        return _engine.GetBgmChannel();
     }
 
     public void RenderInterleavedStereoF32(Span<float> outputBuffer)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        outputBuffer.Clear();
+        _engine.MixFloat32Interleaved(outputBuffer);
     }
 
-    private static void ValidateChannel(int channelIndex)
+    public void MixFloat32Interleaved(Span<float> destination) =>
+        RenderInterleavedStereoF32(destination);
+
+    public void PumpToSink(int frameCount)
     {
-        if ((uint)channelIndex >= IAudioBackend.SoundEffectChannelCount)
-        {
-            throw new ArgumentOutOfRangeException(nameof(channelIndex), channelIndex, "SE channel index must be 0..9.");
-        }
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _engine.PumpToSink(frameCount);
     }
 
     public void Dispose()
@@ -179,8 +135,7 @@ public sealed class CrossPlatformAudioMixer : IAudioBackend
             return;
         }
 
-        StopAllSoundEffects();
-        StopBgm();
+        _engine.Dispose();
         _disposed = true;
     }
 }

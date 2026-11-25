@@ -1,9 +1,20 @@
+using Hypera.Bytecode;
+using Hypera.Runtime;
+using Hypera.VirtualFs;
+
 namespace Hypera.Cli;
 
 public static class Program
 {
     public static int Main(string[] args)
     {
+        // Self-detect YU-RIS style HYPRBNDL trailer appended to the running executable (e.g., Game.exe).
+        string? processPath = Environment.ProcessPath;
+        if (SingleFileBundler.TryDetectTrailer(processPath, out BundleTrailer trailer) && processPath is not null)
+        {
+            return RunBundledExecutable(processPath, trailer, args);
+        }
+
         if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
         {
             PrintUsage();
@@ -17,7 +28,7 @@ public static class Program
         }
 
         string command = args[0].ToLowerInvariant();
-        ReadOnlySpan<string> commandArgs = args.AsSpan(1);
+        string[] commandArgs = args[1..];
 
         return command switch
         {
@@ -29,52 +40,173 @@ public static class Program
         };
     }
 
-    private static int HandleRun(ReadOnlySpan<string> args)
+    private static int RunBundledExecutable(string exePath, BundleTrailer trailer, string[] args)
     {
-        if (args.IsEmpty)
+        (string? headlessFramesDir, List<string> inputs) = ParseRunFlags(args);
+        using MemoryStream payloadStream = SingleFileBundler.ExtractPayloadToMemory(exePath, trailer);
+        using var host = new AnsiConsoleHost(headlessFramesDir: headlessFramesDir, scriptedInputs: inputs);
+
+        if (trailer.PayloadKind == BundlePayloadKind.Heb)
         {
-            Console.Error.WriteLine("Usage: hypera run <game-directory-or-hep>");
+            BytecodeModule module = HebBinaryCodec.Read(payloadStream);
+            string baseDir = Path.GetDirectoryName(exePath) ?? Environment.CurrentDirectory;
+            using var vfs = new PhysicalDirectoryVfs(baseDir);
+            using HyperaGameHost gameHost = HyperaGameHost.LoadFromVfs(vfs, ownsVfs: false, preloadedModule: module);
+            return host.RunHost(gameHost);
+        }
+
+        if (trailer.PayloadKind == BundlePayloadKind.Hep)
+        {
+            using HyperaGameHost gameHost = HyperaGameHost.LoadFromHepStream(payloadStream, exePath, leaveOpen: true);
+            return host.RunHost(gameHost);
+        }
+
+        Console.Error.WriteLine("[hypera] Embedded HYPRBNDL payload is neither .heb nor .hep.");
+        return 1;
+    }
+
+    private static int HandleRun(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Usage: hypera run <game-directory-or-heb-or-hep-or-zip> [--headless-frames <dir>]");
             return 2;
         }
 
-        Console.WriteLine($"[hypera] 'run' target '{args[0]}' ready for Wave 2 VM & CLI runner integration.");
-        return 0;
+        string targetPath = args[0];
+        if (!File.Exists(targetPath) && !Directory.Exists(targetPath))
+        {
+            Console.Error.WriteLine($"[hypera] Target not found: '{targetPath}'.");
+            return 2;
+        }
+
+        (string? headlessFramesDir, List<string> inputs) = ParseRunFlags(args[1..]);
+        using var host = new AnsiConsoleHost(headlessFramesDir: headlessFramesDir, scriptedInputs: inputs);
+        using HyperaGameHost gameHost = HyperaGameHost.Load(targetPath);
+        return host.RunHost(gameHost);
     }
 
-    private static int HandleCompile(ReadOnlySpan<string> args)
+    private static int HandleCompile(string[] args)
     {
-        if (args.IsEmpty)
+        if (args.Length == 0)
         {
             Console.Error.WriteLine("Usage: hypera compile <game-directory> [-o <output.heb>]");
             return 2;
         }
 
-        Console.WriteLine($"[hypera] 'compile' target '{args[0]}' ready for Wave 2 strict compiler integration.");
-        return 0;
-    }
-
-    private static int HandlePack(ReadOnlySpan<string> args)
-    {
-        if (args.IsEmpty)
+        string sourceDir = args[0];
+        if (!Directory.Exists(sourceDir))
         {
-            Console.Error.WriteLine("Usage: hypera pack <game-directory> [-o <output.hep>]");
+            Console.Error.WriteLine($"[hypera] Directory not found: '{sourceDir}'.");
             return 2;
         }
 
-        Console.WriteLine($"[hypera] 'pack' target '{args[0]}' ready for Wave 2 .hep archive builder integration.");
+        string outputPath = ParseOptionValue(args[1..], "-o", "--output")
+            ?? Path.Combine(Path.GetFullPath(sourceDir), "game.heb");
+
+        BytecodeModule module = CliCompilerBridge.CompileDirectory(sourceDir);
+        string? outDir = Path.GetDirectoryName(Path.GetFullPath(outputPath));
+        if (!string.IsNullOrEmpty(outDir))
+        {
+            Directory.CreateDirectory(outDir);
+        }
+
+        using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
+        HebBinaryCodec.Write(fs, module);
+        Console.WriteLine($"[hypera] Compiled {module.Functions.Length} functions ({module.Instructions.Length} instructions) -> '{outputPath}'.");
         return 0;
     }
 
-    private static int HandleBundle(ReadOnlySpan<string> args)
+    private static int HandlePack(string[] args)
     {
-        if (args.IsEmpty)
+        if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: hypera bundle <game-directory> [-o <output-dir>]");
+            Console.Error.WriteLine("Usage: hypera pack <game-directory> [-o <output.hep>] [--no-compress]");
             return 2;
         }
 
-        Console.WriteLine($"[hypera] 'bundle' target '{args[0]}' ready for Wave 2 standalone game bundler integration.");
+        string sourceDir = args[0];
+        if (!Directory.Exists(sourceDir))
+        {
+            Console.Error.WriteLine($"[hypera] Directory not found: '{sourceDir}'.");
+            return 2;
+        }
+
+        string outputPath = ParseOptionValue(args[1..], "-o", "--output")
+            ?? Path.Combine(Directory.GetCurrentDirectory(), Path.GetFileName(Path.GetFullPath(sourceDir).TrimEnd('\\', '/')) + ".hep");
+        bool compress = !args.Contains("--no-compress", StringComparer.OrdinalIgnoreCase);
+
+        BytecodeModule? module = CliCompilerBridge.CompileDirectory(sourceDir);
+        if (module.Functions.Length == 0 && module.Instructions.Length == 0)
+        {
+            module = null;
+        }
+
+        HepPackageCodec.PackDirectory(sourceDir, outputPath, compress, module);
+        Console.WriteLine($"[hypera] Packed '{sourceDir}' -> '{outputPath}'.");
         return 0;
+    }
+
+    private static int HandleBundle(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Usage: hypera bundle <source-heb-or-hep> [--host <apphost-template>] -o <Game.exe>");
+            return 2;
+        }
+
+        string sourcePayload = args[0];
+        string? hostTemplate = ParseOptionValue(args[1..], "--host") ?? Environment.ProcessPath;
+        string? outputExe = ParseOptionValue(args[1..], "-o", "--output");
+
+        if (string.IsNullOrWhiteSpace(hostTemplate))
+        {
+            Console.Error.WriteLine("[hypera] Unable to locate host executable template. Specify --host <path>.");
+            return 2;
+        }
+
+        if (string.IsNullOrWhiteSpace(outputExe))
+        {
+            outputExe = Path.Combine(
+                Path.GetDirectoryName(Path.GetFullPath(sourcePayload)) ?? Environment.CurrentDirectory,
+                Path.GetFileNameWithoutExtension(sourcePayload) + ".exe");
+        }
+
+        BundleTrailer trailer = SingleFileBundler.PackBundle(sourcePayload, hostTemplate, outputExe);
+        Console.WriteLine($"[hypera] Bundled '{sourcePayload}' ({trailer.PayloadLength} bytes, {trailer.PayloadKind}) -> '{outputExe}' (offset={trailer.PayloadOffset}).");
+        return 0;
+    }
+
+    private static (string? HeadlessFramesDir, List<string> Inputs) ParseRunFlags(string[] args)
+    {
+        string? headlessDir = null;
+        var inputs = new List<string>();
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] is "--headless-frames" && i + 1 < args.Length)
+            {
+                headlessDir = args[++i];
+            }
+            else if (args[i] is "--input" && i + 1 < args.Length)
+            {
+                inputs.Add(args[++i]);
+            }
+        }
+
+        return (headlessDir, inputs);
+    }
+
+    private static string? ParseOptionValue(string[] args, params string[] names)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (names.Contains(args[i], StringComparer.OrdinalIgnoreCase))
+            {
+                return args[i + 1];
+            }
+        }
+
+        return null;
     }
 
     private static int ReportUnknownCommand(string command)
@@ -89,9 +221,9 @@ public static class Program
         Console.WriteLine("Hypera Engine CLI (hypera)");
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  hypera run <game-dir-or-hep>             Run an Emuera game directory or .hep package");
-        Console.WriteLine("  hypera compile <game-dir> [-o <out.heb>] Compile CSV/ERH/ERB scripts to .heb bytecode");
-        Console.WriteLine("  hypera pack <game-dir> [-o <out.hep>]    Pack scripts and assets into a single .hep archive");
-        Console.WriteLine("  hypera bundle <game-dir> [-o <out-dir>]  Bundle a standalone distributable game");
+        Console.WriteLine("  hypera run <path> [--headless-frames <dir>]            Run a game directory, .heb, .hep, or .zip");
+        Console.WriteLine("  hypera compile <dir> [-o <out.heb>]                    Compile scripts to .heb bytecode");
+        Console.WriteLine("  hypera pack <dir> [-o <out.hep>]                       Pack assets & scripts into a .hep archive");
+        Console.WriteLine("  hypera bundle <heb-or-hep> --host <exe> -o <Game.exe>  Create single-file HYPRBNDL executable");
     }
 }
