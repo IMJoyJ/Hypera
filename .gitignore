@@ -7,6 +7,8 @@
 *.user
 *.userosscache
 *.sln.docstates
+*.DotSettings.user
+*.pubxml.user
 
 # Build results
 [Dd]ebug/
@@ -36,6 +38,12 @@ artifacts/
 *.trx
 *.coverage
 *.coveragexml
+*.binlog
+*.log
+coverage*.xml
+*.dmp
+*.nettrace
+*.gcdump
 
 # NuGet Packages
 *.nupkg
@@ -56,3 +64,33 @@ project.fragment.lock.json
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
+
+# Local secrets & environment overrides
+.env
+.env.*
+!.env.example
+appsettings.Local.json
+appsettings.*.Local.json
+
+# MAUI / mobile / desktop packaging & signing artifacts
+AppPackages/
+BundleArtifacts/
+*.apk
+*.aab
+*.ipa
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.keystore
+*.jks
+*.pfx
+*.p12
+*.mobileprovision
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
