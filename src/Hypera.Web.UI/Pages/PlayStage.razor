@@ -1,0 +1,1672 @@
+@page "/play/{AppId:guid}"
+@using System.Diagnostics
+@using System.Globalization
+@using System.Text
+@implements IAsyncDisposable
+@inject UiSessionState Ui
+@inject IAppCatalogService CatalogService
+@inject IRuntimeSessionManager SessionManager
+@inject ISnackbar Snackbar
+@inject IJSRuntime Js
+@inject NavigationManager Navigation
+
+@* Top Compact Control Bar *@
+<MudPaper Outlined="true" Class="px-3 py-2 mb-3">
+    <div class="d-flex flex-wrap align-center gap-2">
+        <MudIconButton Icon="@Icons.Material.Filled.ArrowBack"
+                       Size="Size.Small"
+                       title="@Ui.T("player.backToApp")"
+                       Href="@($"/apps/{AppId}")" />
+
+        <MudText Typo="Typo.subtitle1" Style="font-weight: 600;" Class="mr-2">
+            @(_app?.Title ?? "Hypera")
+        </MudText>
+
+        @if (_playableVersions.Count > 0)
+        {
+            <MudSelect T="Guid"
+                       Value="_activeVersionId"
+                       ValueChanged="@OnVersionChangedAsync"
+                       Dense="true"
+                       Variant="Variant.Outlined"
+                       Margin="Margin.Dense"
+                       Style="max-width: 150px;">
+                @foreach (GameVersion ver in _playableVersions)
+                {
+                    <MudSelectItem Value="@ver.Id">@ver.VersionLabel</MudSelectItem>
+                }
+            </MudSelect>
+
+            <MudSelect T="string"
+                       Value="_activeLanguageCode"
+                       ValueChanged="@OnLanguageChangedAsync"
+                       Dense="true"
+                       Variant="Variant.Outlined"
+                       Margin="Margin.Dense"
+                       Style="max-width: 120px;">
+                @foreach (string lang in ActiveVersionLanguages)
+                {
+                    <MudSelectItem Value="@lang">@lang</MudSelectItem>
+                }
+            </MudSelect>
+        }
+
+        <MudSpacer />
+
+        <MudIconButton Icon="@(_muted ? Icons.Material.Filled.VolumeOff : Icons.Material.Filled.VolumeUp)"
+                       Size="Size.Small"
+                       Color="@(_muted ? Color.Secondary : Color.Default)"
+                       title="@(_muted ? Ui.T("player.unmute") : Ui.T("player.mute"))"
+                       OnClick="@ToggleMuteAsync" />
+
+        <MudSlider T="int"
+                   Value="_masterVolume"
+                   ValueChanged="@OnVolumeChangedAsync"
+                   Min="0"
+                   Max="100"
+                   Size="Size.Small"
+                   Style="width: 84px;" />
+
+        <MudButton Variant="Variant.Outlined"
+                   Size="Size.Small"
+                   StartIcon="@Icons.Material.Filled.Replay"
+                   Disabled="@_busy"
+                   OnClick="@RestartSessionAsync">
+            @Ui.T("app.restart")
+        </MudButton>
+
+        <MudButton Variant="Variant.Outlined"
+                   Size="Size.Small"
+                   StartIcon="@Icons.Material.Filled.Save"
+                   OnClick="@(() => _savesDrawerOpen = !_savesDrawerOpen)">
+            @Ui.T("saves.title")
+        </MudButton>
+    </div>
+</MudPaper>
+
+@if (!string.IsNullOrWhiteSpace(_error))
+{
+    <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
+}
+
+@if (_renderState is not null && !string.IsNullOrWhiteSpace(_renderState.FaultMessage))
+{
+    <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">
+        <strong>@Ui.T("player.faulted"):</strong> @_renderState.FaultMessage
+    </MudAlert>
+}
+
+@* Locked LogicalViewport Stage with Smooth Transform Scaling *@
+<div class="hypera-stage-wrapper" @ref="_wrapperRef">
+    @if (_loading)
+    {
+        <MudProgressCircular Indeterminate="true" Color="Color.Primary" />
+    }
+    else if (_renderState is null)
+    {
+        <MudStack AlignItems="AlignItems.Center" Spacing="2">
+            <MudText Typo="Typo.body1" Color="Color.Secondary">@Ui.T("player.noActiveSession")</MudText>
+            <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="@StartOrAttachSessionAsync">
+                @Ui.T("player.startSession")
+            </MudButton>
+        </MudStack>
+    }
+    else
+    {
+        ConsoleScene scene = _renderState.Scene;
+        LogicalViewport vp = scene.Viewport;
+        string bgCss = FormatHelpers.FormatRgbaCss(scene.BackgroundColorRgba);
+
+        <div class="hypera-stage-box">
+            <div class="hypera-stage"
+                 tabindex="0"
+                 @ref="_stageRef"
+                 style="@($"width:{vp.LogicalWidth}px;height:{vp.LogicalHeight}px;background-color:{bgCss};")"
+                 @onclick="@OnStageClickAsync"
+                 @onkeydown="@OnStageKeyDownAsync">
+
+                @foreach (StageRenderItem item in _renderItems)
+                {
+                    switch (item.Kind)
+                    {
+                        case StageItemKind.Image:
+                        {
+                            string? resolvedKey = _hoveredItemKey == item.Key && !string.IsNullOrEmpty(item.HoverAssetKey)
+                                ? item.HoverAssetKey
+                                : item.AssetKey;
+
+                            if (!string.IsNullOrEmpty(resolvedKey) && _assetCache.TryGetValue(resolvedKey, out AssetCacheEntry? asset) && !string.IsNullOrEmpty(asset.BlobUrl))
+                            {
+                                string imgClass = BuildImageClass(item);
+                                string imgStyle = BuildImageStyle(item, asset, vp);
+                                <img @key="item.Key"
+                                     class="@imgClass"
+                                     src="@asset.BlobUrl"
+                                     style="@imgStyle"
+                                     title="@item.Tooltip"
+                                     alt=""
+                                     @onmouseenter="@(() => OnItemHover(item, true))"
+                                     @onmouseleave="@(() => OnItemHover(item, false))" />
+                            }
+
+                            break;
+                        }
+
+                        case StageItemKind.Shape:
+                            <div @key="item.Key"
+                                 class="hypera-op hypera-op-shape"
+                                 style="@BuildShapeStyle(item)"></div>
+                            break;
+
+                        case StageItemKind.DivBox:
+                            <div @key="item.Key"
+                                 class="hypera-op hypera-op-div"
+                                 style="@BuildDivStyle(item)"></div>
+                            break;
+
+                        case StageItemKind.Text:
+                            <span @key="item.Key"
+                                  class="@BuildTextClass("hypera-op hypera-op-text", item)"
+                                  style="@BuildTextStyle(item)">@item.Text</span>
+                            break;
+
+                        case StageItemKind.Button:
+                            <span @key="item.Key"
+                                  class="@BuildTextClass("hypera-op hypera-op-button", item)"
+                                  style="@BuildTextStyle(item)"
+                                  title="@item.Tooltip"
+                                  @onclick="@(e => OnButtonClickAsync(item, e))"
+                                  @onclick:stopPropagation="true">@item.Text</span>
+                            break;
+                    }
+                }
+            </div>
+        </div>
+    }
+</div>
+
+@* Interactive Input Bar *@
+@if (_renderState is not null)
+{
+    InputRequest? pending = _renderState.PendingInput;
+    <MudPaper Outlined="true" Class="px-3 py-2 mt-2">
+        <div class="d-flex flex-wrap align-center gap-2">
+            @if (_renderState.Summary.EngineStatus == EngineStepStatus.Completed)
+            {
+                <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("player.completed")</MudText>
+                <MudSpacer />
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" Size="Size.Small" OnClick="@RestartSessionAsync">
+                    @Ui.T("app.restart")
+                </MudButton>
+            }
+            else if (pending is not null && (pending.Kind == InputRequestKind.IntValue || pending.Kind == InputRequestKind.StringValue))
+            {
+                <MudTextField @bind-Value="_inputText"
+                              Placeholder="@Ui.T("player.inputPlaceholder")"
+                              Variant="Variant.Outlined"
+                              Margin="Margin.Dense"
+                              Immediate="true"
+                              Disabled="@_busy"
+                              OnKeyDown="@OnInputFieldKeyDownAsync"
+                              Class="flex-grow-1" />
+
+                <MudButton Variant="Variant.Filled"
+                           Color="Color.Primary"
+                           Size="Size.Small"
+                           Disabled="@_busy"
+                           OnClick="@SubmitTextInputAsync">
+                    @Ui.T("player.send")
+                </MudButton>
+            }
+            else if (pending is not null && (pending.Kind == InputRequestKind.OneInt || pending.Kind == InputRequestKind.OneString))
+            {
+                <MudTextField Value="@_oneCharText"
+                              ValueChanged="@((string v) => OnOneCharChangedAsync(v))"
+                              Placeholder="@Ui.T("player.inputPlaceholder")"
+                              Variant="Variant.Outlined"
+                              Margin="Margin.Dense"
+                              Immediate="true"
+                              Disabled="@_busy"
+                              MaxLength="1"
+                              Style="max-width: 180px;" />
+            }
+            else if (pending is not null)
+            {
+                <MudText Typo="Typo.body2" Color="Color.Secondary">
+                    @(pending.Kind == InputRequestKind.MouseClick ? Ui.T("player.clickToContinue") : Ui.T("player.pressAnyKey"))
+                </MudText>
+            }
+
+            @if (_remainingSeconds.HasValue)
+            {
+                <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Filled">
+                    @Ui.T("player.timeoutRemaining", _remainingSeconds.Value.ToString("0.0", CultureInfo.InvariantCulture))
+                </MudChip>
+            }
+        </div>
+    </MudPaper>
+}
+
+@* Slide-over Save Manager Drawer *@
+@if (Ui.IsAuthenticated)
+{
+    <MudDrawer @bind-Open="_savesDrawerOpen"
+               Anchor="Anchor.End"
+               Variant="DrawerVariant.Temporary"
+               Width="460px"
+               Elevation="4">
+        <div class="pa-4">
+            <SaveManagerPanel AppId="@AppId" UserId="@Ui.CurrentUser!.Id" />
+        </div>
+    </MudDrawer>
+}
+
+@code {
+    [Parameter]
+    public Guid AppId { get; set; }
+
+    [SupplyParameterFromQuery(Name = "versionId")]
+    public Guid? QueryVersionId { get; set; }
+
+    [SupplyParameterFromQuery(Name = "lang")]
+    public string? QueryLanguageCode { get; set; }
+
+    private GameApp? _app;
+    private List<GameVersion> _playableVersions = [];
+    private RuntimeSessionRenderState? _renderState;
+    private List<StageRenderItem> _renderItems = [];
+    private Guid _activeSessionId;
+    private Guid _activeVersionId;
+    private string _activeLanguageCode = string.Empty;
+    private string _inputText = string.Empty;
+    private string _oneCharText = string.Empty;
+    private string? _error;
+    private string? _hoveredItemKey;
+    private bool _loading = true;
+    private bool _busy;
+    private bool _savesDrawerOpen;
+    private bool _muted;
+    private int _masterVolume = 100;
+
+    private ElementReference _wrapperRef;
+    private ElementReference _stageRef;
+    private int _lastScaledW;
+    private int _lastScaledH;
+
+    private readonly Dictionary<string, AssetCacheEntry> _assetCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _registeredFontPaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _customCrispFonts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _cachedAudioKeys = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Stopwatch _animationClock = Stopwatch.StartNew();
+
+    private Guid _audioSyncedSessionId;
+    private long _lastAudioEventSeq;
+
+    private CancellationTokenSource? _timeoutCts;
+    private long _timeoutGenId = -1;
+    private double? _remainingSeconds;
+
+    private CancellationTokenSource? _animCts;
+    private bool _disposed;
+
+    private IEnumerable<string> ActiveVersionLanguages
+    {
+        get
+        {
+            GameVersion? ver = _playableVersions.FirstOrDefault(v => v.Id == _activeVersionId);
+            if (ver is null)
+            {
+                return [];
+            }
+
+            return ver.Variants
+                .Where(static vr => vr.ActiveSubmissionId.HasValue)
+                .Select(static vr => vr.LanguageCode)
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Ui.Changed += OnUiChanged;
+        await Ui.InitializeAsync();
+        if (!Ui.IsAuthenticated)
+        {
+            Navigation.NavigateTo($"/login?returnUrl={Uri.EscapeDataString($"/play/{AppId}")}");
+            return;
+        }
+
+        _app = await CatalogService.GetAppDetailAsync(AppId, Ui.CurrentUser!.Id);
+        if (_app is not null)
+        {
+            _playableVersions = _app.Versions
+                .OrderByDescending(static v => v.OrderIndex)
+                .Where(static v => v.Variants.Any(static vr => vr.ActiveSubmissionId.HasValue))
+                .ToList();
+        }
+
+        await StartOrAttachSessionAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_renderState is null)
+        {
+            return;
+        }
+
+        LogicalViewport vp = _renderState.Scene.Viewport;
+        if (vp.LogicalWidth != _lastScaledW || vp.LogicalHeight != _lastScaledH)
+        {
+            _lastScaledW = vp.LogicalWidth;
+            _lastScaledH = vp.LogicalHeight;
+            try
+            {
+                await Js.InvokeVoidAsync("hyperaPlayer.attachStageScaler", _wrapperRef, _stageRef, vp.LogicalWidth, vp.LogicalHeight);
+            }
+            catch
+            {
+                // Ignore if element is not yet mounted
+            }
+        }
+    }
+
+    private async Task StartOrAttachSessionAsync()
+    {
+        if (!Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        _loading = true;
+        _error = null;
+        try
+        {
+            Guid userId = Ui.CurrentUser!.Id;
+            RuntimeSessionSnapshot? snapshot = null;
+
+            if (!QueryVersionId.HasValue && string.IsNullOrWhiteSpace(QueryLanguageCode))
+            {
+                IReadOnlyList<RuntimeSessionSummary> sessions = await SessionManager.ListUserSessionsAsync(userId);
+                RuntimeSessionSummary? match = sessions
+                    .Where(s => s.AppId == AppId && s.EngineStatus != EngineStepStatus.Completed && s.EngineStatus != EngineStepStatus.Faulted)
+                    .OrderByDescending(static s => s.LastActiveAtUtc)
+                    .FirstOrDefault();
+
+                if (match is not null)
+                {
+                    snapshot = await SessionManager.GetSessionAsync(match.SessionId, userId);
+                }
+            }
+
+            snapshot ??= await SessionManager.StartSessionAsync(
+                userId,
+                AppId,
+                QueryVersionId,
+                QueryLanguageCode);
+
+            await RefreshRenderStateAsync(snapshot.Summary.SessionId, resetIfSessionChanged: true);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            _renderState = null;
+            _renderItems = [];
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task RestartSessionAsync()
+    {
+        if (!Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        _busy = true;
+        _error = null;
+        CancelTimeout();
+        StopAnimationLoop();
+        try
+        {
+            Guid userId = Ui.CurrentUser!.Id;
+            RuntimeSessionSnapshot snapshot = await SessionManager.RestartSessionAsync(
+                userId,
+                AppId,
+                _activeVersionId == Guid.Empty ? null : _activeVersionId,
+                string.IsNullOrWhiteSpace(_activeLanguageCode) ? null : _activeLanguageCode);
+
+            await ResetClientSessionResourcesAsync();
+            await RefreshRenderStateAsync(snapshot.Summary.SessionId, resetIfSessionChanged: true);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task OnVersionChangedAsync(Guid versionId)
+    {
+        _activeVersionId = versionId;
+        List<string> langs = ActiveVersionLanguages.ToList();
+        if (!langs.Contains(_activeLanguageCode, StringComparer.OrdinalIgnoreCase))
+        {
+            _activeLanguageCode = langs.FirstOrDefault() ?? string.Empty;
+        }
+
+        await RestartSessionAsync();
+    }
+
+    private async Task OnLanguageChangedAsync(string lang)
+    {
+        _activeLanguageCode = lang;
+        await RestartSessionAsync();
+    }
+
+    private async Task ResetClientSessionResourcesAsync()
+    {
+        _assetCache.Clear();
+        _cachedAudioKeys.Clear();
+        _registeredFontPaths.Clear();
+        _customCrispFonts.Clear();
+        _audioSyncedSessionId = Guid.Empty;
+        _lastAudioEventSeq = 0;
+        _hoveredItemKey = null;
+        _lastScaledW = 0;
+        _lastScaledH = 0;
+        _animationClock.Restart();
+
+        try
+        {
+            await Js.InvokeVoidAsync("hyperaPlayer.stopAllAudio");
+            await Js.InvokeVoidAsync("hyperaPlayer.revokeAllAssets");
+        }
+        catch
+        {
+            // Ignore when circuit/JS is unavailable
+        }
+    }
+
+    private async Task RefreshRenderStateAsync(Guid sessionId, bool resetIfSessionChanged = false)
+    {
+        if (!Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        Guid userId = Ui.CurrentUser!.Id;
+        if (resetIfSessionChanged && _activeSessionId != Guid.Empty && _activeSessionId != sessionId)
+        {
+            await ResetClientSessionResourcesAsync();
+        }
+
+        RuntimeSessionRenderState? state = await SessionManager.GetSessionRenderStateAsync(
+            sessionId,
+            userId,
+            elapsedAnimationMs: _animationClock.ElapsedMilliseconds,
+            afterAudioEventSequence: _audioSyncedSessionId == sessionId ? _lastAudioEventSeq : 0);
+
+        if (state is null)
+        {
+            _renderState = null;
+            _renderItems = [];
+            return;
+        }
+
+        _renderState = state;
+        _activeSessionId = state.Summary.SessionId;
+        _activeVersionId = state.Summary.VersionId;
+        _activeLanguageCode = state.Summary.LanguageCode;
+        _inputText = string.Empty;
+        _oneCharText = string.Empty;
+        _hoveredItemKey = null;
+
+        await RegisterCustomFontsAsync(sessionId, userId, state.CustomFonts);
+
+        List<StageRenderItem> items = BuildRenderItems(state.Scene, state.VisibleLineTops);
+        await EnsureSceneAssetsLoadedAsync(sessionId, userId, items);
+        _renderItems = items;
+
+        await SyncWebAudioAsync(sessionId, userId, state.Audio);
+        ConfigurePendingTimeout(state.PendingInput);
+        UpdateAnimationLoop();
+    }
+
+    private async Task RegisterCustomFontsAsync(
+        Guid sessionId,
+        Guid userId,
+        IReadOnlyList<SessionFontDescriptor> customFonts)
+    {
+        foreach (SessionFontDescriptor font in customFonts)
+        {
+            if (font.IsCrispTileFont)
+            {
+                if (!string.IsNullOrWhiteSpace(font.FamilyName))
+                {
+                    _customCrispFonts.Add(font.FamilyName);
+                }
+
+                if (!string.IsNullOrWhiteSpace(font.AliasName))
+                {
+                    _customCrispFonts.Add(font.AliasName);
+                }
+            }
+
+            if (!_registeredFontPaths.Add(font.VirtualPath))
+            {
+                continue;
+            }
+
+            try
+            {
+                SessionAssetPayload? payload = await SessionManager.ReadSessionAssetAsync(sessionId, userId, font.AssetKey);
+                if (payload is null || payload.Data.Length == 0)
+                {
+                    continue;
+                }
+
+                var names = new List<string>(2);
+                if (!string.IsNullOrWhiteSpace(font.FamilyName))
+                {
+                    names.Add(font.FamilyName);
+                }
+
+                if (!string.IsNullOrWhiteSpace(font.AliasName) &&
+                    !names.Contains(font.AliasName, StringComparer.OrdinalIgnoreCase))
+                {
+                    names.Add(font.AliasName);
+                }
+
+                if (names.Count == 0)
+                {
+                    continue;
+                }
+
+                using var ms = new MemoryStream(payload.Data, writable: false);
+                using var streamRef = new DotNetStreamReference(ms, leaveOpen: true);
+                await Js.InvokeAsync<bool>("hyperaPlayer.registerFontAliasesFromStream", names, streamRef);
+            }
+            catch
+            {
+                // Ignore font load errors for non-renderable fonts
+            }
+        }
+    }
+
+    private async Task EnsureSceneAssetsLoadedAsync(
+        Guid sessionId,
+        Guid userId,
+        IReadOnlyList<StageRenderItem> items)
+    {
+        var keysToLoad = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (StageRenderItem item in items)
+        {
+            if (item.Kind != StageItemKind.Image)
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(item.AssetKey))
+            {
+                keysToLoad.Add(item.AssetKey);
+            }
+
+            if (!string.IsNullOrEmpty(item.HoverAssetKey))
+            {
+                keysToLoad.Add(item.HoverAssetKey);
+            }
+        }
+
+        long elapsedMs = _animationClock.ElapsedMilliseconds;
+        foreach (string key in keysToLoad)
+        {
+            bool isDynamicGraphics = key.StartsWith("g:", StringComparison.OrdinalIgnoreCase)
+                || key.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase);
+            bool alreadyCached = _assetCache.TryGetValue(key, out AssetCacheEntry? existing);
+
+            if (alreadyCached && !isDynamicGraphics && !existing!.IsAnimated)
+            {
+                continue;
+            }
+
+            await FetchAndRegisterAssetAsync(sessionId, userId, key, elapsedMs);
+        }
+    }
+
+    private async Task FetchAndRegisterAssetAsync(
+        Guid sessionId,
+        Guid userId,
+        string assetKey,
+        long elapsedMs)
+    {
+        try
+        {
+            SessionAssetPayload? payload = await SessionManager.ReadSessionAssetAsync(sessionId, userId, assetKey, elapsedMs);
+            if (payload is null && assetKey.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase))
+            {
+                string raw = assetKey["sprite:".Length..];
+                payload = await SessionManager.ReadSessionAssetAsync(sessionId, userId, raw, elapsedMs);
+            }
+
+            if (payload is null || payload.Data.Length == 0)
+            {
+                return;
+            }
+
+            using var ms = new MemoryStream(payload.Data, writable: false);
+            using var streamRef = new DotNetStreamReference(ms, leaveOpen: true);
+            string? blobUrl = await Js.InvokeAsync<string?>(
+                "hyperaPlayer.registerAssetFromStream",
+                assetKey,
+                payload.MimeType,
+                streamRef);
+
+            if (!string.IsNullOrEmpty(blobUrl))
+            {
+                _assetCache[assetKey] = new AssetCacheEntry(blobUrl, payload.Width, payload.Height, payload.IsAnimated);
+            }
+        }
+        catch
+        {
+            // Ignore transient JS interop or missing asset errors
+        }
+    }
+
+    private async Task SyncWebAudioAsync(Guid sessionId, Guid userId, WebAudioStateSnapshot audio)
+    {
+        bool firstSyncForSession = _audioSyncedSessionId != sessionId;
+        _audioSyncedSessionId = sessionId;
+
+        if (audio.RecentEvents.Count > 0)
+        {
+            foreach (WebAudioEvent ev in audio.RecentEvents)
+            {
+                if (ev.SequenceId <= _lastAudioEventSeq)
+                {
+                    continue;
+                }
+
+                await ApplyAudioEventAsync(sessionId, userId, ev);
+            }
+        }
+        else if (firstSyncForSession)
+        {
+            // Reconnected to an existing session whose audio was already playing
+            if (audio.Bgm.IsPlaying && !string.IsNullOrWhiteSpace(audio.Bgm.VirtualPath))
+            {
+                string? key = await EnsureAudioAssetCachedAsync(sessionId, userId, audio.Bgm.VirtualPath);
+                if (key is not null)
+                {
+                    await TryJsVoidAsync("hyperaPlayer.playBgmCached", key, audio.Bgm.Volume, audio.Bgm.IsLooping);
+                }
+            }
+
+            for (int ch = 0; ch < audio.SoundEffects.Count; ch++)
+            {
+                AudioChannelSnapshot se = audio.SoundEffects[ch];
+                if (se.IsPlaying && !string.IsNullOrWhiteSpace(se.VirtualPath))
+                {
+                    string? key = await EnsureAudioAssetCachedAsync(sessionId, userId, se.VirtualPath);
+                    if (key is not null)
+                    {
+                        await TryJsVoidAsync("hyperaPlayer.playSeCached", ch, key, se.Volume, se.IsLooping);
+                    }
+                }
+            }
+        }
+
+        _lastAudioEventSeq = audio.LatestSequenceId;
+    }
+
+    private async Task ApplyAudioEventAsync(Guid sessionId, Guid userId, WebAudioEvent ev)
+    {
+        switch (ev.Kind)
+        {
+            case WebAudioEventKind.PlayBgm when !string.IsNullOrWhiteSpace(ev.VirtualPath):
+            {
+                string? key = await EnsureAudioAssetCachedAsync(sessionId, userId, ev.VirtualPath);
+                if (key is not null)
+                {
+                    await TryJsVoidAsync("hyperaPlayer.playBgmCached", key, ev.Volume, ev.IsLooping);
+                }
+
+                break;
+            }
+
+            case WebAudioEventKind.StopBgm:
+                await TryJsVoidAsync("hyperaPlayer.stopBgm");
+                break;
+
+            case WebAudioEventKind.SetBgmVolume:
+                await TryJsVoidAsync("hyperaPlayer.setBgmVolume", ev.Volume);
+                break;
+
+            case WebAudioEventKind.PlaySoundEffect when !string.IsNullOrWhiteSpace(ev.VirtualPath):
+            {
+                string? key = await EnsureAudioAssetCachedAsync(sessionId, userId, ev.VirtualPath);
+                if (key is not null)
+                {
+                    await TryJsVoidAsync("hyperaPlayer.playSeCached", ev.ChannelIndex, key, ev.Volume, ev.IsLooping);
+                }
+
+                break;
+            }
+
+            case WebAudioEventKind.StopSoundEffect:
+                await TryJsVoidAsync("hyperaPlayer.stopSe", ev.ChannelIndex);
+                break;
+
+            case WebAudioEventKind.StopAllSoundEffects:
+                await TryJsVoidAsync("hyperaPlayer.stopAllSe");
+                break;
+
+            case WebAudioEventKind.SetSoundEffectVolume:
+                await TryJsVoidAsync("hyperaPlayer.setSeVolume", ev.ChannelIndex, ev.Volume);
+                break;
+        }
+    }
+
+    private async Task<string?> EnsureAudioAssetCachedAsync(Guid sessionId, Guid userId, string virtualPath)
+    {
+        string cacheKey = $"audio:{virtualPath}";
+        if (_cachedAudioKeys.Contains(cacheKey))
+        {
+            return cacheKey;
+        }
+
+        try
+        {
+            SessionAssetPayload? payload = await SessionManager.ReadSessionAssetAsync(sessionId, userId, virtualPath);
+            if (payload is null || payload.Data.Length == 0)
+            {
+                return null;
+            }
+
+            using var ms = new MemoryStream(payload.Data, writable: false);
+            using var streamRef = new DotNetStreamReference(ms, leaveOpen: true);
+            string? url = await Js.InvokeAsync<string?>(
+                "hyperaPlayer.registerAssetFromStream",
+                cacheKey,
+                payload.MimeType,
+                streamRef);
+
+            if (!string.IsNullOrEmpty(url))
+            {
+                _cachedAudioKeys.Add(cacheKey);
+                return cacheKey;
+            }
+        }
+        catch
+        {
+            // Ignore audio asset fetch failure
+        }
+
+        return null;
+    }
+
+    private void UpdateAnimationLoop()
+    {
+        bool needsAnimation = _assetCache.Values.Any(static a => a.IsAnimated);
+        if (!needsAnimation)
+        {
+            StopAnimationLoop();
+            return;
+        }
+
+        if (_animCts is not null || _disposed)
+        {
+            return;
+        }
+
+        _animCts = new CancellationTokenSource();
+        CancellationToken ct = _animCts.Token;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
+                while (await timer.WaitForNextTickAsync(ct))
+                {
+                    await InvokeAsync(RefreshAnimatedAssetsAsync);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on stop/dispose
+            }
+        }, ct);
+    }
+
+    private async Task RefreshAnimatedAssetsAsync()
+    {
+        if (_disposed || _renderState is null || !Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        List<string> animatedKeys = _assetCache
+            .Where(static kv => kv.Value.IsAnimated)
+            .Select(static kv => kv.Key)
+            .ToList();
+
+        if (animatedKeys.Count == 0)
+        {
+            StopAnimationLoop();
+            return;
+        }
+
+        Guid sid = _renderState.Summary.SessionId;
+        Guid uid = Ui.CurrentUser!.Id;
+        long elapsedMs = _animationClock.ElapsedMilliseconds;
+
+        foreach (string key in animatedKeys)
+        {
+            await FetchAndRegisterAssetAsync(sid, uid, key, elapsedMs);
+        }
+
+        StateHasChanged();
+    }
+
+    private void StopAnimationLoop()
+    {
+        if (_animCts is not null)
+        {
+            _animCts.Cancel();
+            _animCts.Dispose();
+            _animCts = null;
+        }
+    }
+
+    private List<StageRenderItem> BuildRenderItems(ConsoleScene scene, IReadOnlyList<float> lineTops)
+    {
+        var items = new List<StageRenderItem>();
+        int seq = 0;
+
+        // 1. Background images (SETBGIMAGE)
+        foreach (BackgroundImageLayer bg in scene.BackgroundImages)
+        {
+            items.Add(new StageRenderItem(
+                Key: $"bg_{seq++}",
+                Kind: StageItemKind.Image,
+                LayerGroup: 0,
+                Depth: bg.Depth,
+                Order: seq,
+                X: 0f,
+                Y: 0f,
+                Width: scene.Viewport.LogicalWidth,
+                Height: scene.Viewport.LogicalHeight,
+                AssetKey: NormalizeVisualAssetKey(bg.SpriteName),
+                Opacity: bg.Opacity,
+                SamplingMode: PixelSamplingMode.SmoothAntialiased));
+        }
+
+        // 2. CBG Layers (bottom-left anchored)
+        foreach (CbgLayer cbg in scene.CbgLayers)
+        {
+            string? assetKey = !string.IsNullOrWhiteSpace(cbg.SpriteName)
+                ? NormalizeVisualAssetKey(cbg.SpriteName)
+                : (cbg.GraphicsId.HasValue ? $"g:{cbg.GraphicsId.Value}" : null);
+
+            if (string.IsNullOrEmpty(assetKey))
+            {
+                continue;
+            }
+
+            string? hoverKey = !string.IsNullOrWhiteSpace(cbg.HoverSpriteName)
+                ? NormalizeVisualAssetKey(cbg.HoverSpriteName)
+                : null;
+
+            items.Add(new StageRenderItem(
+                Key: $"cbg_{seq++}",
+                Kind: StageItemKind.Image,
+                LayerGroup: 1,
+                Depth: cbg.Depth,
+                Order: seq,
+                X: cbg.X,
+                Y: cbg.Y,
+                Width: 0f,
+                Height: 0f,
+                IsBottomLeftCbg: true,
+                AssetKey: assetKey,
+                HoverAssetKey: hoverKey,
+                IsInteractiveImage: cbg.IsButton,
+                Tooltip: cbg.Tooltip,
+                SamplingMode: PixelSamplingMode.CrispNearestNeighbor));
+        }
+
+        // 3. Flow lines
+        for (int i = 0; i < scene.VisibleLines.Count; i++)
+        {
+            float lineTop = i < lineTops.Count ? lineTops[i] : 0f;
+            EmitLineItems(items, scene, scene.VisibleLines[i], lineTop, originOffsetX: 0f, layerGroup: 1, ref seq);
+        }
+
+        // 4. Overlay HTML_PRINT_ISLAND layers
+        foreach (HtmlIslandLayer island in scene.IslandLayers.OrderByDescending(static l => l.Depth))
+        {
+            float y = 0f;
+            foreach (ConsoleLine line in island.Lines)
+            {
+                EmitLineItems(items, scene, line, y, originOffsetX: 0f, layerGroup: 2, ref seq, depthOverride: island.Depth);
+                y += Math.Max(1, line.LineHeight);
+            }
+        }
+
+        // Exact Emuera Z-order: LayerGroup asc -> Depth desc (higher depth = further back) -> insertion order asc
+        items.Sort(static (a, b) =>
+        {
+            int cmp = a.LayerGroup.CompareTo(b.LayerGroup);
+            if (cmp != 0)
+            {
+                return cmp;
+            }
+
+            cmp = b.Depth.CompareTo(a.Depth);
+            return cmp != 0 ? cmp : a.Order.CompareTo(b.Order);
+        });
+
+        return items;
+    }
+
+    private void EmitLineItems(
+        List<StageRenderItem> items,
+        ConsoleScene scene,
+        ConsoleLine line,
+        float lineTopY,
+        float originOffsetX,
+        int layerGroup,
+        ref int seq,
+        int? depthOverride = null)
+    {
+        foreach (ConsoleRenderPart part in line.Parts)
+        {
+            int depth = depthOverride ?? part.Depth;
+            PixelSamplingMode sampling = part.SamplingMode;
+            if (sampling == PixelSamplingMode.Auto &&
+                !string.IsNullOrWhiteSpace(part.FontFamily) &&
+                _customCrispFonts.Contains(part.FontFamily))
+            {
+                sampling = PixelSamplingMode.CrispNearestNeighbor;
+            }
+
+            switch (part.Kind)
+            {
+                case ConsolePartKind.Text:
+                {
+                    if (string.IsNullOrEmpty(part.Text))
+                    {
+                        break;
+                    }
+
+                    bool isActiveButton = part.Button is { IsButton: true } btn && btn.GenerationId == scene.ActiveButtonGeneration;
+                    items.Add(new StageRenderItem(
+                        Key: $"txt_{seq++}",
+                        Kind: isActiveButton ? StageItemKind.Button : StageItemKind.Text,
+                        LayerGroup: layerGroup,
+                        Depth: depth,
+                        Order: seq,
+                        X: originOffsetX + part.X,
+                        Y: lineTopY + part.YOffset,
+                        Width: part.Width,
+                        Height: part.Height,
+                        Text: part.Text,
+                        ColorRgba: part.ColorRgba,
+                        FontFamily: part.FontFamily,
+                        FontSize: part.FontSize,
+                        FontStyle: part.FontStyle,
+                        SamplingMode: sampling,
+                        Button: isActiveButton ? part.Button : null,
+                        Tooltip: part.Button?.Title));
+                    break;
+                }
+
+                case ConsolePartKind.Image:
+                {
+                    string? srcKey = NormalizeVisualAssetKey(part.ImageSrc);
+                    if (string.IsNullOrEmpty(srcKey))
+                    {
+                        break;
+                    }
+
+                    string? hoverKey = NormalizeVisualAssetKey(part.ImageSrcHover);
+                    bool interactive = (part.Button is { IsButton: true } b && b.GenerationId == scene.ActiveButtonGeneration)
+                        || !string.IsNullOrWhiteSpace(part.ImageSrcMap);
+
+                    items.Add(new StageRenderItem(
+                        Key: $"img_{seq++}",
+                        Kind: StageItemKind.Image,
+                        LayerGroup: layerGroup,
+                        Depth: depth,
+                        Order: seq,
+                        X: originOffsetX + part.X,
+                        Y: lineTopY + part.YOffset,
+                        Width: part.Width,
+                        Height: part.Height,
+                        AssetKey: srcKey,
+                        HoverAssetKey: hoverKey,
+                        FlipX: part.FlipX,
+                        FlipY: part.FlipY,
+                        IsInteractiveImage: interactive,
+                        SamplingMode: sampling,
+                        Button: part.Button,
+                        Tooltip: part.Button?.Title));
+                    break;
+                }
+
+                case ConsolePartKind.RectShape:
+                    items.Add(new StageRenderItem(
+                        Key: $"shp_{seq++}",
+                        Kind: StageItemKind.Shape,
+                        LayerGroup: layerGroup,
+                        Depth: depth,
+                        Order: seq,
+                        X: originOffsetX + part.X,
+                        Y: lineTopY + part.YOffset,
+                        Width: part.Width,
+                        Height: part.Height,
+                        ColorRgba: part.ColorRgba));
+                    break;
+
+                case ConsolePartKind.Div:
+                {
+                    if (part.Div is null)
+                    {
+                        break;
+                    }
+
+                    LogicalRect outer = ConsoleHitTester.ComputeDivOuterRect(
+                        part with { X = part.X + originOffsetX },
+                        part.Div,
+                        lineTopY,
+                        scene.Viewport);
+
+                    int divDepth = depthOverride ?? part.Div.Depth;
+                    if ((part.Div.BackgroundColorRgba.HasValue && (part.Div.BackgroundColorRgba.Value & 0xFFu) > 0) ||
+                        !part.Div.Border.IsZero)
+                    {
+                        items.Add(new StageRenderItem(
+                            Key: $"div_{seq++}",
+                            Kind: StageItemKind.DivBox,
+                            LayerGroup: layerGroup,
+                            Depth: divDepth,
+                            Order: seq,
+                            X: outer.X,
+                            Y: outer.Y,
+                            Width: outer.Width,
+                            Height: outer.Height,
+                            DivStyle: part.Div));
+                    }
+
+                    LogicalRect content = ConsoleHitTester.ComputeDivContentRect(outer, part.Div);
+                    float childY = content.Y;
+                    foreach (ConsoleLine childLine in part.Div.Children)
+                    {
+                        EmitLineItems(items, scene, childLine, childY, content.X, layerGroup, ref seq, depthOverride: divDepth);
+                        childY += Math.Max(1, childLine.LineHeight);
+                    }
+
+                    break;
+                }
+            }
+        }
+    }
+
+    private static string? NormalizeVisualAssetKey(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        string trimmed = raw.Trim();
+        if (trimmed.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("g:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("vfs:", StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed;
+        }
+
+        return $"sprite:{trimmed}";
+    }
+
+    private void OnItemHover(StageRenderItem item, bool entering)
+    {
+        if (string.IsNullOrEmpty(item.HoverAssetKey))
+        {
+            return;
+        }
+
+        _hoveredItemKey = entering ? item.Key : (_hoveredItemKey == item.Key ? null : _hoveredItemKey);
+    }
+
+    private void ConfigurePendingTimeout(InputRequest? pending)
+    {
+        if (pending is null || !pending.TimeoutMilliseconds.HasValue || pending.TimeoutMilliseconds.Value <= 0)
+        {
+            CancelTimeout();
+            return;
+        }
+
+        if (_timeoutGenId == pending.GenerationId && _timeoutCts is not null)
+        {
+            return;
+        }
+
+        CancelTimeout();
+        _timeoutGenId = pending.GenerationId;
+        long totalMs = pending.TimeoutMilliseconds.Value;
+        _remainingSeconds = totalMs / 1000.0;
+        _timeoutCts = new CancellationTokenSource();
+        CancellationToken ct = _timeoutCts.Token;
+        long genId = pending.GenerationId;
+
+        _ = Task.Run(async () =>
+        {
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
+                while (await timer.WaitForNextTickAsync(ct))
+                {
+                    long leftMs = totalMs - sw.ElapsedMilliseconds;
+                    if (leftMs <= 0)
+                    {
+                        _remainingSeconds = 0;
+                        await InvokeAsync(async () =>
+                        {
+                            await SubmitResponseAsync(new InputResponse(genId, IsTimeout: true));
+                        });
+                        break;
+                    }
+
+                    _remainingSeconds = leftMs / 1000.0;
+                    await InvokeAsync(StateHasChanged);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancelled by user input or dispose
+            }
+        }, ct);
+    }
+
+    private void CancelTimeout()
+    {
+        if (_timeoutCts is not null)
+        {
+            _timeoutCts.Cancel();
+            _timeoutCts.Dispose();
+            _timeoutCts = null;
+        }
+
+        _timeoutGenId = -1;
+        _remainingSeconds = null;
+    }
+
+    private async Task SubmitResponseAsync(InputResponse response)
+    {
+        if (_busy || _renderState is null || !Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        _busy = true;
+        _error = null;
+        CancelTimeout();
+        try
+        {
+            Guid sid = _renderState.Summary.SessionId;
+            await SessionManager.SubmitInputAsync(sid, Ui.CurrentUser!.Id, response);
+            await RefreshRenderStateAsync(sid);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task OnButtonClickAsync(StageRenderItem item, MouseEventArgs e)
+    {
+        if (_busy || _renderState?.PendingInput is not { } pending || !Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        LogicalCoordsResult coords = await MapClickCoordsAsync(e);
+        if (coords.HasSelection)
+        {
+            return;
+        }
+
+        _busy = true;
+        _error = null;
+        CancelTimeout();
+        try
+        {
+            Guid sid = _renderState.Summary.SessionId;
+            Guid uid = Ui.CurrentUser!.Id;
+            int mouseBtn = MapMouseButton(e.Button);
+
+            // Always run authoritative ConsoleHitTester so CBGSETBMAPG / <img srcm> populate RESULT:3/4/6
+            SessionHitTestActionResult hitResult = await SessionManager.HitTestAndClickAsync(
+                sid,
+                uid,
+                coords.X,
+                coords.Y,
+                mouseBtn,
+                submitIfInteractive: true);
+
+            if (!hitResult.InputSubmitted && item.Button is { IsButton: true } btn)
+            {
+                var fallback = new InputResponse(
+                    GenerationId: pending.GenerationId,
+                    IsTimeout: false,
+                    IntValue: btn.IsInteger ? btn.IntValue : null,
+                    StringValue: btn.StringValue ?? (btn.IsInteger ? btn.IntValue.ToString(CultureInfo.InvariantCulture) : item.Text),
+                    HitTest: hitResult.HitTestSlots);
+                await SessionManager.SubmitInputAsync(sid, uid, fallback);
+            }
+
+            await RefreshRenderStateAsync(sid);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task OnStageClickAsync(MouseEventArgs e)
+    {
+        if (_busy || _renderState?.PendingInput is null || !Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        LogicalCoordsResult coords = await MapClickCoordsAsync(e);
+        if (coords.HasSelection || !coords.Inside)
+        {
+            return;
+        }
+
+        _busy = true;
+        _error = null;
+        try
+        {
+            Guid sid = _renderState.Summary.SessionId;
+            Guid uid = Ui.CurrentUser!.Id;
+            int mouseBtn = MapMouseButton(e.Button);
+
+            SessionHitTestActionResult hitResult = await SessionManager.HitTestAndClickAsync(
+                sid,
+                uid,
+                coords.X,
+                coords.Y,
+                mouseBtn,
+                submitIfInteractive: true);
+
+            if (hitResult.InputSubmitted)
+            {
+                CancelTimeout();
+                await RefreshRenderStateAsync(sid);
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task OnStageKeyDownAsync(KeyboardEventArgs e)
+    {
+        if (_renderState?.PendingInput is not { } pending)
+        {
+            return;
+        }
+
+        if (pending.Kind is InputRequestKind.AnyKey or InputRequestKind.TimedWait)
+        {
+            await SubmitResponseAsync(new InputResponse(pending.GenerationId, StringValue: e.Key));
+        }
+        else if (pending.Kind == InputRequestKind.OneInt && e.Key.Length == 1 && long.TryParse(e.Key, out long digit))
+        {
+            await SubmitResponseAsync(new InputResponse(pending.GenerationId, IntValue: digit, StringValue: e.Key));
+        }
+        else if (pending.Kind == InputRequestKind.OneString && e.Key.Length == 1)
+        {
+            await SubmitResponseAsync(new InputResponse(pending.GenerationId, StringValue: e.Key));
+        }
+    }
+
+    private async Task OnInputFieldKeyDownAsync(KeyboardEventArgs e)
+    {
+        if (string.Equals(e.Key, "Enter", StringComparison.Ordinal))
+        {
+            await SubmitTextInputAsync();
+        }
+    }
+
+    private async Task SubmitTextInputAsync()
+    {
+        if (_renderState?.PendingInput is not { } pending)
+        {
+            return;
+        }
+
+        if (pending.Kind == InputRequestKind.IntValue)
+        {
+            long? parsed = long.TryParse(_inputText.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long n)
+                ? n
+                : null;
+            await SubmitResponseAsync(new InputResponse(pending.GenerationId, IntValue: parsed, StringValue: _inputText));
+        }
+        else
+        {
+            await SubmitResponseAsync(new InputResponse(pending.GenerationId, StringValue: _inputText));
+        }
+    }
+
+    private async Task OnOneCharChangedAsync(string value)
+    {
+        _oneCharText = value;
+        if (string.IsNullOrEmpty(value) || _renderState?.PendingInput is not { } pending)
+        {
+            return;
+        }
+
+        string ch = value[..1];
+        if (pending.Kind == InputRequestKind.OneInt)
+        {
+            long? parsed = long.TryParse(ch, NumberStyles.Integer, CultureInfo.InvariantCulture, out long n) ? n : null;
+            await SubmitResponseAsync(new InputResponse(pending.GenerationId, IntValue: parsed, StringValue: ch));
+        }
+        else
+        {
+            await SubmitResponseAsync(new InputResponse(pending.GenerationId, StringValue: ch));
+        }
+    }
+
+    private async Task<LogicalCoordsResult> MapClickCoordsAsync(MouseEventArgs e)
+    {
+        if (_renderState is null)
+        {
+            return new LogicalCoordsResult(0, 0, false, false);
+        }
+
+        LogicalViewport vp = _renderState.Scene.Viewport;
+        try
+        {
+            return await Js.InvokeAsync<LogicalCoordsResult>(
+                "hyperaPlayer.getLogicalCoords",
+                _stageRef,
+                e.ClientX,
+                e.ClientY,
+                vp.LogicalWidth,
+                vp.LogicalHeight);
+        }
+        catch
+        {
+            return new LogicalCoordsResult(0, 0, true, false);
+        }
+    }
+
+    private static int MapMouseButton(long domButton) => domButton switch
+    {
+        0 => 1, // Left click
+        2 => 2, // Right click
+        1 => 4, // Middle click
+        _ => 1,
+    };
+
+    private async Task ToggleMuteAsync()
+    {
+        _muted = !_muted;
+        await TryJsVoidAsync("hyperaPlayer.setMasterMuted", _muted);
+    }
+
+    private async Task OnVolumeChangedAsync(int vol)
+    {
+        _masterVolume = vol;
+        await TryJsVoidAsync("hyperaPlayer.setMasterVolume", vol);
+    }
+
+    private async Task TryJsVoidAsync(string identifier, params object?[] args)
+    {
+        try
+        {
+            await Js.InvokeVoidAsync(identifier, args);
+        }
+        catch
+        {
+            // Ignore when circuit/JS is unavailable
+        }
+    }
+
+    private static string BuildTextClass(string baseClass, StageRenderItem item) =>
+        item.SamplingMode == PixelSamplingMode.CrispNearestNeighbor
+            ? $"{baseClass} hypera-font-crisp"
+            : baseClass;
+
+    private static string BuildTextStyle(StageRenderItem item)
+    {
+        var sb = new StringBuilder(128);
+        sb.Append("left:").Append(item.X.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+        sb.Append("top:").Append(item.Y.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+        sb.Append("font-size:").Append(item.FontSize).Append("px;");
+        sb.Append("color:").Append(FormatHelpers.FormatRgbaCss(item.ColorRgba)).Append(';');
+
+        string font = string.IsNullOrWhiteSpace(item.FontFamily)
+            ? "monospace"
+            : $"'{item.FontFamily.Replace("'", "\\'")}', monospace";
+        sb.Append("font-family:").Append(font).Append(';');
+
+        if ((item.FontStyle & FontStyleFlags.Bold) != 0)
+        {
+            sb.Append("font-weight:700;");
+        }
+
+        if ((item.FontStyle & FontStyleFlags.Italic) != 0)
+        {
+            sb.Append("font-style:italic;");
+        }
+
+        bool underline = (item.FontStyle & FontStyleFlags.Underline) != 0;
+        bool strike = (item.FontStyle & FontStyleFlags.Strikeout) != 0;
+        if (underline || strike)
+        {
+            sb.Append("text-decoration:");
+            if (underline)
+            {
+                sb.Append("underline");
+            }
+
+            if (underline && strike)
+            {
+                sb.Append(' ');
+            }
+
+            if (strike)
+            {
+                sb.Append("line-through");
+            }
+
+            sb.Append(';');
+        }
+
+        return sb.ToString();
+    }
+
+    private static string BuildImageClass(StageRenderItem item)
+    {
+        string samplingClass = item.SamplingMode == PixelSamplingMode.CrispNearestNeighbor
+            ? "hypera-img-crisp"
+            : "hypera-img-smooth";
+        return item.IsInteractiveImage
+            ? $"hypera-op hypera-op-image hypera-op-image-interactive {samplingClass}"
+            : $"hypera-op hypera-op-image {samplingClass}";
+    }
+
+    private static string BuildImageStyle(StageRenderItem item, AssetCacheEntry asset, LogicalViewport vp)
+    {
+        float w = item.Width > 0f ? item.Width : Math.Max(1, asset.Width);
+        float h = item.Height > 0f ? item.Height : Math.Max(1, asset.Height);
+        float top = item.IsBottomLeftCbg ? (item.Y + vp.LogicalHeight - h) : item.Y;
+
+        var sb = new StringBuilder(128);
+        sb.Append("left:").Append(item.X.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+        sb.Append("top:").Append(top.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+        sb.Append("width:").Append(w.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+        sb.Append("height:").Append(h.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+
+        if (item.Opacity < 0.999f)
+        {
+            sb.Append("opacity:").Append(Math.Clamp(item.Opacity, 0f, 1f).ToString("0.###", CultureInfo.InvariantCulture)).Append(';');
+        }
+
+        if (item.FlipX || item.FlipY)
+        {
+            sb.Append("transform:scale(")
+              .Append(item.FlipX ? "-1" : "1")
+              .Append(',')
+              .Append(item.FlipY ? "-1" : "1")
+              .Append(");");
+        }
+
+        return sb.ToString();
+    }
+
+    private static string BuildShapeStyle(StageRenderItem item) =>
+        $"left:{item.X.ToString("0.##", CultureInfo.InvariantCulture)}px;" +
+        $"top:{item.Y.ToString("0.##", CultureInfo.InvariantCulture)}px;" +
+        $"width:{Math.Max(0f, item.Width).ToString("0.##", CultureInfo.InvariantCulture)}px;" +
+        $"height:{Math.Max(0f, item.Height).ToString("0.##", CultureInfo.InvariantCulture)}px;" +
+        $"background-color:{FormatHelpers.FormatRgbaCss(item.ColorRgba)};";
+
+    private static string BuildDivStyle(StageRenderItem item)
+    {
+        var sb = new StringBuilder(192);
+        sb.Append("left:").Append(item.X.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+        sb.Append("top:").Append(item.Y.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+        sb.Append("width:").Append(Math.Max(0f, item.Width).ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+        sb.Append("height:").Append(Math.Max(0f, item.Height).ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+
+        if (item.DivStyle is { } div)
+        {
+            if (div.BackgroundColorRgba.HasValue)
+            {
+                sb.Append("background-color:").Append(FormatHelpers.FormatRgbaCss(div.BackgroundColorRgba.Value)).Append(';');
+            }
+
+            if (!div.Border.IsZero)
+            {
+                sb.Append("border-style:solid;");
+                sb.Append("border-width:")
+                  .Append(div.Border.Top.ToString("0.##", CultureInfo.InvariantCulture)).Append("px ")
+                  .Append(div.Border.Right.ToString("0.##", CultureInfo.InvariantCulture)).Append("px ")
+                  .Append(div.Border.Bottom.ToString("0.##", CultureInfo.InvariantCulture)).Append("px ")
+                  .Append(div.Border.Left.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+
+                if (div.BorderColors is { } bc)
+                {
+                    sb.Append("border-top-color:").Append(FormatHelpers.FormatRgbaCss(bc.TopRgba)).Append(';');
+                    sb.Append("border-right-color:").Append(FormatHelpers.FormatRgbaCss(bc.RightRgba)).Append(';');
+                    sb.Append("border-bottom-color:").Append(FormatHelpers.FormatRgbaCss(bc.BottomRgba)).Append(';');
+                    sb.Append("border-left-color:").Append(FormatHelpers.FormatRgbaCss(bc.LeftRgba)).Append(';');
+                }
+            }
+
+            if (!div.Radius.IsZero)
+            {
+                sb.Append("border-radius:")
+                  .Append(div.Radius.Top.ToString("0.##", CultureInfo.InvariantCulture)).Append("px ")
+                  .Append(div.Radius.Right.ToString("0.##", CultureInfo.InvariantCulture)).Append("px ")
+                  .Append(div.Radius.Bottom.ToString("0.##", CultureInfo.InvariantCulture)).Append("px ")
+                  .Append(div.Radius.Left.ToString("0.##", CultureInfo.InvariantCulture)).Append("px;");
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private void OnUiChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public async ValueTask DisposeAsync()
+    {
+        _disposed = true;
+        Ui.Changed -= OnUiChanged;
+        CancelTimeout();
+        StopAnimationLoop();
+        try
+        {
+            await Js.InvokeVoidAsync("hyperaPlayer.detachStageScaler", _wrapperRef);
+            await Js.InvokeVoidAsync("hyperaPlayer.stopAllAudio");
+            await Js.InvokeVoidAsync("hyperaPlayer.revokeAllAssets");
+        }
+        catch
+        {
+            // Circuit may already be disconnected
+        }
+    }
+
+    private enum StageItemKind
+    {
+        Image,
+        Shape,
+        DivBox,
+        Text,
+        Button,
+    }
+
+    private sealed record AssetCacheEntry(string BlobUrl, int Width, int Height, bool IsAnimated);
+
+    private sealed record StageRenderItem(
+        string Key,
+        StageItemKind Kind,
+        int LayerGroup,
+        int Depth,
+        int Order,
+        float X,
+        float Y,
+        float Width,
+        float Height,
+        bool IsBottomLeftCbg = false,
+        string? Text = null,
+        uint ColorRgba = 0xC0C0C0FFu,
+        string? FontFamily = null,
+        int FontSize = 18,
+        FontStyleFlags FontStyle = FontStyleFlags.Regular,
+        PixelSamplingMode SamplingMode = PixelSamplingMode.Auto,
+        string? AssetKey = null,
+        string? HoverAssetKey = null,
+        float Opacity = 1f,
+        bool FlipX = false,
+        bool FlipY = false,
+        bool IsInteractiveImage = false,
+        HtmlButtonContext? Button = null,
+        DivBoxStyle? DivStyle = null,
+        string? Tooltip = null);
+
+    private sealed record LogicalCoordsResult(int X, int Y, bool Inside, bool HasSelection);
+}

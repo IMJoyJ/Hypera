@@ -162,7 +162,9 @@ public sealed class StrFormParser
                                 "ERA1302",
                                 expectInt ? "Empty '{}' placeholder in FORM string." : "Empty '%%' placeholder in FORM string.",
                                 part.Span,
-                                filePath);
+                                filePath,
+                                null,
+                                [expectInt ? "{}" : "%%"]);
                             break;
                         }
 
@@ -195,7 +197,7 @@ public sealed class StrFormParser
                             {
                                 if (ts.Current.Kind != ErbTokenKind.Identifier || string.IsNullOrEmpty(ts.Current.Text))
                                 {
-                                    diagnostics.ReportError("ERA1306", "Expected 'LEFT' or 'RIGHT' alignment keyword in FORM placeholder.", ts.Current.Span, filePath);
+                                    diagnostics.ReportError("ERA1306", "Expected 'LEFT' or 'RIGHT' alignment keyword in FORM placeholder.", ts.Current.Span, filePath, null, [], "diag.ERA1306.expected");
                                 }
                                 else
                                 {
@@ -211,7 +213,7 @@ public sealed class StrFormParser
                                     }
                                     else
                                     {
-                                        diagnostics.ReportError("ERA1306", $"Invalid FORM alignment '{alignText}'; expected 'LEFT' or 'RIGHT'.", part.Span, filePath);
+                                        diagnostics.ReportError("ERA1306", $"Invalid FORM alignment '{alignText}'; expected 'LEFT' or 'RIGHT'.", part.Span, filePath, null, [alignText], "diag.ERA1306.invalid");
                                     }
                                 }
                             }
@@ -219,7 +221,8 @@ public sealed class StrFormParser
 
                         if (!ts.IsAtEnd)
                         {
-                            diagnostics.ReportError("ERA1307", $"Unexpected token '{ts.Current.Text ?? ts.Current.Kind.ToString()}' inside FORM placeholder.", ts.Current.Span, filePath);
+                            string tokText = ts.Current.Text ?? ts.Current.Kind.ToString();
+                            diagnostics.ReportError("ERA1307", $"Unexpected token '{tokText}' inside FORM placeholder.", ts.Current.Span, filePath, null, [tokText]);
                         }
 
                         // Constant fold integer literal without dynamic width

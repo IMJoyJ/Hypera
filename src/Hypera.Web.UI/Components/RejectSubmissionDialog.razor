@@ -1,0 +1,102 @@
+@inject UiSessionState Ui
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">@Ui.T("review.reject")</MudText>
+    </TitleContent>
+    <DialogContent>
+        <MudStack Spacing="3">
+            <MudTextField @bind-Value="_reason"
+                          Label="@Ui.T("admin.rejectReason")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Lines="3"
+                          Immediate="true"
+                          Required="true" />
+
+            @if (Binaries.Count > 0)
+            {
+                <div>
+                    <MudText Typo="Typo.subtitle2" Class="mb-1">@Ui.T("admin.rejectFlagBinaries")</MudText>
+                    <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-2 d-block">
+                        @Ui.T("admin.rejectFlagHint")
+                    </MudText>
+
+                    <MudPaper Outlined="true" Class="pa-2">
+                        <MudStack Spacing="1">
+                            @foreach (BinaryInspectionItem bin in Binaries)
+                            {
+                                Guid entryId = bin.EntryId;
+                                bool isChecked = _selectedHighRisk.TryGetValue(entryId, out bool v) && v;
+                                <div class="d-flex align-center justify-space-between gap-2">
+                                    <MudCheckBox T="bool"
+                                                 Value="@isChecked"
+                                                 ValueChanged="@(val => _selectedHighRisk[entryId] = val)"
+                                                 Color="Color.Error"
+                                                 Dense="true">
+                                        <span class="hypera-mono">@bin.RelativePath</span>
+                                        <span class="ml-2" style="opacity:0.7;">(@FormatHelpers.FormatBytes(bin.ByteSize))</span>
+                                    </MudCheckBox>
+                                    <MudChip T="string"
+                                             Size="Size.Small"
+                                             Variant="Variant.Outlined"
+                                             Color="@FormatHelpers.GetReputationColor(bin.EffectiveStatus)">
+                                        @FormatHelpers.GetReputationText(bin.EffectiveStatus, Ui)
+                                    </MudChip>
+                                </div>
+                            }
+                        </MudStack>
+                    </MudPaper>
+                </div>
+            }
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="@Cancel">@Ui.T("app.cancel")</MudButton>
+        <MudButton Variant="Variant.Filled"
+                   Color="Color.Error"
+                   Disabled="@string.IsNullOrWhiteSpace(_reason)"
+                   OnClick="@Confirm">
+            @Ui.T("review.reject")
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter]
+    private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter]
+    public IReadOnlyList<BinaryInspectionItem> Binaries { get; set; } = [];
+
+    private string _reason = string.Empty;
+    private readonly Dictionary<Guid, bool> _selectedHighRisk = new();
+
+    protected override void OnInitialized()
+    {
+        // All binary checkboxes MUST start unchecked by default
+        foreach (BinaryInspectionItem bin in Binaries)
+        {
+            _selectedHighRisk[bin.EntryId] = false;
+        }
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private void Confirm()
+    {
+        if (string.IsNullOrWhiteSpace(_reason))
+        {
+            return;
+        }
+
+        List<Guid> flagged = _selectedHighRisk
+            .Where(static kv => kv.Value)
+            .Select(static kv => kv.Key)
+            .ToList();
+
+        MudDialog.Close(DialogResult.Ok(new RejectSubmissionDialogResult(_reason.Trim(), flagged)));
+    }
+
+    public sealed record RejectSubmissionDialogResult(string Reason, IReadOnlyList<Guid> HighRiskEntryIds);
+}

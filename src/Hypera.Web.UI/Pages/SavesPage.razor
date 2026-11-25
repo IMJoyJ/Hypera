@@ -1,0 +1,67 @@
+@page "/apps/{AppId:guid}/saves"
+@implements IDisposable
+@inject UiSessionState Ui
+@inject IAppCatalogService CatalogService
+@inject NavigationManager Navigation
+
+<div class="d-flex flex-wrap align-center justify-space-between gap-2 mb-4">
+    <div class="d-flex align-center gap-2">
+        <MudButton Variant="Variant.Text"
+                   Size="Size.Small"
+                   StartIcon="@Icons.Material.Filled.ArrowBack"
+                   Href="@($"/apps/{AppId}")">
+            @Ui.T("player.backToApp")
+        </MudButton>
+        @if (_app is not null)
+        {
+            <MudText Typo="Typo.h5" Style="font-weight: 600;">@_app.Title</MudText>
+        }
+    </div>
+
+    <MudButton Variant="Variant.Filled"
+               Color="Color.Primary"
+               Size="Size.Small"
+               StartIcon="@Icons.Material.Filled.PlayArrow"
+               Href="@($"/play/{AppId}")">
+        @Ui.T("app.play")
+    </MudButton>
+</div>
+
+@if (!Ui.IsInitialized)
+{
+    <MudProgressLinear Indeterminate="true" Color="Color.Primary" />
+}
+else if (!Ui.IsAuthenticated)
+{
+    <MudAlert Severity="Severity.Warning">@Ui.T("auth.loginRequired")</MudAlert>
+}
+else
+{
+    <MudPaper Outlined="true" Class="pa-4">
+        <SaveManagerPanel AppId="@AppId" UserId="@Ui.CurrentUser!.Id" />
+    </MudPaper>
+}
+
+@code {
+    [Parameter]
+    public Guid AppId { get; set; }
+
+    private GameApp? _app;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Ui.Changed += OnUiChanged;
+        await Ui.InitializeAsync();
+        if (!Ui.IsAuthenticated && Ui.IsMultiUserServer)
+        {
+            Navigation.NavigateTo($"/login?returnUrl={Uri.EscapeDataString($"/apps/{AppId}/saves")}");
+            return;
+        }
+
+        _app = await CatalogService.GetAppDetailAsync(AppId, Ui.CurrentUser?.Id);
+    }
+
+    private void OnUiChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Ui.Changed -= OnUiChanged;
+}

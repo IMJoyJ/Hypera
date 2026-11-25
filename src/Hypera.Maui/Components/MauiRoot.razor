@@ -1,0 +1,54 @@
+@inject MauiPlatformInitializer Initializer
+
+@if (_initialized)
+{
+    <CascadingAuthenticationState>
+        <Hypera.Web.UI.Routes />
+    </CascadingAuthenticationState>
+}
+else if (_errorMessage is not null)
+{
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;background:#14191F;color:#E2E8F0;padding:24px;font-family:sans-serif;text-align:center;">
+        <h2 style="margin-bottom:8px;">Hypera</h2>
+        <p style="color:#FB7185;max-width:480px;margin-bottom:16px;">@_errorMessage</p>
+        <button @onclick="RetryAsync" style="padding:8px 20px;border:none;border-radius:6px;background:#2A9D8F;color:#FFFFFF;cursor:pointer;">
+            Retry
+        </button>
+    </div>
+}
+else
+{
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;background:#14191F;color:#CBD5E1;font-family:sans-serif;">
+        <p>Initializing Hypera...</p>
+    </div>
+}
+
+@code {
+    private bool _initialized;
+    private string? _errorMessage;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await InitializeAsync();
+    }
+
+    private async Task RetryAsync()
+    {
+        _errorMessage = null;
+        StateHasChanged();
+        await InitializeAsync();
+    }
+
+    private async Task InitializeAsync()
+    {
+        try
+        {
+            await Initializer.EnsureInitializedAsync();
+            _initialized = true;
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+    }
+}

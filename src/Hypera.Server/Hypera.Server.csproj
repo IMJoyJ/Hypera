@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <RootNamespace>Hypera.Server</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Hypera.Platform\Hypera.Platform.csproj" />
+    <ProjectReference Include="..\Hypera.Web.UI\Hypera.Web.UI.csproj" />
+  </ItemGroup>
+</Project>

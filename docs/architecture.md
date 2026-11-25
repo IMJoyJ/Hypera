@@ -16,8 +16,15 @@
 
 ```mermaid
 flowchart TD
-    CLI["Hypera.Cli (hypera, net10.0)"] --> Core["Hypera.Core (RootNamespace: Hypera, net10.0)"]
-    CLI --> Shim["Hypera.LegacyPluginShim (AssemblyName: Emuera, net10.0)"]
+    Server["Hypera.Server (ASP.NET Core, 0.0.0.0:5080)"] --> WebUI["Hypera.Web.UI (MudBlazor RCL)"]
+    Server --> Platform["Hypera.Platform (EF Core SQLite)"]
+    Maui["Hypera.Maui (Windows / Android Blazor Hybrid)"] --> WebUI
+    Maui --> Platform
+    WebUI --> Platform
+    Platform --> Core["Hypera.Core (RootNamespace: Hypera, net10.0)"]
+    Platform --> Shim["Hypera.LegacyPluginShim (AssemblyName: Emuera, net10.0)"]
+    CLI["Hypera.Cli (hypera, net10.0)"] --> Core
+    CLI --> Shim
     Audio["Hypera.Audio (net10.0)"] --> Core
     Shim --> Core
     WinForms["Hypera.Views.WinForms (net10.0-windows10.0.19041.0)"] --> Core
@@ -25,17 +32,24 @@ flowchart TD
     Tests["Hypera.Tests (xUnit, net10.0)"] --> Core
     Tests --> Audio
     Tests --> Shim
+    PlatformTests["Hypera.Platform.Tests (xUnit, net10.0)"] --> Platform
+    PlatformTests --> Server
 ```
 
 | 项目路径 | 目标框架 / 程序集名 | 职责边界 |
 | --- | --- | --- |
-| `src/Hypera.Core` | `net10.0` (`Hypera.Core.dll`) | 核心契约与基础设施：`Hypera.VirtualFs`、`Hypera.Diagnostics`、`Hypera.Configuration`、`Hypera.Bytecode`、`Hypera.Runtime`、`Hypera.Rendering`、`Hypera.Audio` |
+| `src/Hypera.Core` | `net10.0` (`Hypera.Core.dll`) | 核心契约与基础设施：`Hypera.VirtualFs`、`Hypera.Diagnostics`、`Hypera.Localization`、`Hypera.Configuration`、`Hypera.Bytecode`、`Hypera.Runtime`、`Hypera.Rendering`、`Hypera.Audio` |
 | `src/Hypera.Audio` | `net10.0` (`Hypera.Audio.dll`) | 跨平台 10 路音效（SE `0..9`）+ 1 路循环背景音乐（BGM）软件混音器 `CrossPlatformAudioMixer` |
 | `src/Hypera.LegacyPluginShim` | `net10.0` (**`Emuera.dll`**) | 兼容旧版 `CALLSHARP` 插件的 `MinorShift.Emuera.Runtime.Utils.PluginSystem` 二进制垫片，基于可回收 `AssemblyLoadContext` 与 `AsyncLocal` 引擎作用域绑定 |
 | `src/Hypera.Views.WinForms` | `net10.0-windows10.0.19041.0` | 超薄 `SKControl` 宿主控件 `HyperaSkiaControl`，转发绘制与逻辑视口鼠标坐标 |
 | `src/Hypera.Views.Wpf` | `net10.0-windows10.0.19041.0` | 超薄 `SKElement` 宿主控件 `HyperaSkiaElement`，处理 WPF DPI 换算并转发逻辑视口输入 |
 | `src/Hypera.Cli` | `net10.0` (**`hypera`**) | 命令行入口，承载 `run`、`compile`、`pack`、`bundle` 四大子命令 |
-| `tests/Hypera.Tests` | `net10.0` | 核心布局、二进制头、源码映射、视口变换、音频状态与插件并发隔离测试套件 |
+| `src/Hypera.Platform` | `net10.0` (`Hypera.Platform.dll`) | 多租户/本地共用平台服务层：SQLite WAL 持久化、鉴权与首位自动管理员、并行 `.zip`→`.hep` 编译审核流水线、二进制 `(SHA-256, Size)` 信誉库、智能选版、沙箱存档与共享字节码会话托管 |
+| `src/Hypera.Web.UI` | `net10.0` (`Hypera.Web.UI.dll`) | 共享 MudBlazor RCL：Slate & Teal 主题、多语言即时切换、目录/详情/管理后台、存档管理与富媒体 `PlayStage` 舞台组件 |
+| `src/Hypera.Server` | `net10.0` (`Hypera.Server.dll`) | ASP.NET Core Blazor Interactive Server 宿主（默认 `http://0.0.0.0:5080`），承载 Cookie 认证、源码/存档流式端点与空闲会话回收 |
+| `src/Hypera.Maui` | `net10.0-windows10.0.19041.0`; `net10.0-android` | `.NET MAUI Blazor Hybrid` 跨平台本地客户端，自动初始化本地 SQLite 与 `SingleUserLocalAdmin` 身份，零代码复用 `Hypera.Web.UI` |
+| `tests/Hypera.Tests` | `net10.0` | 核心编译器、多语言诊断、VM 运行时、Skia/WebP/瓦片字体渲染、VFS/存档、音频与插件并发隔离测试套件 |
+| `tests/Hypera.Platform.Tests` | `net10.0` | 平台核心服务与基于 `WebApplicationFactory<Program>` 的多用户 HTTP 全栈集成测试 |
 
 ---
 
@@ -127,4 +141,23 @@ flowchart TD
 2. **文件与编码读取**：严禁在业务代码中直接调用 `System.IO.File.*` 或 `Directory.*` 读取游戏脚本与资源！一律通过注入的 `IVirtualFileSystem` + `VfsPathNormalizer` 访问，文本解码默认走 `EncodingDetector`（自动识别 UTF-8 BOM / 严格 UTF-8 / Shift-JIS CP932 / GB18030）。
 3. **配置分层只读**：影响语法与符号绑定的开关只从 `CompilerOptions` 读取（包括 `;!;`/`;^;`/`;#;` 特殊注释前缀、`SIF` 空行兼容、`Compati*` 系列开关、`UseERD` 与 `setting.json` 的 `UseScopedVariableInstruction`）；运行期视口与存档参数只从 `EmueraEngine.Options`（`RuntimeOptions`）读取。
 4. **旧版插件隔离**：执行 `OpCode.CallSharpPlugin` 时，必须先包裹 `using (pluginManager.EnterScope())` 建立当前异步流的 `AsyncLocal` 绑定，确保插件内部调用 `PluginManager.GetInstance()` 与 `PluginAPICharContext.CreateCharContext()` 精确路由到当前 `EmueraEngine` 实例。
-5. **跨平台构建兼容性**：`Hypera.Core`、`Hypera.Audio`、`Hypera.LegacyPluginShim`、`Hypera.Cli` 与 `Hypera.Tests` 必须保持纯 `net10.0` 零 Windows 专属 API 依赖，确保在 Linux 容器与 macOS 上原生编译运行。
+5. **跨平台构建兼容性**：`Hypera.Core`、`Hypera.Audio`、`Hypera.LegacyPluginShim`、`Hypera.Cli`、`Hypera.Platform`、`Hypera.Web.UI`、`Hypera.Server` 与测试项目保持纯 `net10.0` 零 Windows 专属 API 依赖，确保在 Linux 容器与 macOS 上原生编译运行。
+
+---
+
+## 6. 平台应用层、双宿主与热插拔本地化
+
+### 6.1 `Hypera.Platform` 核心流水线与安全边界
+- **启动初始化（`InitializeHyperaPlatformDatabaseAsync`）**：在 `Hypera.Server` 与 `Hypera.Maui` 启动时统一创建数据目录（`packages/`、`sources/`、`saves/`、`locales/`）、初始化 SQLite WAL 数据库，并主动拉起 `PackagePipelineService` 的有界并行编译消费者线程池（同时恢复异常中断的 `Compiling` 队列任务）。
+- **版本链与选版策略（`VersionResolutionService`）**：每个 `GameApp` 维护可重排的 `GameVersion`（`OrderIndex`）与多语言变体 `GameLanguageVariant`，支持三种用户选版策略：算法 β `KnownLanguagePriority`（按用户理解语言优先列表向最新可玩版本收敛）、`VersionPriority`（最新版本优先）与 `AlwaysLastRun`（固定上次运行版本与语言）。
+- **包审核与二进制信誉（`PackagePipelineService` & `BinaryReputationService`）**：上传 `.zip` 时执行路径穿越与 Zip Bomb 校验，只读扫描 `.dll`/`.exe`/`.so`/`.dylib` 计算 `(SHA-256, ByteSize)`；在 `MultiUserServer` 模式下，管理员通过 `PendingReview` 审核后才原子替换线上 `ActiveSubmissionId` 并允许将二进制标记为 `Trusted`（驳回时高风险复选框默认不勾选）。
+- **会话托管与存档沙箱（`RuntimeSessionManager` & `UserSaveService`）**：按 `SubmissionId` 在内存中复用不可变 `BytecodeModule`；按 `(UserId, AppId)` 强制单活动会话互斥与跨版本共享存档目录（`saves/{userId}/{appId}`），严格校验单应用配额与步数/壁钟防死循环熔断；服务端默认禁用未授权 `CALLSHARP`。
+
+### 6.2 `Hypera.Web.UI`、`Hypera.Server` 与 `Hypera.Maui`
+- **`Hypera.Web.UI`**：共享 MudBlazor 组件库，采用 Slate & Teal 配色方案。`PlayStage.razor` 与 `hyperaPlayer.js` 直接绑定 `GetSessionRenderStateAsync`、`ReadSessionAssetAsync` 与 `HitTestAndClickAsync`，支持自定义 `font/*.ttf` `@font-face` 注册、精灵/动画 WebP/`g:<id>` 画布流式加载、`WebAudioTracker` 1 路 BGM + 10 路 SE 通道同步，以及 `CBGSETBMAPG` / `<img srcm>` 像素命中回填 `RESULT:3/4/6`。
+- **`Hypera.Server`**：默认绑定 `http://0.0.0.0:5080`，提供 Cookie 身份验证（`/api/auth/*`）、带权限校验的源码/存档流式下载（`/api/downloads/source/{submissionId}`、`/api/downloads/saves/{appId}/zip`）、健康检查（`/healthz`）及空闲会话后台清理。
+- **`Hypera.Maui`**：通过 `BlazorWebView` 加载同一套 `Hypera.Web.UI.Routes`，`MauiPlatformInitializer` 在首屏渲染前异步完成数据库初始化与本地管理员账号（`SingleUserLocalAdmin`）就绪。
+
+### 6.3 社区多语言包（`locales/*.json`）
+- `HyperaLocalizer` 默认回退语言为日语（`ja`），内置 `ja`、`zh-CN`、`en` 完整 UI 与编译器结构化诊断（`diag.ERA*`）词典。
+- `Hypera.Server` 与 `Hypera.Maui` 均监听 `{DataRoot}/locales/` 目录；新增或修改外部 `*.json` 文件会自动触发 `LocalesChanged` 事件，无需重启或重新编译即可在所有在线界面中即时切换。

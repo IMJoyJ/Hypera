@@ -1,0 +1,257 @@
+@inject UiSessionState Ui
+@inject IAppCatalogService CatalogService
+@inject IAuthService AuthService
+@inject ISnackbar Snackbar
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">@Ui.T("appDetail.fork")</MudText>
+    </TitleContent>
+    <DialogContent>
+        <MudStack Spacing="3">
+            <MudAlert Severity="Severity.Info" Dense="true">
+                @Ui.T("appDetail.forkZipRequired")
+            </MudAlert>
+
+            @if (!string.IsNullOrWhiteSpace(_error))
+            {
+                <MudAlert Severity="Severity.Error" Dense="true">@_error</MudAlert>
+            }
+
+            <MudGrid Spacing="2">
+                <MudItem xs="6">
+                    <MudSelect T="Guid"
+                               Value="_sourceVersionId"
+                               ValueChanged="@OnSourceVersionChanged"
+                               Label="@Ui.T("appDetail.launchVersion")"
+                               Variant="Variant.Outlined"
+                               Margin="Margin.Dense">
+                        @foreach (GameVersion ver in Versions)
+                        {
+                            <MudSelectItem Value="@ver.Id">@ver.VersionLabel</MudSelectItem>
+                        }
+                    </MudSelect>
+                </MudItem>
+                <MudItem xs="6">
+                    <MudSelect T="string"
+                               @bind-Value="_sourceLanguageCode"
+                               Label="@Ui.T("appDetail.launchLanguage")"
+                               Variant="Variant.Outlined"
+                               Margin="Margin.Dense">
+                        @foreach (string lang in SourceLanguagesForSelectedVersion)
+                        {
+                            <MudSelectItem Value="@lang">@lang</MudSelectItem>
+                        }
+                    </MudSelect>
+                </MudItem>
+            </MudGrid>
+
+            <MudTextField @bind-Value="_title"
+                          Label="@Ui.T("appDetail.forkTitle")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Immediate="true"
+                          Required="true" />
+
+            <MudTextField @bind-Value="_summary"
+                          Label="@Ui.T("catalog.summary")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Lines="2" />
+
+            <MudGrid Spacing="2">
+                <MudItem xs="6">
+                    <MudTextField @bind-Value="_versionLabel"
+                                  Label="@Ui.T("catalog.initialVersion")"
+                                  Variant="Variant.Outlined"
+                                  Margin="Margin.Dense"
+                                  Immediate="true" />
+                </MudItem>
+                <MudItem xs="6">
+                    <MudSelect T="string"
+                               @bind-Value="_targetLanguageCode"
+                               Label="@Ui.T("catalog.languageCode")"
+                               Variant="Variant.Outlined"
+                               Margin="Margin.Dense">
+                        @foreach (string lang in AvailableLanguageChoices)
+                        {
+                            <MudSelectItem Value="@lang">@FormatHelpers.GetLanguageLabel(lang, Ui.Localizer)</MudSelectItem>
+                        }
+                    </MudSelect>
+                </MudItem>
+            </MudGrid>
+
+            <MudSwitch @bind-Value="_allowSourceDownload"
+                       Color="Color.Primary"
+                       Label="@Ui.T("catalog.allowSourceDownload")" />
+
+            <div class="d-flex align-center gap-3">
+                <MudFileUpload T="IBrowserFile"
+                               Accept=".zip"
+                               FilesChanged="@OnFileSelected">
+                    <ActivatorContent>
+                        <MudButton Variant="Variant.Outlined"
+                                   Color="Color.Primary"
+                                   StartIcon="@Icons.Material.Filled.UploadFile"
+                                   Disabled="@_submitting">
+                            @Ui.T("appDetail.selectZip")
+                        </MudButton>
+                    </ActivatorContent>
+                </MudFileUpload>
+                @if (_zipFile is not null)
+                {
+                    <MudText Typo="Typo.body2">@_zipFile.Name (@FormatHelpers.FormatBytes(_zipFile.Size))</MudText>
+                }
+                else
+                {
+                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                        @Ui.T("appDetail.maxSize", FormatHelpers.FormatBytes(_maxUploadBytes))
+                    </MudText>
+                }
+            </div>
+
+            @if (_submitting)
+            {
+                <MudProgressLinear Indeterminate="true" Color="Color.Primary" />
+            }
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="@Cancel" Disabled="@_submitting">@Ui.T("app.cancel")</MudButton>
+        <MudButton Variant="Variant.Filled"
+                   Color="Color.Primary"
+                   OnClick="@SubmitAsync"
+                   Disabled="@(!CanSubmit)">
+            @Ui.T("appDetail.fork")
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter]
+    private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter]
+    public Guid UserId { get; set; }
+
+    [Parameter]
+    public GameApp SourceApp { get; set; } = default!;
+
+    [Parameter]
+    public IReadOnlyList<GameVersion> Versions { get; set; } = [];
+
+    private Guid _sourceVersionId;
+    private string _sourceLanguageCode = "ja";
+    private string _title = string.Empty;
+    private string _summary = string.Empty;
+    private string _versionLabel = "v1.0";
+    private string _targetLanguageCode = "ja";
+    private bool _allowSourceDownload = true;
+    private IBrowserFile? _zipFile;
+    private long _maxUploadBytes = PlatformSettings.DefaultMaxUploadBytes;
+    private bool _submitting;
+    private string? _error;
+
+    private IEnumerable<string> AvailableLanguageChoices =>
+        Ui.AvailableLocales.Select(static l => l.Code)
+            .Concat(FormatHelpers.CommonLanguageCodes)
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+    private IEnumerable<string> SourceLanguagesForSelectedVersion
+    {
+        get
+        {
+            GameVersion? selected = Versions.FirstOrDefault(v => v.Id == _sourceVersionId);
+            if (selected is null)
+            {
+                return ["ja"];
+            }
+
+            List<string> langs = selected.Variants.Select(static v => v.LanguageCode).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            return langs.Count > 0 ? langs : ["ja"];
+        }
+    }
+
+    private bool CanSubmit =>
+        !_submitting
+        && _sourceVersionId != Guid.Empty
+        && !string.IsNullOrWhiteSpace(_sourceLanguageCode)
+        && !string.IsNullOrWhiteSpace(_title)
+        && !string.IsNullOrWhiteSpace(_versionLabel)
+        && !string.IsNullOrWhiteSpace(_targetLanguageCode)
+        && _zipFile is not null;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _title = $"{SourceApp.Title} (Fork)";
+        _targetLanguageCode = Ui.UiLanguage;
+        GameVersion? first = Versions.FirstOrDefault();
+        if (first is not null)
+        {
+            _sourceVersionId = first.Id;
+            _sourceLanguageCode = first.Variants.FirstOrDefault()?.LanguageCode ?? "ja";
+        }
+
+        try
+        {
+            PlatformSettings settings = await AuthService.GetSettingsAsync();
+            _maxUploadBytes = settings.MaxUploadBytes;
+        }
+        catch
+        {
+            // Keep default
+        }
+    }
+
+    private void OnSourceVersionChanged(Guid versionId)
+    {
+        _sourceVersionId = versionId;
+        _sourceLanguageCode = SourceLanguagesForSelectedVersion.FirstOrDefault() ?? "ja";
+    }
+
+    private void OnFileSelected(IBrowserFile? file)
+    {
+        _zipFile = file;
+        _error = null;
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private async Task SubmitAsync()
+    {
+        if (!CanSubmit || _zipFile is null)
+        {
+            return;
+        }
+
+        _submitting = true;
+        _error = null;
+        try
+        {
+            await using Stream stream = _zipFile.OpenReadStream(_maxUploadBytes);
+            ForkAppResult result = await CatalogService.ForkAppWithPackageAsync(
+                userId: UserId,
+                sourceAppId: SourceApp.Id,
+                sourceVersionId: _sourceVersionId,
+                newTitle: _title.Trim(),
+                summary: _summary.Trim(),
+                initialVersionLabel: _versionLabel.Trim(),
+                initialLanguageCode: _targetLanguageCode.Trim(),
+                allowSourceDownload: _allowSourceDownload,
+                zipArchiveStream: stream,
+                initialChangelog: string.Empty,
+                declaredByteLength: _zipFile.Size);
+
+            Snackbar.Add(Ui.T("appDetail.uploaded"), Severity.Success);
+            MudDialog.Close(DialogResult.Ok(result.App.Id));
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}

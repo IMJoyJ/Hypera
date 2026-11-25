@@ -1,0 +1,20 @@
+<CascadingAuthenticationState>
+    <Router AppAssembly="typeof(Routes).Assembly">
+        <Found Context="routeData">
+            <RouteView RouteData="routeData" DefaultLayout="typeof(MainLayout)" />
+            <FocusOnNavigate RouteData="routeData" Selector="h1" />
+        </Found>
+        <NotFound>
+            <LayoutView Layout="typeof(MainLayout)">
+                <MudContainer MaxWidth="MaxWidth.Small" Class="mt-8">
+                    <MudPaper Class="pa-6" Elevation="1">
+                        <MudText Typo="Typo.h5">404</MudText>
+                        <MudButton Variant="Variant.Text" Color="Color.Primary" Href="/" Class="mt-3">
+                            Hypera
+                        </MudButton>
+                    </MudPaper>
+                </MudContainer>
+            </LayoutView>
+        </NotFound>
+    </Router>
+</CascadingAuthenticationState>

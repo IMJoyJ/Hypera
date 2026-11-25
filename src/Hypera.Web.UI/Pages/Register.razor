@@ -1,0 +1,136 @@
+@page "/register"
+@implements IDisposable
+@inject UiSessionState Ui
+@inject IAuthService AuthService
+@inject NavigationManager Navigation
+
+<MudContainer MaxWidth="MaxWidth.ExtraSmall" Class="mt-8">
+    <MudPaper Class="pa-6" Elevation="2">
+        <MudText Typo="Typo.h5" Class="mb-4">@Ui.T("auth.register")</MudText>
+
+        @if (_loading)
+        {
+            <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mb-4" />
+        }
+        else if (_isFirstUser)
+        {
+            <MudAlert Severity="Severity.Info" Dense="true" Class="mb-4">
+                @Ui.T("auth.firstUserAdminHint")
+            </MudAlert>
+        }
+        else if (!_allowRegistration)
+        {
+            <MudAlert Severity="Severity.Warning" Dense="true" Class="mb-4">
+                @Ui.T("auth.registrationClosed")
+            </MudAlert>
+        }
+
+        @if (!string.IsNullOrWhiteSpace(Error))
+        {
+            <MudAlert Severity="Severity.Error" Dense="true" Class="mb-4">
+                @FormatHelpers.MapAuthError(Error, Ui)
+            </MudAlert>
+        }
+
+        <form method="post" action="/api/auth/register">
+            <input type="hidden" name="username" value="@_username" />
+            <input type="hidden" name="password" value="@_password" />
+            <input type="hidden" name="uiLanguage" value="@Ui.UiLanguage" />
+            @if (!string.IsNullOrWhiteSpace(ReturnUrl))
+            {
+                <input type="hidden" name="returnUrl" value="@ReturnUrl" />
+            }
+
+            <MudTextField @bind-Value="_username"
+                          Label="@Ui.T("auth.username")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Immediate="true"
+                          Disabled="@(!CanRegister)"
+                          Class="mb-3" />
+
+            <MudTextField @bind-Value="_password"
+                          Label="@Ui.T("auth.password")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          InputType="InputType.Password"
+                          Immediate="true"
+                          Disabled="@(!CanRegister)"
+                          Class="mb-3" />
+
+            <MudTextField @bind-Value="_confirmPassword"
+                          Label="@Ui.T("auth.confirmPassword")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          InputType="InputType.Password"
+                          Immediate="true"
+                          Disabled="@(!CanRegister)"
+                          Error="@PasswordMismatch"
+                          ErrorText="@(PasswordMismatch ? Ui.T("auth.passwordMismatch") : null)"
+                          Class="mb-4" />
+
+            <MudButton ButtonType="ButtonType.Submit"
+                       Variant="Variant.Filled"
+                       Color="Color.Primary"
+                       FullWidth="true"
+                       Disabled="@(!CanSubmit)">
+                @Ui.T("auth.register")
+            </MudButton>
+        </form>
+
+        <div class="d-flex justify-end mt-3">
+            <MudButton Variant="Variant.Text" Size="Size.Small" Href="/login" Class="text-none">
+                @Ui.T("auth.switchToLogin")
+            </MudButton>
+        </div>
+    </MudPaper>
+</MudContainer>
+
+@code {
+    [SupplyParameterFromQuery(Name = "error")]
+    public string? Error { get; set; }
+
+    [SupplyParameterFromQuery(Name = "returnUrl")]
+    public string? ReturnUrl { get; set; }
+
+    private bool _loading = true;
+    private bool _isFirstUser;
+    private bool _allowRegistration = true;
+    private string _username = string.Empty;
+    private string _password = string.Empty;
+    private string _confirmPassword = string.Empty;
+
+    private bool CanRegister => !_loading && (_isFirstUser || _allowRegistration);
+    private bool PasswordMismatch => !string.IsNullOrEmpty(_confirmPassword) && !string.Equals(_password, _confirmPassword, StringComparison.Ordinal);
+    private bool CanSubmit =>
+        CanRegister
+        && !string.IsNullOrWhiteSpace(_username)
+        && !string.IsNullOrEmpty(_password)
+        && string.Equals(_password, _confirmPassword, StringComparison.Ordinal);
+
+    protected override async Task OnInitializedAsync()
+    {
+        Ui.Changed += OnUiChanged;
+        await Ui.InitializeAsync();
+        if (Ui.IsLocalSingleUser || Ui.IsAuthenticated)
+        {
+            Navigation.NavigateTo("/");
+            return;
+        }
+
+        try
+        {
+            _isFirstUser = !await AuthService.HasAnyUsersAsync();
+            PlatformSettings settings = await AuthService.GetSettingsAsync();
+            _allowRegistration = settings.AllowOpenRegistration;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private void OnUiChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Ui.Changed -= OnUiChanged;
+}

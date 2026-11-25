@@ -1,0 +1,332 @@
+@inject UiSessionState Ui
+@inject IUserSaveService SaveService
+@inject IAuthService AuthService
+@inject IDialogService DialogService
+@inject ISnackbar Snackbar
+@inject IJSRuntime Js
+
+<MudStack Spacing="3">
+    <div class="d-flex flex-wrap align-center justify-space-between gap-2">
+        <div class="d-flex align-center gap-2">
+            <MudText Typo="Typo.h6" Style="font-weight: 600;">@Ui.T("saves.title")</MudText>
+            <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined" Color="Color.Secondary">
+                @Ui.T("saves.totalSize", FormatHelpers.FormatBytes(_files.Sum(static f => f.ByteSize)))
+            </MudChip>
+        </div>
+
+        <MudIconButton Icon="@Icons.Material.Filled.Refresh"
+                       Size="Size.Small"
+                       OnClick="@LoadFilesAsync"
+                       title="@Ui.T("app.refresh")" />
+    </div>
+
+    <div class="d-flex flex-wrap align-center gap-2">
+        <MudFileUpload T="IBrowserFile" FilesChanged="@OnUploadSingleFileAsync">
+            <ActivatorContent>
+                <MudButton Variant="Variant.Outlined"
+                           Color="Color.Primary"
+                           Size="Size.Small"
+                           StartIcon="@Icons.Material.Filled.UploadFile"
+                           Disabled="@_busy">
+                    @Ui.T("saves.uploadFile")
+                </MudButton>
+            </ActivatorContent>
+        </MudFileUpload>
+
+        <MudFileUpload T="IBrowserFile" Accept=".zip" FilesChanged="@OnImportZipAsync">
+            <ActivatorContent>
+                <MudButton Variant="Variant.Outlined"
+                           Color="Color.Primary"
+                           Size="Size.Small"
+                           StartIcon="@Icons.Material.Filled.Archive"
+                           Disabled="@_busy">
+                    @Ui.T("saves.importZip")
+                </MudButton>
+            </ActivatorContent>
+        </MudFileUpload>
+
+        <MudSwitch @bind-Value="_replaceOnImport"
+                   Color="Color.Warning"
+                   Size="Size.Small"
+                   Label="@(_replaceOnImport ? Ui.T("saves.importReplace") : Ui.T("saves.importMerge"))" />
+
+        <MudSpacer />
+
+        <MudButton Variant="Variant.Filled"
+                   Color="Color.Primary"
+                   Size="Size.Small"
+                   StartIcon="@Icons.Material.Filled.Download"
+                   Disabled="@(_busy || _files.Count == 0)"
+                   OnClick="@ExportZipAsync">
+            @Ui.T("saves.exportZip")
+        </MudButton>
+
+        <MudButton Variant="Variant.Outlined"
+                   Color="Color.Error"
+                   Size="Size.Small"
+                   StartIcon="@Icons.Material.Filled.DeleteSweep"
+                   Disabled="@(_busy || _files.Count == 0)"
+                   OnClick="@ClearAllAsync">
+            @Ui.T("saves.clearAll")
+        </MudButton>
+    </div>
+
+    @if (_loading || _busy)
+    {
+        <MudProgressLinear Indeterminate="true" Color="Color.Primary" />
+    }
+
+    @if (!_loading && _files.Count == 0)
+    {
+        <MudPaper Outlined="true" Class="pa-6 text-center">
+            <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("saves.emptyList")</MudText>
+        </MudPaper>
+    }
+    else if (_files.Count > 0)
+    {
+        <MudSimpleTable Dense="true" Hover="true" Outlined="true">
+            <thead>
+                <tr>
+                    <th>@Ui.T("saves.fileName")</th>
+                    <th style="width: 100px;">@Ui.T("saves.size")</th>
+                    <th style="width: 150px;">@Ui.T("saves.timestamp")</th>
+                    <th style="width: 96px;"></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (UserSaveFileEntry file in _files)
+                {
+                    <tr>
+                        <td class="hypera-mono">@file.RelativePath</td>
+                        <td>@FormatHelpers.FormatBytes(file.ByteSize)</td>
+                        <td>@FormatHelpers.FormatUtc(file.LastModifiedUtc)</td>
+                        <td>
+                            <div class="d-flex justify-end gap-1">
+                                <MudIconButton Icon="@Icons.Material.Filled.Download"
+                                               Size="Size.Small"
+                                               Color="Color.Primary"
+                                               title="@Ui.T("saves.download")"
+                                               Disabled="@_busy"
+                                               OnClick="@(() => DownloadSingleFileAsync(file))" />
+                                <MudIconButton Icon="@Icons.Material.Filled.Delete"
+                                               Size="Size.Small"
+                                               Color="Color.Error"
+                                               title="@Ui.T("app.delete")"
+                                               Disabled="@_busy"
+                                               OnClick="@(() => DeleteFileAsync(file))" />
+                            </div>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </MudSimpleTable>
+    }
+</MudStack>
+
+@code {
+    [Parameter]
+    public Guid AppId { get; set; }
+
+    [Parameter]
+    public Guid UserId { get; set; }
+
+    private List<UserSaveFileEntry> _files = [];
+    private bool _loading = true;
+    private bool _busy;
+    private bool _replaceOnImport;
+    private long _maxQuotaBytes = PlatformSettings.DefaultMaxSaveQuotaBytesPerApp;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (AppId != Guid.Empty && UserId != Guid.Empty)
+        {
+            await LoadQuotaAsync();
+            await LoadFilesAsync();
+        }
+    }
+
+    private async Task LoadQuotaAsync()
+    {
+        try
+        {
+            PlatformSettings settings = await AuthService.GetSettingsAsync();
+            _maxQuotaBytes = Math.Max(1024L * 1024L, settings.MaxSaveQuotaBytesPerApp);
+        }
+        catch
+        {
+            // Keep default
+        }
+    }
+
+    private async Task LoadFilesAsync()
+    {
+        _loading = true;
+        try
+        {
+            IReadOnlyList<UserSaveFileEntry> list = await SaveService.ListSaveFilesAsync(UserId, AppId);
+            _files = list.OrderBy(static f => f.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task OnUploadSingleFileAsync(IBrowserFile? file)
+    {
+        if (file is null)
+        {
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            string fileName = Path.GetFileName(file.Name);
+            string relativePath = fileName.StartsWith("save", StringComparison.OrdinalIgnoreCase)
+                && fileName.EndsWith(".sav", StringComparison.OrdinalIgnoreCase)
+                ? $"sav/{fileName}"
+                : fileName;
+
+            await using Stream input = file.OpenReadStream(_maxQuotaBytes);
+            await SaveService.ImportSaveFileAsync(UserId, AppId, relativePath, input);
+
+            Snackbar.Add(Ui.T("saves.uploadSuccess"), Severity.Success);
+            await LoadFilesAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task OnImportZipAsync(IBrowserFile? file)
+    {
+        if (file is null)
+        {
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            await using Stream stream = file.OpenReadStream(_maxQuotaBytes);
+            await SaveService.ImportSavesZipAsync(UserId, AppId, stream, replaceExisting: _replaceOnImport);
+            Snackbar.Add(Ui.T("saves.importSuccess"), Severity.Success);
+            await LoadFilesAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task ExportZipAsync()
+    {
+        _busy = true;
+        try
+        {
+            using var ms = new MemoryStream();
+            await SaveService.ExportSavesZipAsync(UserId, AppId, ms);
+            ms.Position = 0;
+            using var streamRef = new DotNetStreamReference(ms, leaveOpen: true);
+            string name = $"hypera_saves_{AppId:N}.zip";
+            await Js.InvokeVoidAsync("hyperaPlayer.downloadFromStream", name, "application/zip", streamRef);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task DownloadSingleFileAsync(UserSaveFileEntry file)
+    {
+        _busy = true;
+        try
+        {
+            await using Stream stream = await SaveService.OpenSaveFileStreamAsync(UserId, AppId, file.RelativePath);
+            using var streamRef = new DotNetStreamReference(stream, leaveOpen: false);
+            string downloadName = Path.GetFileName(file.RelativePath);
+            await Js.InvokeVoidAsync("hyperaPlayer.downloadFromStream", downloadName, "application/octet-stream", streamRef);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task DeleteFileAsync(UserSaveFileEntry file)
+    {
+        bool? confirmed = await DialogService.ShowMessageBox(
+            Ui.T("app.delete"),
+            Ui.T("saves.deleteConfirm", file.RelativePath),
+            yesText: Ui.T("app.delete"),
+            cancelText: Ui.T("app.cancel"));
+
+        if (confirmed != true)
+        {
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            await SaveService.DeleteSaveFileAsync(UserId, AppId, file.RelativePath);
+            await LoadFilesAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task ClearAllAsync()
+    {
+        bool? confirmed = await DialogService.ShowMessageBox(
+            Ui.T("saves.clearAll"),
+            Ui.T("saves.clearAllConfirm"),
+            yesText: Ui.T("app.confirm"),
+            cancelText: Ui.T("app.cancel"));
+
+        if (confirmed != true)
+        {
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            await SaveService.ClearAllSavesAsync(UserId, AppId);
+            Snackbar.Add(Ui.T("saves.cleared"), Severity.Success);
+            await LoadFilesAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+}

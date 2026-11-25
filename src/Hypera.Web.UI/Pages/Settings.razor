@@ -1,0 +1,282 @@
+@page "/settings"
+@implements IDisposable
+@inject UiSessionState Ui
+@inject IAuthService AuthService
+@inject ISnackbar Snackbar
+@inject IJSRuntime Js
+
+<MudContainer MaxWidth="MaxWidth.Medium" Class="px-0">
+    <MudText Typo="Typo.h5" Class="mb-4" Style="font-weight: 600;">@Ui.T("settings.title")</MudText>
+
+    <MudStack Spacing="4">
+        @* UI Language & Theme *@
+        <MudPaper Outlined="true" Class="pa-4">
+            <MudGrid Spacing="3" Class="align-center">
+                <MudItem xs="12" sm="6">
+                    <MudSelect T="string"
+                               Value="_uiLanguage"
+                               ValueChanged="@OnUiLanguageSelectedAsync"
+                               Label="@Ui.T("settings.uiLanguage")"
+                               Variant="Variant.Outlined"
+                               Margin="Margin.Dense">
+                        @foreach (LocaleInfo locale in Ui.AvailableLocales)
+                        {
+                            <MudSelectItem Value="@locale.Code">@locale.NativeName (@locale.Code)</MudSelectItem>
+                        }
+                    </MudSelect>
+                </MudItem>
+                <MudItem xs="12" sm="6">
+                    <MudSwitch T="bool"
+                               Value="Ui.IsDarkMode"
+                               ValueChanged="@OnDarkModeChangedAsync"
+                               Color="Color.Primary"
+                               Label="@Ui.T("settings.darkMode")" />
+                </MudItem>
+            </MudGrid>
+        </MudPaper>
+
+        @if (Ui.IsAuthenticated)
+        {
+            @* Known Languages with Explicit Priority Ordering *@
+            <MudPaper Outlined="true" Class="pa-4">
+                <MudText Typo="Typo.subtitle1" Style="font-weight: 600;">@Ui.T("settings.knownLanguages")</MudText>
+                <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-3 d-block">
+                    @Ui.T("settings.knownLanguagesHint")
+                </MudText>
+
+                <MudStack Spacing="2" Class="mb-3">
+                    @for (int i = 0; i < _knownLanguages.Count; i++)
+                    {
+                        int index = i;
+                        string lang = _knownLanguages[index];
+                        <MudPaper Outlined="true" Class="px-3 py-2 d-flex align-center justify-space-between gap-2">
+                            <div class="d-flex align-center gap-2">
+                                <MudChip T="string" Size="Size.Small" Color="Color.Primary" Variant="Variant.Outlined">
+                                    @(index + 1)
+                                </MudChip>
+                                <MudText Typo="Typo.body1">@FormatHelpers.GetLanguageLabel(lang, Ui.Localizer)</MudText>
+                            </div>
+                            <div class="d-flex align-center gap-1">
+                                <MudIconButton Icon="@Icons.Material.Filled.ArrowUpward"
+                                               Size="Size.Small"
+                                               Disabled="@(index == 0)"
+                                               OnClick="@(() => MoveLanguage(index, index - 1))" />
+                                <MudIconButton Icon="@Icons.Material.Filled.ArrowDownward"
+                                               Size="Size.Small"
+                                               Disabled="@(index == _knownLanguages.Count - 1)"
+                                               OnClick="@(() => MoveLanguage(index, index + 1))" />
+                                <MudIconButton Icon="@Icons.Material.Filled.Close"
+                                               Size="Size.Small"
+                                               Color="Color.Error"
+                                               Disabled="@(_knownLanguages.Count <= 1)"
+                                               OnClick="@(() => RemoveLanguage(index))" />
+                            </div>
+                        </MudPaper>
+                    }
+                </MudStack>
+
+                @if (AddableLanguages.Count > 0)
+                {
+                    <div class="d-flex align-center gap-2">
+                        <MudSelect T="string"
+                                   @bind-Value="_langToAdd"
+                                   Label="@Ui.T("settings.addLanguage")"
+                                   Variant="Variant.Outlined"
+                                   Margin="Margin.Dense"
+                                   Style="max-width: 260px;">
+                            @foreach (string lang in AddableLanguages)
+                            {
+                                <MudSelectItem Value="@lang">@FormatHelpers.GetLanguageLabel(lang, Ui.Localizer)</MudSelectItem>
+                            }
+                        </MudSelect>
+                        <MudButton Variant="Variant.Outlined"
+                                   Color="Color.Primary"
+                                   StartIcon="@Icons.Material.Filled.Add"
+                                   Disabled="@string.IsNullOrWhiteSpace(_langToAdd)"
+                                   OnClick="@AddLanguage">
+                            @Ui.T("settings.addLanguage")
+                        </MudButton>
+                    </div>
+                }
+            </MudPaper>
+
+            @* Version Resolution Strategy *@
+            <MudPaper Outlined="true" Class="pa-4">
+                <MudText Typo="Typo.subtitle1" Class="mb-2" Style="font-weight: 600;">
+                    @Ui.T("settings.versionStrategy")
+                </MudText>
+
+                <MudRadioGroup T="VersionResolutionStrategy" @bind-Value="_strategy">
+                    <MudStack Spacing="2">
+                        <div>
+                            <MudRadio Value="VersionResolutionStrategy.KnownLanguagePriority" Color="Color.Primary">
+                                <MudText Typo="Typo.body1" Style="font-weight: 500;">@Ui.T("settings.strategyKnownLang")</MudText>
+                            </MudRadio>
+                            <MudText Typo="Typo.caption" Color="Color.Secondary" Class="ml-8 d-block">
+                                @Ui.T("settings.strategyKnownLangDesc")
+                            </MudText>
+                        </div>
+
+                        <div>
+                            <MudRadio Value="VersionResolutionStrategy.VersionPriority" Color="Color.Primary">
+                                <MudText Typo="Typo.body1" Style="font-weight: 500;">@Ui.T("settings.strategyVersion")</MudText>
+                            </MudRadio>
+                            <MudText Typo="Typo.caption" Color="Color.Secondary" Class="ml-8 d-block">
+                                @Ui.T("settings.strategyVersionDesc")
+                            </MudText>
+                        </div>
+
+                        <div>
+                            <MudRadio Value="VersionResolutionStrategy.AlwaysLastRun" Color="Color.Primary">
+                                <MudText Typo="Typo.body1" Style="font-weight: 500;">@Ui.T("settings.strategyLastRun")</MudText>
+                            </MudRadio>
+                            <MudText Typo="Typo.caption" Color="Color.Secondary" Class="ml-8 d-block">
+                                @Ui.T("settings.strategyLastRunDesc")
+                            </MudText>
+                        </div>
+                    </MudStack>
+                </MudRadioGroup>
+            </MudPaper>
+
+            <div class="d-flex justify-end">
+                <MudButton Variant="Variant.Filled"
+                           Color="Color.Primary"
+                           StartIcon="@Icons.Material.Filled.Save"
+                           Disabled="@_saving"
+                           OnClick="@SavePreferencesAsync">
+                    @Ui.T("app.save")
+                </MudButton>
+            </div>
+        }
+    </MudStack>
+</MudContainer>
+
+@code {
+    private string _uiLanguage = HyperaLocalizer.DefaultLocaleCode;
+    private List<string> _knownLanguages = [HyperaLocalizer.DefaultLocaleCode];
+    private string? _langToAdd;
+    private VersionResolutionStrategy _strategy = VersionResolutionStrategy.KnownLanguagePriority;
+    private bool _saving;
+
+    private IReadOnlyList<string> AddableLanguages =>
+        Ui.AvailableLocales.Select(static l => l.Code)
+            .Concat(FormatHelpers.CommonLanguageCodes)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(code => !_knownLanguages.Contains(code, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+    protected override async Task OnInitializedAsync()
+    {
+        Ui.Changed += OnUiChanged;
+        await Ui.InitializeAsync();
+        LoadFromState();
+    }
+
+    private void LoadFromState()
+    {
+        _uiLanguage = Ui.UiLanguage;
+        if (Ui.CurrentUser is not null)
+        {
+            _strategy = Ui.CurrentUser.VersionStrategy;
+            _knownLanguages = Ui.CurrentUser.GetKnownLanguages().ToList();
+            if (_knownLanguages.Count == 0)
+            {
+                _knownLanguages.Add(HyperaLocalizer.DefaultLocaleCode);
+            }
+        }
+
+        _langToAdd = AddableLanguages.FirstOrDefault();
+    }
+
+    private async Task OnUiLanguageSelectedAsync(string code)
+    {
+        _uiLanguage = code;
+        await Ui.SetUiLanguageAsync(code, persistToProfile: false);
+    }
+
+    private async Task OnDarkModeChangedAsync(bool isDark)
+    {
+        Ui.SetDarkMode(isDark);
+        try
+        {
+            await Js.InvokeVoidAsync("hyperaPlayer.setLocalStorage", "hypera.theme", isDark ? "dark" : "light");
+        }
+        catch
+        {
+            // Ignore
+        }
+    }
+
+    private void MoveLanguage(int from, int to)
+    {
+        if (to < 0 || to >= _knownLanguages.Count)
+        {
+            return;
+        }
+
+        string item = _knownLanguages[from];
+        _knownLanguages.RemoveAt(from);
+        _knownLanguages.Insert(to, item);
+    }
+
+    private void RemoveLanguage(int index)
+    {
+        if (_knownLanguages.Count <= 1 || index < 0 || index >= _knownLanguages.Count)
+        {
+            return;
+        }
+
+        _knownLanguages.RemoveAt(index);
+        _langToAdd = AddableLanguages.FirstOrDefault();
+    }
+
+    private void AddLanguage()
+    {
+        if (string.IsNullOrWhiteSpace(_langToAdd))
+        {
+            return;
+        }
+
+        if (!_knownLanguages.Contains(_langToAdd, StringComparer.OrdinalIgnoreCase))
+        {
+            _knownLanguages.Add(_langToAdd);
+        }
+
+        _langToAdd = AddableLanguages.FirstOrDefault();
+    }
+
+    private async Task SavePreferencesAsync()
+    {
+        if (!Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        _saving = true;
+        try
+        {
+            await AuthService.UpdateUserPreferencesAsync(
+                Ui.CurrentUser!.Id,
+                new UserPreferencesUpdate(
+                    UiLanguage: _uiLanguage,
+                    VersionStrategy: _strategy,
+                    KnownLanguages: _knownLanguages));
+
+            await Ui.SetUiLanguageAsync(_uiLanguage, persistToProfile: false);
+            await Ui.RefreshUserAsync();
+            Snackbar.Add(Ui.T("settings.saved"), Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private void OnUiChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Ui.Changed -= OnUiChanged;
+}

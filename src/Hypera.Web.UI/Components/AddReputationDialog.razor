@@ -1,0 +1,119 @@
+@inject UiSessionState Ui
+@inject IBinaryReputationService ReputationService
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">@Ui.T("admin.addReputation")</MudText>
+    </TitleContent>
+    <DialogContent>
+        <MudStack Spacing="3">
+            @if (!string.IsNullOrWhiteSpace(_error))
+            {
+                <MudAlert Severity="Severity.Error" Dense="true">@_error</MudAlert>
+            }
+
+            <MudTextField @bind-Value="_sha256"
+                          Label="@Ui.T("admin.binaryHash")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Immediate="true"
+                          Required="true" />
+
+            <MudGrid Spacing="2">
+                <MudItem xs="6">
+                    <MudNumericField T="long"
+                                     @bind-Value="_byteSize"
+                                     Label="@Ui.T("admin.binarySize")"
+                                     Variant="Variant.Outlined"
+                                     Margin="Margin.Dense"
+                                     Min="0" />
+                </MudItem>
+                <MudItem xs="6">
+                    <MudSelect T="BinaryReputationStatus"
+                               @bind-Value="_status"
+                               Label="@Ui.T("admin.binaryStatus")"
+                               Variant="Variant.Outlined"
+                               Margin="Margin.Dense">
+                        <MudSelectItem Value="BinaryReputationStatus.Trusted">@Ui.T("admin.binaryTrusted")</MudSelectItem>
+                        <MudSelectItem Value="BinaryReputationStatus.HighRisk">@Ui.T("admin.binaryHighRisk")</MudSelectItem>
+                    </MudSelect>
+                </MudItem>
+            </MudGrid>
+
+            <MudTextField @bind-Value="_sampleFileName"
+                          Label="@Ui.T("admin.sampleFile")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Immediate="true" />
+
+            <MudTextField @bind-Value="_reasonNote"
+                          Label="@Ui.T("admin.reasonNote")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Lines="2" />
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="@Cancel" Disabled="@_submitting">@Ui.T("app.cancel")</MudButton>
+        <MudButton Variant="Variant.Filled"
+                   Color="Color.Primary"
+                   Disabled="@(!CanSubmit)"
+                   OnClick="@SaveAsync">
+            @Ui.T("app.save")
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter]
+    private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter]
+    public Guid AdminUserId { get; set; }
+
+    private string _sha256 = string.Empty;
+    private long _byteSize;
+    private BinaryReputationStatus _status = BinaryReputationStatus.Trusted;
+    private string _sampleFileName = string.Empty;
+    private string _reasonNote = string.Empty;
+    private bool _submitting;
+    private string? _error;
+
+    private bool CanSubmit =>
+        !_submitting
+        && !string.IsNullOrWhiteSpace(_sha256)
+        && _byteSize >= 0;
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private async Task SaveAsync()
+    {
+        if (!CanSubmit)
+        {
+            return;
+        }
+
+        _submitting = true;
+        _error = null;
+        try
+        {
+            await ReputationService.SetReputationAsync(
+                AdminUserId,
+                _sha256.Trim().ToLowerInvariant(),
+                _byteSize,
+                _status,
+                string.IsNullOrWhiteSpace(_sampleFileName) ? "binary.dll" : _sampleFileName.Trim(),
+                _reasonNote.Trim());
+
+            MudDialog.Close(DialogResult.Ok(true));
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}

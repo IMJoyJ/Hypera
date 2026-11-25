@@ -1,0 +1,126 @@
+@inject UiSessionState Ui
+
+@if (Submissions is null || Submissions.Count == 0)
+{
+    <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("appDetail.noSubmissions")</MudText>
+}
+else
+{
+    <MudStack Spacing="2">
+        @foreach (GameLanguageSubmission sub in Submissions)
+        {
+            IReadOnlyList<LocalizedDiagnosticEntry> diagnostics = DiagnosticFormatter.ParseAndFormat(
+                sub.DiagnosticsJson,
+                Ui.Localizer,
+                Ui.UiLanguage);
+
+            <MudPaper Outlined="true" Class="pa-3">
+                <div class="d-flex flex-wrap align-center justify-space-between gap-2">
+                    <div class="d-flex flex-wrap align-center gap-2">
+                        @if (!string.IsNullOrWhiteSpace(sub.Version?.VersionLabel))
+                        {
+                            <MudText Typo="Typo.subtitle2">@sub.Version!.VersionLabel</MudText>
+                        }
+                        <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined" Color="Color.Default">
+                            @sub.LanguageCode
+                        </MudChip>
+                        <MudChip T="string"
+                                 Size="Size.Small"
+                                 Variant="Variant.Filled"
+                                 Color="@FormatHelpers.GetSubmissionStatusColor(sub.Status)">
+                            @if (sub.Status == SubmissionStatus.Compiling)
+                            {
+                                <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-1" Style="width:12px;height:12px;" />
+                            }
+                            @FormatHelpers.GetSubmissionStatusText(sub.Status, Ui)
+                        </MudChip>
+                        @if (sub.IsActivePublished)
+                        {
+                            <MudChip T="string" Size="Size.Small" Variant="Variant.Text" Color="Color.Primary">
+                                @Ui.T("appDetail.activeBuild")
+                            </MudChip>
+                        }
+                    </div>
+                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                        @FormatHelpers.FormatUtc(sub.CreatedAtUtc)
+                    </MudText>
+                </div>
+
+                @if (sub.Status == SubmissionStatus.Rejected && !string.IsNullOrWhiteSpace(sub.RejectionReason))
+                {
+                    <MudAlert Severity="Severity.Error" Dense="true" Class="mt-2">
+                        <strong>@Ui.T("appDetail.rejectionReason"):</strong> @sub.RejectionReason
+                    </MudAlert>
+                }
+
+                @if (diagnostics.Count > 0)
+                {
+                    int errorCount = diagnostics.Count(static d => d.Severity == DiagnosticSeverity.Error);
+                    int warnCount = diagnostics.Count(static d => d.Severity == DiagnosticSeverity.Warning);
+
+                    <MudExpansionPanels Class="mt-2" Dense="true" Elevation="0">
+                        <MudExpansionPanel Expanded="@(sub.Status == SubmissionStatus.CompileFailed)">
+                            <TitleContent>
+                                <div class="d-flex align-center gap-2">
+                                    <MudText Typo="Typo.body2">@Ui.T("review.diagnostics")</MudText>
+                                    @if (errorCount > 0)
+                                    {
+                                        <MudChip T="string" Size="Size.Small" Color="Color.Error" Variant="Variant.Text">
+                                            @errorCount @Ui.T("review.errors")
+                                        </MudChip>
+                                    }
+                                    @if (warnCount > 0)
+                                    {
+                                        <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Text">
+                                            @warnCount @Ui.T("review.warnings")
+                                        </MudChip>
+                                    }
+                                </div>
+                            </TitleContent>
+                            <ChildContent>
+                                <div class="hypera-diag-list">
+                                    <MudStack Spacing="1">
+                                        @foreach (LocalizedDiagnosticEntry d in diagnostics)
+                                        {
+                                            Color sevColor = d.Severity switch
+                                            {
+                                                DiagnosticSeverity.Error => Color.Error,
+                                                DiagnosticSeverity.Warning => Color.Warning,
+                                                _ => Color.Info,
+                                            };
+                                            <div class="d-flex flex-column pa-2 rounded" style="background: rgba(148,163,184,0.06);">
+                                                <div class="d-flex flex-wrap align-center gap-2">
+                                                    <MudChip T="string" Size="Size.Small" Color="@sevColor" Variant="Variant.Filled">
+                                                        @d.Code
+                                                    </MudChip>
+                                                    @if (!string.IsNullOrWhiteSpace(d.Location))
+                                                    {
+                                                        <MudText Typo="Typo.caption" Class="hypera-mono" Color="Color.Secondary">
+                                                            @d.Location
+                                                        </MudText>
+                                                    }
+                                                </div>
+                                                <MudText Typo="Typo.body2" Class="mt-1">@d.FormattedMessage</MudText>
+                                                @if (!string.IsNullOrWhiteSpace(d.RawLineText))
+                                                {
+                                                    <MudText Typo="Typo.caption" Class="hypera-mono mt-1" Color="Color.Secondary">
+                                                        @d.RawLineText
+                                                    </MudText>
+                                                }
+                                            </div>
+                                        }
+                                    </MudStack>
+                                </div>
+                            </ChildContent>
+                        </MudExpansionPanel>
+                    </MudExpansionPanels>
+                }
+            </MudPaper>
+        }
+    </MudStack>
+}
+
+@code {
+    [Parameter]
+    public IReadOnlyList<GameLanguageSubmission>? Submissions { get; set; }
+}

@@ -1,0 +1,220 @@
+@inject UiSessionState Ui
+@inject IAppCatalogService CatalogService
+@inject IPackagePipelineService PipelineService
+@inject IAuthService AuthService
+@inject ISnackbar Snackbar
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">@Ui.T("appDetail.newVersion")</MudText>
+    </TitleContent>
+    <DialogContent>
+        <MudStack Spacing="3">
+            @if (!string.IsNullOrWhiteSpace(_error))
+            {
+                <MudAlert Severity="Severity.Error" Dense="true">@_error</MudAlert>
+            }
+
+            <MudGrid Spacing="2">
+                <MudItem xs="6">
+                    <MudTextField @bind-Value="_versionLabel"
+                                  Label="@Ui.T("appDetail.versionLabel")"
+                                  Variant="Variant.Outlined"
+                                  Margin="Margin.Dense"
+                                  Immediate="true"
+                                  Required="true" />
+                </MudItem>
+                <MudItem xs="6">
+                    <MudSelect T="string"
+                               @bind-Value="_languageCode"
+                               Label="@Ui.T("catalog.languageCode")"
+                               Variant="Variant.Outlined"
+                               Margin="Margin.Dense">
+                        @foreach (string lang in AvailableLanguageChoices)
+                        {
+                            <MudSelectItem Value="@lang">@FormatHelpers.GetLanguageLabel(lang, Ui.Localizer)</MudSelectItem>
+                        }
+                    </MudSelect>
+                </MudItem>
+            </MudGrid>
+
+            <MudTextField @bind-Value="_changelog"
+                          Label="@Ui.T("appDetail.changelog")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Lines="2" />
+
+            @if (ExistingVersions.Count > 0)
+            {
+                <MudSelect T="VersionInsertPosition"
+                           @bind-Value="_insertPosition"
+                           Label="@Ui.T("appDetail.insertPosition")"
+                           HelperText="@Ui.T("appDetail.insertPosHint")"
+                           Variant="Variant.Outlined"
+                           Margin="Margin.Dense">
+                    <MudSelectItem Value="VersionInsertPosition.NewestHead">@Ui.T("appDetail.posNewestHead")</MudSelectItem>
+                    <MudSelectItem Value="VersionInsertPosition.BeforeTarget">@Ui.T("appDetail.posBeforeTarget")</MudSelectItem>
+                    <MudSelectItem Value="VersionInsertPosition.AfterTarget">@Ui.T("appDetail.posAfterTarget")</MudSelectItem>
+                </MudSelect>
+
+                @if (_insertPosition != VersionInsertPosition.NewestHead)
+                {
+                    <MudSelect T="Guid?"
+                               @bind-Value="_targetVersionId"
+                               Label="@Ui.T("appDetail.targetVersion")"
+                               Variant="Variant.Outlined"
+                               Margin="Margin.Dense">
+                        @foreach (GameVersion ver in ExistingVersions)
+                        {
+                            <MudSelectItem Value="@((Guid?)ver.Id)">@ver.VersionLabel (#@ver.OrderIndex)</MudSelectItem>
+                        }
+                    </MudSelect>
+                }
+            }
+
+            <MudSwitch @bind-Value="_allowSourceDownload"
+                       Color="Color.Primary"
+                       Label="@Ui.T("catalog.allowSourceDownload")" />
+
+            <div class="d-flex align-center gap-3">
+                <MudFileUpload T="IBrowserFile"
+                               Accept=".zip"
+                               FilesChanged="@OnFileSelected">
+                    <ActivatorContent>
+                        <MudButton Variant="Variant.Outlined"
+                                   Color="Color.Primary"
+                                   StartIcon="@Icons.Material.Filled.UploadFile"
+                                   Disabled="@_submitting">
+                            @Ui.T("appDetail.selectZip")
+                        </MudButton>
+                    </ActivatorContent>
+                </MudFileUpload>
+                @if (_zipFile is not null)
+                {
+                    <MudText Typo="Typo.body2">@_zipFile.Name (@FormatHelpers.FormatBytes(_zipFile.Size))</MudText>
+                }
+                else
+                {
+                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                        @Ui.T("appDetail.maxSize", FormatHelpers.FormatBytes(_maxUploadBytes))
+                    </MudText>
+                }
+            </div>
+
+            @if (_submitting)
+            {
+                <MudProgressLinear Indeterminate="true" Color="Color.Primary" />
+            }
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="@Cancel" Disabled="@_submitting">@Ui.T("app.cancel")</MudButton>
+        <MudButton Variant="Variant.Filled"
+                   Color="Color.Primary"
+                   OnClick="@SubmitAsync"
+                   Disabled="@(!CanSubmit)">
+            @Ui.T("version.upload")
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter]
+    private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter]
+    public Guid AppId { get; set; }
+
+    [Parameter]
+    public Guid UserId { get; set; }
+
+    [Parameter]
+    public IReadOnlyList<GameVersion> ExistingVersions { get; set; } = [];
+
+    private string _versionLabel = string.Empty;
+    private string _changelog = string.Empty;
+    private string _languageCode = "ja";
+    private VersionInsertPosition _insertPosition = VersionInsertPosition.NewestHead;
+    private Guid? _targetVersionId;
+    private bool _allowSourceDownload = true;
+    private IBrowserFile? _zipFile;
+    private long _maxUploadBytes = PlatformSettings.DefaultMaxUploadBytes;
+    private bool _submitting;
+    private string? _error;
+
+    private IEnumerable<string> AvailableLanguageChoices =>
+        Ui.AvailableLocales.Select(static l => l.Code)
+            .Concat(FormatHelpers.CommonLanguageCodes)
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+    private bool CanSubmit =>
+        !_submitting
+        && !string.IsNullOrWhiteSpace(_versionLabel)
+        && !string.IsNullOrWhiteSpace(_languageCode)
+        && (_insertPosition == VersionInsertPosition.NewestHead || _targetVersionId.HasValue)
+        && _zipFile is not null;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _languageCode = Ui.UiLanguage;
+        _targetVersionId = ExistingVersions.FirstOrDefault()?.Id;
+        try
+        {
+            PlatformSettings settings = await AuthService.GetSettingsAsync();
+            _maxUploadBytes = settings.MaxUploadBytes;
+        }
+        catch
+        {
+            // Keep default limit
+        }
+    }
+
+    private void OnFileSelected(IBrowserFile? file)
+    {
+        _zipFile = file;
+        _error = null;
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private async Task SubmitAsync()
+    {
+        if (!CanSubmit || _zipFile is null)
+        {
+            return;
+        }
+
+        _submitting = true;
+        _error = null;
+        try
+        {
+            GameVersion version = await CatalogService.InsertVersionAsync(
+                UserId,
+                AppId,
+                _versionLabel.Trim(),
+                _changelog.Trim(),
+                _insertPosition,
+                _insertPosition == VersionInsertPosition.NewestHead ? null : _targetVersionId);
+
+            await using Stream stream = _zipFile.OpenReadStream(_maxUploadBytes);
+            await PipelineService.SubmitZipPackageAsync(new PackageUploadRequest(
+                VersionId: version.Id,
+                LanguageCode: _languageCode.Trim(),
+                UploadedByUserId: UserId,
+                AllowSourceDownload: _allowSourceDownload,
+                ZipArchiveStream: stream,
+                DeclaredByteLength: _zipFile.Size));
+
+            Snackbar.Add(Ui.T("appDetail.uploaded"), Severity.Success);
+            MudDialog.Close(DialogResult.Ok(true));
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}

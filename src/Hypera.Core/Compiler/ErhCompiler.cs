@@ -48,7 +48,9 @@ public sealed class ErhCompiler
                     "Every active line in an .ERH header file must begin with '#'.",
                     line.CreateSpan(pos, 1),
                     line.FilePath,
-                    line.RawLineText);
+                    line.RawLineText,
+                    [],
+                    "diag.erh.ERA1501");
                 continue;
             }
 
@@ -61,7 +63,9 @@ public sealed class ErhCompiler
                     "Missing directive name after '#' in .ERH file.",
                     line.CreateSpan(pos - 1, 1),
                     line.FilePath,
-                    line.RawLineText);
+                    line.RawLineText,
+                    [],
+                    "diag.erh.ERA1502");
                 continue;
             }
 
@@ -98,7 +102,9 @@ public sealed class ErhCompiler
                     $"Unrecognized .ERH header directive '#{directive}'.",
                     line.CreateSpan(0, directive.Length + 1),
                     line.FilePath,
-                    line.RawLineText);
+                    line.RawLineText,
+                    [directive],
+                    "diag.erh.ERA1503");
             }
         }
     }
@@ -208,7 +214,9 @@ public sealed class ErhCompiler
                 $"Private variable '{resolved.Name}' in '@{ownerFunction.Name}' is duplicate or conflicts with a reserved/local name.",
                 line.CreateSpan(0, line.Text.Length),
                 line.FilePath,
-                line.RawLineText);
+                line.RawLineText,
+                [resolved.Name, ownerFunction.Name],
+                "diag.erh.ERA1504");
             return null;
         }
 
@@ -227,7 +235,9 @@ public sealed class ErhCompiler
                 "Missing identifier name after '#DEFINE'.",
                 line.CreateSpan(idStart, 1),
                 line.FilePath,
-                line.RawLineText);
+                line.RawLineText,
+                [],
+                "diag.erh.ERA1505");
             return;
         }
 
@@ -241,7 +251,9 @@ public sealed class ErhCompiler
                 $"Function-like parameterized #DEFINE macro '{macroName}(...)' is not supported; declare a #FUNCTION / #FUNCTIONS method instead.",
                 macroSpan,
                 line.FilePath,
-                line.RawLineText);
+                line.RawLineText,
+                [macroName],
+                "diag.erh.ERA1506");
             return;
         }
 
@@ -274,12 +286,15 @@ public sealed class ErhCompiler
         string name = ErbLexer.ReadIdentifierSlice(line.Text, ref pos);
         if (string.IsNullOrEmpty(name))
         {
+            string kind = isString ? "FUNCTIONS" : "FUNCTION";
             diagnostics.ReportError(
                 "ERA1507",
-                $"Missing identifier after '#{(isString ? "FUNCTIONS" : "FUNCTION")}' in .ERH file.",
+                $"Missing identifier after '#{kind}' in .ERH file.",
                 line.CreateSpan(idStart, 1),
                 line.FilePath,
-                line.RawLineText);
+                line.RawLineText,
+                [kind],
+                "diag.erh.ERA1507");
             return;
         }
 
@@ -319,7 +334,7 @@ public sealed class ErhCompiler
                 if (isConst) { ReportDup(kw, kwTok.Span); return null; }
                 if (isCharaData || isGlobal || isSavedata || isRef || isDynamic)
                 {
-                    diagnostics.ReportError("ERA1508", "'CONST' cannot be combined with CHARADATA, GLOBAL, SAVEDATA, REF, or DYNAMIC.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1508", "'CONST' cannot be combined with CHARADATA, GLOBAL, SAVEDATA, REF, or DYNAMIC.", kwTok.Span, line.FilePath, line.RawLineText, ["CONST", "CHARADATA, GLOBAL, SAVEDATA, REF, DYNAMIC"], "diag.erh.ERA1508");
                     return null;
                 }
 
@@ -330,7 +345,7 @@ public sealed class ErhCompiler
                 if (isRef) { ReportDup(kw, kwTok.Span); return null; }
                 if ((staticExplicit && !isDynamic) || isCharaData || isGlobal || isSavedata || isConst)
                 {
-                    diagnostics.ReportError("ERA1508", "'REF' cannot be combined with STATIC, CHARADATA, GLOBAL, SAVEDATA, or CONST.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1508", "'REF' cannot be combined with STATIC, CHARADATA, GLOBAL, SAVEDATA, or CONST.", kwTok.Span, line.FilePath, line.RawLineText, ["REF", "STATIC, CHARADATA, GLOBAL, SAVEDATA, CONST"], "diag.erh.ERA1508");
                     return null;
                 }
 
@@ -341,13 +356,13 @@ public sealed class ErhCompiler
             {
                 if (!isPrivate)
                 {
-                    diagnostics.ReportError("ERA1509", "'DYNAMIC' is only valid on function-private #DIM/#DIMS variables.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1509", "'DYNAMIC' is only valid on function-private #DIM/#DIMS variables.", kwTok.Span, line.FilePath, line.RawLineText, ["DYNAMIC"], "diag.erh.ERA1509");
                     return null;
                 }
 
                 if (staticExplicit || isConst || isCharaData)
                 {
-                    diagnostics.ReportError("ERA1508", "'DYNAMIC' conflicts with STATIC, CONST, or CHARADATA.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1508", "'DYNAMIC' conflicts with STATIC, CONST, or CHARADATA.", kwTok.Span, line.FilePath, line.RawLineText, ["DYNAMIC", "STATIC, CONST, CHARADATA"], "diag.erh.ERA1508");
                     return null;
                 }
 
@@ -358,13 +373,13 @@ public sealed class ErhCompiler
             {
                 if (!isPrivate)
                 {
-                    diagnostics.ReportError("ERA1509", "'STATIC' is only valid on function-private #DIM/#DIMS variables.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1509", "'STATIC' is only valid on function-private #DIM/#DIMS variables.", kwTok.Span, line.FilePath, line.RawLineText, ["STATIC"], "diag.erh.ERA1509");
                     return null;
                 }
 
                 if (staticExplicit || isRef || isCharaData)
                 {
-                    diagnostics.ReportError("ERA1508", "'STATIC' conflicts with DYNAMIC, REF, or CHARADATA.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1508", "'STATIC' conflicts with DYNAMIC, REF, or CHARADATA.", kwTok.Span, line.FilePath, line.RawLineText, ["STATIC", "DYNAMIC, REF, CHARADATA"], "diag.erh.ERA1508");
                     return null;
                 }
 
@@ -375,14 +390,14 @@ public sealed class ErhCompiler
             {
                 if (isPrivate)
                 {
-                    diagnostics.ReportError("ERA1510", "'GLOBAL' is only valid on global .ERH #DIM/#DIMS declarations.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1510", "'GLOBAL' is only valid on global .ERH #DIM/#DIMS declarations.", kwTok.Span, line.FilePath, line.RawLineText, ["GLOBAL"], "diag.erh.ERA1510");
                     return null;
                 }
 
                 if (isGlobal) { ReportDup(kw, kwTok.Span); return null; }
                 if (isCharaData || isRef || isConst || staticExplicit)
                 {
-                    diagnostics.ReportError("ERA1508", "'GLOBAL' conflicts with CHARADATA, REF, CONST, or STATIC/DYNAMIC.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1508", "'GLOBAL' conflicts with CHARADATA, REF, CONST, or STATIC/DYNAMIC.", kwTok.Span, line.FilePath, line.RawLineText, ["GLOBAL", "CHARADATA, REF, CONST, STATIC/DYNAMIC"], "diag.erh.ERA1508");
                     return null;
                 }
 
@@ -392,14 +407,14 @@ public sealed class ErhCompiler
             {
                 if (isPrivate)
                 {
-                    diagnostics.ReportError("ERA1510", "'SAVEDATA' is only valid on global .ERH #DIM/#DIMS declarations.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1510", "'SAVEDATA' is only valid on global .ERH #DIM/#DIMS declarations.", kwTok.Span, line.FilePath, line.RawLineText, ["SAVEDATA"], "diag.erh.ERA1510");
                     return null;
                 }
 
                 if (isSavedata) { ReportDup(kw, kwTok.Span); return null; }
                 if (isRef || isConst || staticExplicit)
                 {
-                    diagnostics.ReportError("ERA1508", "'SAVEDATA' conflicts with REF, CONST, or STATIC/DYNAMIC.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1508", "'SAVEDATA' conflicts with REF, CONST, or STATIC/DYNAMIC.", kwTok.Span, line.FilePath, line.RawLineText, ["SAVEDATA", "REF, CONST, STATIC/DYNAMIC"], "diag.erh.ERA1508");
                     return null;
                 }
 
@@ -409,14 +424,14 @@ public sealed class ErhCompiler
             {
                 if (isPrivate)
                 {
-                    diagnostics.ReportError("ERA1510", "'CHARADATA' is only valid on global .ERH #DIM/#DIMS declarations.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1510", "'CHARADATA' is only valid on global .ERH #DIM/#DIMS declarations.", kwTok.Span, line.FilePath, line.RawLineText, ["CHARADATA"], "diag.erh.ERA1510");
                     return null;
                 }
 
                 if (isCharaData) { ReportDup(kw, kwTok.Span); return null; }
                 if (isRef || isConst || isGlobal || staticExplicit)
                 {
-                    diagnostics.ReportError("ERA1508", "'CHARADATA' conflicts with REF, CONST, GLOBAL, or STATIC/DYNAMIC.", kwTok.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1508", "'CHARADATA' conflicts with REF, CONST, GLOBAL, or STATIC/DYNAMIC.", kwTok.Span, line.FilePath, line.RawLineText, ["CHARADATA", "REF, CONST, GLOBAL, STATIC/DYNAMIC"], "diag.erh.ERA1508");
                     return null;
                 }
 
@@ -431,7 +446,7 @@ public sealed class ErhCompiler
 
         if (string.IsNullOrEmpty(varName))
         {
-            diagnostics.ReportError("ERA1511", "Expected variable name in #DIM/#DIMS declaration.", lineSpan, line.FilePath, line.RawLineText);
+            diagnostics.ReportError("ERA1511", "Expected variable name in #DIM/#DIMS declaration.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1511");
             return null;
         }
 
@@ -462,7 +477,7 @@ public sealed class ErhCompiler
                         ts, ownerFunction, line.FilePath, diagnostics, stopAtComma: true, stopAtAssign: true);
                     if (refDimExpr is not IntLiteralExpr { Value: 0 })
                     {
-                        diagnostics.ReportError("ERA1512", "REF array dimensions cannot specify non-zero element counts (use ', 0' or ',').", refDimExpr.Span, line.FilePath, line.RawLineText);
+                        diagnostics.ReportError("ERA1512", "REF array dimensions cannot specify non-zero element counts (use ', 0' or ',').", refDimExpr.Span, line.FilePath, line.RawLineText, [], "diag.erh.ERA1512");
                         return null;
                     }
 
@@ -473,7 +488,7 @@ public sealed class ErhCompiler
 
                 if (ts.IsAtEnd)
                 {
-                    diagnostics.ReportError("ERA1513", "Expected constant dimension expression after ',' in #DIM/#DIMS.", lineSpan, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1513", "Expected constant dimension expression after ',' in #DIM/#DIMS.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1513");
                     return null;
                 }
 
@@ -481,13 +496,13 @@ public sealed class ErhCompiler
                     ts, ownerFunction, line.FilePath, diagnostics, stopAtComma: true, stopAtAssign: true);
                 if (dimExpr is not IntLiteralExpr constDim)
                 {
-                    diagnostics.ReportError("ERA1514", "#DIM/#DIMS array dimension must be a compile-time integer constant.", dimExpr.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1514", "#DIM/#DIMS array dimension must be a compile-time integer constant.", dimExpr.Span, line.FilePath, line.RawLineText, [], "diag.erh.ERA1514");
                     return null;
                 }
 
                 if (constDim.Value <= 0 || constDim.Value > MaxTotalVariableElements)
                 {
-                    diagnostics.ReportError("ERA1515", $"#DIM/#DIMS dimension '{constDim.Value}' is out of valid range (1..{MaxTotalVariableElements}).", dimExpr.Span, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1515", $"#DIM/#DIMS dimension '{constDim.Value}' is out of valid range (1..{MaxTotalVariableElements}).", dimExpr.Span, line.FilePath, line.RawLineText, [constDim.Value.ToString(), MaxTotalVariableElements.ToString()], "diag.erh.ERA1515.dim");
                     return null;
                 }
 
@@ -502,19 +517,19 @@ public sealed class ErhCompiler
         {
             if (isRef)
             {
-                diagnostics.ReportError("ERA1516", "REF variables cannot specify initial values.", lineSpan, line.FilePath, line.RawLineText);
+                diagnostics.ReportError("ERA1516", "REF variables cannot specify initial values.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1516.ref");
                 return null;
             }
 
             if (dimensions.Count >= 2)
             {
-                diagnostics.ReportError("ERA1516", "Multi-dimensional #DIM/#DIMS arrays cannot specify inline initializers.", lineSpan, line.FilePath, line.RawLineText);
+                diagnostics.ReportError("ERA1516", "Multi-dimensional #DIM/#DIMS arrays cannot specify inline initializers.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1516.multidim");
                 return null;
             }
 
             if (isCharaData)
             {
-                diagnostics.ReportError("ERA1516", "CHARADATA #DIM/#DIMS variables cannot specify inline initializers.", lineSpan, line.FilePath, line.RawLineText);
+                diagnostics.ReportError("ERA1516", "CHARADATA #DIM/#DIMS variables cannot specify inline initializers.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1516.charadata");
                 return null;
             }
 
@@ -522,7 +537,7 @@ public sealed class ErhCompiler
                 ts, closingDelimiter: null, ownerFunction, line.FilePath, diagnostics);
             if (initTerms.Length == 0)
             {
-                diagnostics.ReportError("ERA1517", "Expected at least one constant initializer after '=' in #DIM/#DIMS.", lineSpan, line.FilePath, line.RawLineText);
+                diagnostics.ReportError("ERA1517", "Expected at least one constant initializer after '=' in #DIM/#DIMS.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1517");
                 return null;
             }
 
@@ -530,13 +545,13 @@ public sealed class ErhCompiler
             {
                 if (initTerms.Length > dimensions[0])
                 {
-                    diagnostics.ReportError("ERA1518", $"Too many initializers ({initTerms.Length}) for #DIM array of size {dimensions[0]}.", lineSpan, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1518", $"Too many initializers ({initTerms.Length}) for #DIM array of size {dimensions[0]}.", lineSpan, line.FilePath, line.RawLineText, [initTerms.Length.ToString(), dimensions[0].ToString()], "diag.erh.ERA1518");
                     return null;
                 }
 
                 if (isConst && initTerms.Length != dimensions[0])
                 {
-                    diagnostics.ReportError("ERA1519", $"#DIM CONST array size ({dimensions[0]}) must match initializer count ({initTerms.Length}).", lineSpan, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1519", $"#DIM CONST array size ({dimensions[0]}) must match initializer count ({initTerms.Length}).", lineSpan, line.FilePath, line.RawLineText, [dimensions[0].ToString(), initTerms.Length.ToString()], "diag.erh.ERA1519");
                     return null;
                 }
             }
@@ -545,7 +560,7 @@ public sealed class ErhCompiler
             {
                 if (item is null)
                 {
-                    diagnostics.ReportError("ERA1520", "Cannot omit elements in #DIM/#DIMS initializer list.", lineSpan, line.FilePath, line.RawLineText);
+                    diagnostics.ReportError("ERA1520", "Cannot omit elements in #DIM/#DIMS initializer list.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1520");
                     return null;
                 }
 
@@ -553,7 +568,7 @@ public sealed class ErhCompiler
                 {
                     if (item is not StrLiteralExpr sl)
                     {
-                        diagnostics.ReportError("ERA1521", "#DIMS initializer must be a compile-time string constant.", item.Span, line.FilePath, line.RawLineText);
+                        diagnostics.ReportError("ERA1521", "#DIMS initializer must be a compile-time string constant.", item.Span, line.FilePath, line.RawLineText, [], "diag.erh.ERA1521.str");
                         return null;
                     }
 
@@ -563,7 +578,7 @@ public sealed class ErhCompiler
                 {
                     if (item is not IntLiteralExpr il)
                     {
-                        diagnostics.ReportError("ERA1521", "#DIM initializer must be a compile-time integer constant.", item.Span, line.FilePath, line.RawLineText);
+                        diagnostics.ReportError("ERA1521", "#DIM initializer must be a compile-time integer constant.", item.Span, line.FilePath, line.RawLineText, [], "diag.erh.ERA1521.int");
                         return null;
                     }
 
@@ -578,13 +593,15 @@ public sealed class ErhCompiler
         }
         else if (isConst)
         {
-            diagnostics.ReportError("ERA1522", $"#DIM{(isString ? "S" : "")} CONST '{varName}' requires an '= initialValue' clause.", lineSpan, line.FilePath, line.RawLineText);
+            string dimKw = isString ? "DIMS" : "DIM";
+            diagnostics.ReportError("ERA1522", $"#{dimKw} CONST '{varName}' requires an '= initialValue' clause.", lineSpan, line.FilePath, line.RawLineText, [dimKw, varName], "diag.erh.ERA1522");
             return null;
         }
 
         if (!ts.IsAtEnd)
         {
-            diagnostics.ReportError("ERA1523", $"Unexpected token '{ts.Current.Text ?? ts.Current.Kind.ToString()}' in #DIM/#DIMS declaration.", ts.Current.Span, line.FilePath, line.RawLineText);
+            string tokText = ts.Current.Text ?? ts.Current.Kind.ToString();
+            diagnostics.ReportError("ERA1523", $"Unexpected token '{tokText}' in #DIM/#DIMS declaration.", ts.Current.Span, line.FilePath, line.RawLineText, [tokText], "diag.erh.ERA1523");
             return null;
         }
 
@@ -596,19 +613,19 @@ public sealed class ErhCompiler
         int rank = dimensions.Count;
         if (isConst && rank > 1)
         {
-            diagnostics.ReportError("ERA1524", "Multi-dimensional CONST arrays are not supported.", lineSpan, line.FilePath, line.RawLineText);
+            diagnostics.ReportError("ERA1524", "Multi-dimensional CONST arrays are not supported.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1524");
             return null;
         }
 
         if (isCharaData && rank > 2)
         {
-            diagnostics.ReportError("ERA1525", "CHARADATA user variables support at most 2 per-character dimensions.", lineSpan, line.FilePath, line.RawLineText);
+            diagnostics.ReportError("ERA1525", "CHARADATA user variables support at most 2 per-character dimensions.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1525");
             return null;
         }
 
         if (rank > 3)
         {
-            diagnostics.ReportError("ERA1526", "#DIM/#DIMS arrays support at most 3 dimensions.", lineSpan, line.FilePath, line.RawLineText);
+            diagnostics.ReportError("ERA1526", "#DIM/#DIMS arrays support at most 3 dimensions.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1526");
             return null;
         }
 
@@ -618,7 +635,7 @@ public sealed class ErhCompiler
             foreach (int d in dimensions) total *= d;
             if (total <= 0 || total > MaxTotalVariableElements)
             {
-                diagnostics.ReportError("ERA1515", $"Total #DIM/#DIMS array element count ({total}) exceeds limit ({MaxTotalVariableElements}).", lineSpan, line.FilePath, line.RawLineText);
+                diagnostics.ReportError("ERA1515", $"Total #DIM/#DIMS array element count ({total}) exceeds limit ({MaxTotalVariableElements}).", lineSpan, line.FilePath, line.RawLineText, [total.ToString(), MaxTotalVariableElements.ToString()], "diag.erh.ERA1515.total");
                 return null;
             }
         }
@@ -656,7 +673,7 @@ public sealed class ErhCompiler
         };
 
         void ReportDup(string kw, SourceSpan span) =>
-            diagnostics.ReportError("ERA1527", $"Duplicate modifier '{kw}' in #DIM/#DIMS declaration.", span, line.FilePath, line.RawLineText);
+            diagnostics.ReportError("ERA1527", $"Duplicate modifier '{kw}' in #DIM/#DIMS declaration.", span, line.FilePath, line.RawLineText, [kw], "diag.erh.ERA1527");
     }
 
     private ImmutableArray<ErbToken> ExpandTokensNow(
@@ -685,7 +702,7 @@ public sealed class ErhCompiler
 
             if (++expansions > ErbLexer.MaxMacroExpansions)
             {
-                diagnostics.ReportError("ERA1118", $"Circular #DEFINE macro '{tok.Text}' exceeded expansion limit.", tok.Span, line.FilePath, line.RawLineText);
+                diagnostics.ReportError("ERA1118", $"Circular #DEFINE macro '{tok.Text}' exceeded expansion limit.", tok.Span, line.FilePath, line.RawLineText, [ErbLexer.MaxMacroExpansions.ToString(), tok.Text ?? string.Empty]);
                 break;
             }
 

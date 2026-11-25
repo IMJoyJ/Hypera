@@ -178,7 +178,7 @@ public sealed class ErbLexer
                         : closeIdx == pos + 2
                             ? "Empty '[[]]' rename token is invalid."
                             : $"Unresolved rename key '{rawKey}'.";
-                    diagnostics.ReportError("ERA1102", msg, MakeSpan(fileId, lineNo, baseColumn, pos, len), filePath, text);
+                    diagnostics.ReportError("ERA1102", msg, MakeSpan(fileId, lineNo, baseColumn, pos, len), filePath, text, [msg]);
                     pos += len;
                     continue;
                 }
@@ -261,7 +261,7 @@ public sealed class ErbLexer
                     string str = ScanPlainString(text, ref pos, '\'', fileId, filePath, lineNo, baseColumn, diagnostics);
                     if (pos >= text.Length || text[pos] != '\'')
                     {
-                        diagnostics.ReportError("ERA1103", "Unterminated single-quoted string literal.", MakeSpan(fileId, lineNo, baseColumn, start, pos - start), filePath, text);
+                        diagnostics.ReportError("ERA1103", "Unterminated single-quoted string literal.", MakeSpan(fileId, lineNo, baseColumn, start, pos - start), filePath, text, [], "diag.ERA1103.single");
                     }
                     else
                     {
@@ -340,7 +340,7 @@ public sealed class ErbLexer
 
             if (c is '{' or '}' or '$')
             {
-                diagnostics.ReportError("ERA1107", $"Unexpected character '{c}' in expression.", MakeSpan(fileId, lineNo, baseColumn, pos, 1), filePath, text);
+                diagnostics.ReportError("ERA1107", $"Unexpected character '{c}' in expression.", MakeSpan(fileId, lineNo, baseColumn, pos, 1), filePath, text, [c.ToString()]);
                 pos++;
                 continue;
             }
@@ -368,7 +368,7 @@ public sealed class ErbLexer
             string ident = ReadIdentifierSlice(text, ref pos);
             if (ident.Length == 0)
             {
-                diagnostics.ReportError("ERA1108", $"Unexpected character '{text[pos]}'.", MakeSpan(fileId, lineNo, baseColumn, pos, 1), filePath, text);
+                diagnostics.ReportError("ERA1108", $"Unexpected character '{text[pos]}'.", MakeSpan(fileId, lineNo, baseColumn, pos, 1), filePath, text, [text[pos].ToString()]);
                 pos++;
                 continue;
             }
@@ -386,7 +386,9 @@ public sealed class ErbLexer
                 parenDepth > 0 ? "Unclosed parenthesis '('." : "Unexpected closing parenthesis ')'.",
                 MakeSpan(fileId, lineNo, baseColumn, Math.Max(0, pos - 1), 1),
                 filePath,
-                text);
+                text,
+                [],
+                parenDepth > 0 ? "diag.ERA1109.open" : "diag.ERA1109.close");
         }
 
         if (bracketDepth != 0)
@@ -396,7 +398,9 @@ public sealed class ErbLexer
                 bracketDepth > 0 ? "Unclosed bracket '['." : "Unexpected closing bracket ']'.",
                 MakeSpan(fileId, lineNo, baseColumn, Math.Max(0, pos - 1), 1),
                 filePath,
-                text);
+                text,
+                [],
+                bracketDepth > 0 ? "diag.ERA1110.open" : "diag.ERA1110.close");
         }
 
         ImmutableArray<ErbToken> result = [.. tokens];
@@ -770,7 +774,9 @@ public sealed class ErbLexer
                     "ERA1118",
                     $"Macro expansion exceeded maximum depth ({MaxMacroExpansions}); circular #DEFINE macro '{tok.Text}' detected.",
                     tok.Span,
-                    filePath);
+                    filePath,
+                    null,
+                    [MaxMacroExpansions.ToString(), tok.Text ?? string.Empty]);
                 break;
             }
 
@@ -879,12 +885,14 @@ public sealed class ErbLexer
 
         if (!TryScanRadixDigits(text, ref pos, radix, allowSign: false, out long significand, out string? digitErr))
         {
+            string litSlice = text[literalStart..pos];
             diagnostics.ReportError(
                 "ERA1119",
-                digitErr ?? $"Invalid integer literal '{text[literalStart..pos]}'.",
+                digitErr ?? $"Invalid integer literal '{litSlice}'.",
                 MakeSpan(fileId, lineNo, baseColumn, literalStart, Math.Max(1, pos - literalStart)),
                 filePath,
-                text);
+                text,
+                [litSlice]);
             return 0;
         }
 
@@ -894,12 +902,14 @@ public sealed class ErbLexer
             pos++;
             if (!TryScanRadixDigits(text, ref pos, 10, allowSign: true, out long exponent, out string? expErr))
             {
+                string litSlice = text[literalStart..pos];
                 diagnostics.ReportError(
                     "ERA1120",
-                    expErr ?? $"Invalid exponent in numeric literal '{text[literalStart..pos]}'.",
+                    expErr ?? $"Invalid exponent in numeric literal '{litSlice}'.",
                     MakeSpan(fileId, lineNo, baseColumn, literalStart, pos - literalStart),
                     filePath,
-                    text);
+                    text,
+                    [litSlice]);
                 return 0;
             }
 
@@ -910,12 +920,14 @@ public sealed class ErbLexer
                     Int128 shifted = (Int128)significand << (int)exponent;
                     if (shifted > long.MaxValue || shifted < long.MinValue)
                     {
+                        string litSlice = text[literalStart..pos];
                         diagnostics.ReportError(
                             "ERA1121",
-                            $"Integer literal '{text[literalStart..pos]}' overflows 64-bit signed integer.",
+                            $"Integer literal '{litSlice}' overflows 64-bit signed integer.",
                             MakeSpan(fileId, lineNo, baseColumn, literalStart, pos - literalStart),
                             filePath,
-                            text);
+                            text,
+                            [litSlice]);
                         return 0;
                     }
 
@@ -925,12 +937,14 @@ public sealed class ErbLexer
                 double scaled = significand * Math.Pow(isBinaryExp ? 2.0 : 10.0, exponent);
                 if (double.IsNaN(scaled) || double.IsInfinity(scaled) || scaled > long.MaxValue || scaled < long.MinValue)
                 {
+                    string litSlice = text[literalStart..pos];
                     diagnostics.ReportError(
                         "ERA1121",
-                        $"Integer literal '{text[literalStart..pos]}' overflows 64-bit signed integer.",
+                        $"Integer literal '{litSlice}' overflows 64-bit signed integer.",
                         MakeSpan(fileId, lineNo, baseColumn, literalStart, pos - literalStart),
                         filePath,
-                        text);
+                        text,
+                        [litSlice]);
                     return 0;
                 }
 
@@ -1211,7 +1225,7 @@ public sealed class ErbLexer
                 return OperatorKind.TernaryHash;
 
             default:
-                diagnostics.ReportError("ERA1123", $"Unrecognized operator '{cur}'.", MakeSpan(fileId, lineNo, baseColumn, start, 1), filePath, text);
+                diagnostics.ReportError("ERA1123", $"Unrecognized operator '{cur}'.", MakeSpan(fileId, lineNo, baseColumn, start, 1), filePath, text, [cur.ToString()]);
                 return OperatorKind.None;
         }
     }

@@ -99,7 +99,8 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
 
         if (!stream.IsAtEnd)
         {
-            diagnostics.ReportError("ERA1901", $"Unexpected token '{stream.Current.Text}' in dynamic integer expression.", stream.Current.Span, "<dynamic>");
+            string tok = stream.Current.Text ?? stream.Current.Kind.ToString();
+            diagnostics.ReportError("ERA1901", $"Unexpected token '{tok}' in dynamic integer expression.", stream.Current.Span, "<dynamic>", null, [tok]);
         }
 
         diagnostics.ThrowIfErrors();
@@ -140,7 +141,8 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         ExprNode node = _exprParser.ParseStrExpression(stream, fnSym, "<dynamic>", diagnostics);
         if (!stream.IsAtEnd)
         {
-            diagnostics.ReportError("ERA1902", $"Unexpected token '{stream.Current.Text}' in dynamic string expression.", stream.Current.Span, "<dynamic>");
+            string tok = stream.Current.Text ?? stream.Current.Kind.ToString();
+            diagnostics.ReportError("ERA1902", $"Unexpected token '{tok}' in dynamic string expression.", stream.Current.Span, "<dynamic>", null, [tok]);
         }
 
         diagnostics.ThrowIfErrors();
@@ -357,7 +359,8 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         ExprNode expr = _exprParser.ParseExpression(exprStream, fnSym, "<@debug>", diagnostics);
         if (!exprStream.IsAtEnd)
         {
-            diagnostics.ReportError("ERA1905", $"Unexpected token '{exprStream.Current.Text}' in @debug expression.", exprStream.Current.Span, "<@debug>");
+            string tok = exprStream.Current.Text ?? exprStream.Current.Kind.ToString();
+            diagnostics.ReportError("ERA1905", $"Unexpected token '{tok}' in @debug expression.", exprStream.Current.Span, "<@debug>", null, [tok]);
         }
 
         diagnostics.ThrowIfErrors();
@@ -381,7 +384,8 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         VariableAccessExpr? va = _exprParser.ParseVariableLValue(stream, fnSym, "<dynamic-var>", diagnostics, requireWritable: requireWritable);
         if (!stream.IsAtEnd)
         {
-            diagnostics.ReportError("ERA1903", $"Unexpected token '{stream.Current.Text}' in variable designator '{variableExpression}'.", stream.Current.Span, "<dynamic-var>");
+            string tok = stream.Current.Text ?? stream.Current.Kind.ToString();
+            diagnostics.ReportError("ERA1903", $"Unexpected token '{tok}' in variable designator '{variableExpression}'.", stream.Current.Span, "<dynamic-var>", null, [tok, variableExpression]);
         }
 
         diagnostics.ThrowIfErrors();

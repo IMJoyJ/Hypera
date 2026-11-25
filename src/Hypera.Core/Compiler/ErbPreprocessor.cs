@@ -372,7 +372,8 @@ public sealed partial class ErbPreprocessor
                     $"Malformed preprocessor directive on line {lineNo}.",
                     span,
                     virtualPath,
-                    rawLine);
+                    rawLine,
+                    [lineNo.ToString()]);
             }
 
             return;
@@ -546,7 +547,7 @@ public sealed partial class ErbPreprocessor
             {
                 if (!string.IsNullOrEmpty(arg))
                 {
-                    diagnostics.ReportWarning("ERA1007", "[SKIPSTART] does not accept arguments.", span, filePath, rawLine);
+                    diagnostics.ReportWarning("ERA1007", "[SKIPSTART] does not accept arguments.", span, filePath, rawLine, ["[SKIPSTART]"]);
                 }
 
                 _skipDepth++;
@@ -558,7 +559,7 @@ public sealed partial class ErbPreprocessor
             {
                 if (!string.IsNullOrEmpty(arg))
                 {
-                    diagnostics.ReportWarning("ERA1007", "[SKIPEND] does not accept arguments.", span, filePath, rawLine);
+                    diagnostics.ReportWarning("ERA1007", "[SKIPEND] does not accept arguments.", span, filePath, rawLine, ["[SKIPEND]"]);
                 }
 
                 if (_stack.Count == 0 || !_stack.Peek().IsSkipStart)
@@ -584,7 +585,7 @@ public sealed partial class ErbPreprocessor
             {
                 if (!string.IsNullOrEmpty(arg))
                 {
-                    diagnostics.ReportError("ERA1009", "[IF_DEBUG] does not accept arguments.", span, filePath, rawLine);
+                    diagnostics.ReportError("ERA1009", "[IF_DEBUG] does not accept arguments.", span, filePath, rawLine, ["[IF_DEBUG]"]);
                     return;
                 }
 
@@ -597,7 +598,7 @@ public sealed partial class ErbPreprocessor
             {
                 if (!string.IsNullOrEmpty(arg))
                 {
-                    diagnostics.ReportError("ERA1009", "[IF_NDEBUG] does not accept arguments.", span, filePath, rawLine);
+                    diagnostics.ReportError("ERA1009", "[IF_NDEBUG] does not accept arguments.", span, filePath, rawLine, ["[IF_NDEBUG]"]);
                     return;
                 }
 
@@ -610,7 +611,7 @@ public sealed partial class ErbPreprocessor
             {
                 if (string.IsNullOrEmpty(arg))
                 {
-                    diagnostics.ReportError("ERA1010", "[IF] requires a macro or constant condition identifier.", span, filePath, rawLine);
+                    diagnostics.ReportError("ERA1010", "[IF] requires a macro or constant condition identifier.", span, filePath, rawLine, ["[IF]"]);
                     return;
                 }
 
@@ -623,7 +624,7 @@ public sealed partial class ErbPreprocessor
             {
                 if (string.IsNullOrEmpty(arg))
                 {
-                    diagnostics.ReportError("ERA1010", "[ELSEIF] requires a macro or constant condition identifier.", span, filePath, rawLine);
+                    diagnostics.ReportError("ERA1010", "[ELSEIF] requires a macro or constant condition identifier.", span, filePath, rawLine, ["[ELSEIF]"]);
                     return;
                 }
 
@@ -647,7 +648,7 @@ public sealed partial class ErbPreprocessor
             {
                 if (!string.IsNullOrEmpty(arg))
                 {
-                    diagnostics.ReportError("ERA1009", "[ELSE] does not accept arguments.", span, filePath, rawLine);
+                    diagnostics.ReportError("ERA1009", "[ELSE] does not accept arguments.", span, filePath, rawLine, ["[ELSE]"]);
                     return;
                 }
 
@@ -672,7 +673,7 @@ public sealed partial class ErbPreprocessor
             {
                 if (!string.IsNullOrEmpty(arg))
                 {
-                    diagnostics.ReportError("ERA1009", "[ENDIF] does not accept arguments.", span, filePath, rawLine);
+                    diagnostics.ReportError("ERA1009", "[ENDIF] does not accept arguments.", span, filePath, rawLine, ["[ENDIF]"]);
                     return;
                 }
 
@@ -686,7 +687,7 @@ public sealed partial class ErbPreprocessor
                 return;
             }
 
-            diagnostics.ReportError("ERA1014", $"Unrecognized preprocessor directive '[{directive}]'.", span, filePath, rawLine);
+            diagnostics.ReportError("ERA1014", $"Unrecognized preprocessor directive '[{directive}]'.", span, filePath, rawLine, [directive]);
         }
 
         public void VerifyEndOfFile(int fileId, string filePath, int eofLineNo, DiagnosticBag diagnostics)
@@ -699,7 +700,9 @@ public sealed partial class ErbPreprocessor
                     "ERA1015",
                     $"Unclosed preprocessor block; expected {expected} before end of file.",
                     unclosed.Span,
-                    filePath);
+                    filePath,
+                    null,
+                    [expected]);
             }
 
             _skipDepth = 0;

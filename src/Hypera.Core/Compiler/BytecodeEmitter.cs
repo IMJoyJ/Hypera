@@ -306,7 +306,9 @@ internal sealed class FunctionBytecodeEmitter
                     "ERA1601",
                     $"Undefined label '${p.LabelName}' in function '@{_fn.Name}'.",
                     p.Span,
-                    _fn.FilePath);
+                    _fn.FilePath,
+                    null,
+                    [p.LabelName, _fn.Name]);
                 continue;
             }
 

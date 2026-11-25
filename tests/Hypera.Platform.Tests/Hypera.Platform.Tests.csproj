@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <RootNamespace>Hypera.Platform.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Hypera.Core\Hypera.Core.csproj" />
+    <ProjectReference Include="..\..\src\Hypera.Platform\Hypera.Platform.csproj" />
+    <ProjectReference Include="..\..\src\Hypera.Web.UI\Hypera.Web.UI.csproj" />
+    <ProjectReference Include="..\..\src\Hypera.Server\Hypera.Server.csproj" />
+  </ItemGroup>
+</Project>

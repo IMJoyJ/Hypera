@@ -1,0 +1,82 @@
+@page "/login"
+@implements IDisposable
+@inject UiSessionState Ui
+@inject NavigationManager Navigation
+
+<MudContainer MaxWidth="MaxWidth.ExtraSmall" Class="mt-8">
+    <MudPaper Class="pa-6" Elevation="2">
+        <MudText Typo="Typo.h5" Class="mb-4">@Ui.T("auth.login")</MudText>
+
+        @if (!string.IsNullOrWhiteSpace(Error))
+        {
+            <MudAlert Severity="Severity.Error" Dense="true" Class="mb-4">
+                @FormatHelpers.MapAuthError(Error, Ui)
+            </MudAlert>
+        }
+
+        <form method="post" action="/api/auth/login">
+            <input type="hidden" name="username" value="@_username" />
+            <input type="hidden" name="password" value="@_password" />
+            @if (!string.IsNullOrWhiteSpace(ReturnUrl))
+            {
+                <input type="hidden" name="returnUrl" value="@ReturnUrl" />
+            }
+
+            <MudTextField @bind-Value="_username"
+                          Label="@Ui.T("auth.username")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Immediate="true"
+                          Required="true"
+                          Class="mb-3" />
+
+            <MudTextField @bind-Value="_password"
+                          Label="@Ui.T("auth.password")"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          InputType="InputType.Password"
+                          Immediate="true"
+                          Required="true"
+                          Class="mb-4" />
+
+            <MudButton ButtonType="ButtonType.Submit"
+                       Variant="Variant.Filled"
+                       Color="Color.Primary"
+                       FullWidth="true"
+                       Disabled="@(string.IsNullOrWhiteSpace(_username) || string.IsNullOrEmpty(_password))">
+                @Ui.T("auth.login")
+            </MudButton>
+        </form>
+
+        <div class="d-flex justify-end mt-3">
+            <MudButton Variant="Variant.Text" Size="Size.Small" Href="/register" Class="text-none">
+                @Ui.T("auth.switchToRegister")
+            </MudButton>
+        </div>
+    </MudPaper>
+</MudContainer>
+
+@code {
+    [SupplyParameterFromQuery(Name = "error")]
+    public string? Error { get; set; }
+
+    [SupplyParameterFromQuery(Name = "returnUrl")]
+    public string? ReturnUrl { get; set; }
+
+    private string _username = string.Empty;
+    private string _password = string.Empty;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Ui.Changed += OnUiChanged;
+        await Ui.InitializeAsync();
+        if (Ui.IsLocalSingleUser || Ui.IsAuthenticated)
+        {
+            Navigation.NavigateTo("/");
+        }
+    }
+
+    private void OnUiChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Ui.Changed -= OnUiChanged;
+}

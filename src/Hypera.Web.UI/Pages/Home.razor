@@ -1,0 +1,219 @@
+@page "/"
+@implements IDisposable
+@inject UiSessionState Ui
+@inject IAppCatalogService CatalogService
+@inject IDialogService DialogService
+@inject NavigationManager Navigation
+
+<div class="d-flex flex-wrap align-center justify-space-between gap-3 mb-4">
+    <MudText Typo="Typo.h5" Style="font-weight: 600;">@Ui.T("catalog.title")</MudText>
+
+    <div class="d-flex align-center gap-2">
+        <MudTextField @bind-Value="_search"
+                      Placeholder="@Ui.T("app.search")"
+                      Adornment="Adornment.Start"
+                      AdornmentIcon="@Icons.Material.Filled.Search"
+                      Variant="Variant.Outlined"
+                      Margin="Margin.Dense"
+                      Immediate="true"
+                      Clearable="true"
+                      Style="min-width: 220px;" />
+
+        @if (Ui.IsAuthenticated)
+        {
+            <MudButton Variant="Variant.Filled"
+                       Color="Color.Primary"
+                       StartIcon="@Icons.Material.Filled.Add"
+                       OnClick="@OpenCreateDialogAsync">
+                @Ui.T("catalog.newApp")
+            </MudButton>
+        }
+        else if (Ui.IsMultiUserServer)
+        {
+            <MudButton Variant="Variant.Outlined"
+                       Color="Color.Primary"
+                       StartIcon="@Icons.Material.Filled.Login"
+                       Href="/login">
+                @Ui.T("auth.login")
+            </MudButton>
+        }
+    </div>
+</div>
+
+@if (_loading)
+{
+    <MudProgressLinear Indeterminate="true" Color="Color.Primary" Class="mb-4" />
+}
+else if (FilteredApps.Count == 0)
+{
+    <MudPaper Outlined="true" Class="pa-8 text-center">
+        <MudText Typo="Typo.body1" Color="Color.Secondary">@Ui.T("catalog.empty")</MudText>
+    </MudPaper>
+}
+else
+{
+    <MudGrid Spacing="3">
+        @foreach (GameApp app in FilteredApps)
+        {
+            List<string> languages = app.Versions
+                .SelectMany(static v => v.Variants)
+                .Where(static vr => vr.ActiveSubmissionId.HasValue)
+                .Select(static vr => vr.LanguageCode)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            bool playable = languages.Count > 0;
+
+            <MudItem xs="12" sm="6" md="4">
+                <MudCard Outlined="true" Class="d-flex flex-column" Style="height: 100%;">
+                    <MudCardHeader Class="pb-1">
+                        <CardHeaderContent>
+                            <div class="d-flex align-center gap-2">
+                                <MudLink Href="@($"/apps/{app.Id}")" Typo="Typo.h6" Underline="Underline.Hover" Color="Color.Default" Style="font-weight: 600;">
+                                    @app.Title
+                                </MudLink>
+                            </div>
+                        </CardHeaderContent>
+                        <CardHeaderActions>
+                            @if (!app.IsPublicPool)
+                            {
+                                <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Text">
+                                    @Ui.T("catalog.privatePending")
+                                </MudChip>
+                            }
+                            @if (app.ForkedFromAppId.HasValue)
+                            {
+                                <MudTooltip Text="@Ui.T("catalog.forkedFrom")">
+                                    <MudIcon Icon="@Icons.Material.Filled.AccountTree" Size="Size.Small" Color="Color.Secondary" Class="mt-2 mr-1" />
+                                </MudTooltip>
+                            }
+                        </CardHeaderActions>
+                    </MudCardHeader>
+
+                    <MudCardContent Class="pt-1 flex-grow-1">
+                        @if (!string.IsNullOrWhiteSpace(app.Summary))
+                        {
+                            <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mb-2" Style="display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">
+                                @app.Summary
+                            </MudText>
+                        }
+
+                        <div class="d-flex flex-wrap align-center gap-1 mt-1">
+                            @if (playable)
+                            {
+                                @foreach (string lang in languages)
+                                {
+                                    <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined" Color="Color.Primary">
+                                        @lang
+                                    </MudChip>
+                                }
+                            }
+                            else
+                            {
+                                <MudChip T="string" Size="Size.Small" Variant="Variant.Text" Color="Color.Default">
+                                    @Ui.T("catalog.noPlayableVersion")
+                                </MudChip>
+                            }
+                        </div>
+                    </MudCardContent>
+
+                    <MudCardActions Class="px-4 pb-3 pt-0 d-flex justify-space-between">
+                        <div class="d-flex gap-1">
+                            <MudButton Variant="Variant.Filled"
+                                       Color="Color.Primary"
+                                       Size="Size.Small"
+                                       StartIcon="@Icons.Material.Filled.PlayArrow"
+                                       Disabled="@(!playable || !Ui.IsAuthenticated)"
+                                       Href="@($"/play/{app.Id}")">
+                                @Ui.T("app.play")
+                            </MudButton>
+                            <MudButton Variant="Variant.Text"
+                                       Color="Color.Default"
+                                       Size="Size.Small"
+                                       Href="@($"/apps/{app.Id}")">
+                                @Ui.T("catalog.details")
+                            </MudButton>
+                        </div>
+
+                        @if (Ui.IsAuthenticated)
+                        {
+                            <MudIconButton Icon="@Icons.Material.Filled.Save"
+                                           Size="Size.Small"
+                                           Color="Color.Secondary"
+                                           title="@Ui.T("saves.title")"
+                                           Href="@($"/apps/{app.Id}/saves")" />
+                        }
+                    </MudCardActions>
+                </MudCard>
+            </MudItem>
+        }
+    </MudGrid>
+}
+
+@code {
+    private List<GameApp> _apps = [];
+    private string _search = string.Empty;
+    private bool _loading = true;
+
+    private IReadOnlyList<GameApp> FilteredApps
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(_search))
+            {
+                return _apps;
+            }
+
+            string q = _search.Trim();
+            return _apps.Where(a =>
+                a.Title.Contains(q, StringComparison.OrdinalIgnoreCase)
+                || a.Summary.Contains(q, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Ui.Changed += OnUiChanged;
+        await Ui.InitializeAsync();
+        await LoadAppsAsync();
+    }
+
+    private async Task LoadAppsAsync()
+    {
+        _loading = true;
+        try
+        {
+            IReadOnlyList<GameApp> list = await CatalogService.ListVisibleAppsAsync(Ui.CurrentUser?.Id);
+            _apps = list.ToList();
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task OpenCreateDialogAsync()
+    {
+        if (!Ui.IsAuthenticated)
+        {
+            Navigation.NavigateTo("/login");
+            return;
+        }
+
+        var parameters = new DialogParameters<CreateAppDialog>
+        {
+            { x => x.UserId, Ui.CurrentUser!.Id },
+        };
+
+        IDialogReference dialog = await DialogService.ShowAsync<CreateAppDialog>(Ui.T("catalog.newApp"), parameters);
+        DialogResult? result = await dialog.Result;
+        if (result is { Canceled: false, Data: Guid createdAppId })
+        {
+            Navigation.NavigateTo($"/apps/{createdAppId}");
+        }
+    }
+
+    private void OnUiChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Ui.Changed -= OnUiChanged;
+}

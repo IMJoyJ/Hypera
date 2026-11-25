@@ -288,25 +288,25 @@ public sealed partial class SymbolTable
     {
         if (IsReservedKeyword(macro.Name))
         {
-            diagnostics.ReportError("ERA1201", $"Cannot #DEFINE reserved keyword '{macro.Name}'.", macro.DeclarationSpan, filePath);
+            diagnostics.ReportError("ERA1201", $"Cannot #DEFINE reserved keyword '{macro.Name}'.", macro.DeclarationSpan, filePath, null, [macro.Name]);
             return false;
         }
 
         if (_macros.ContainsKey(macro.Name))
         {
-            diagnostics.ReportError("ERA1202", $"Duplicate #DEFINE macro '{macro.Name}'.", macro.DeclarationSpan, filePath);
+            diagnostics.ReportError("ERA1202", $"Duplicate #DEFINE macro '{macro.Name}'.", macro.DeclarationSpan, filePath, null, [macro.Name]);
             return false;
         }
 
         if (_globalVariables.ContainsKey(macro.Name))
         {
-            diagnostics.ReportError("ERA1203", $"Macro name '{macro.Name}' conflicts with an existing variable.", macro.DeclarationSpan, filePath);
+            diagnostics.ReportError("ERA1203", $"Macro name '{macro.Name}' conflicts with an existing variable.", macro.DeclarationSpan, filePath, null, [macro.Name]);
             return false;
         }
 
         if (BuiltinInstructionCatalog.TryGet(macro.Name, _options.IgnoreCase, _options.UseScopedVariableInstruction, out _))
         {
-            diagnostics.ReportError("ERA1204", $"Macro name '{macro.Name}' conflicts with a built-in instruction.", macro.DeclarationSpan, filePath);
+            diagnostics.ReportError("ERA1204", $"Macro name '{macro.Name}' conflicts with a built-in instruction.", macro.DeclarationSpan, filePath, null, [macro.Name]);
             return false;
         }
 
@@ -318,7 +318,7 @@ public sealed partial class SymbolTable
     {
         if (_funcRefs.ContainsKey(funcRef.Name) || _globalVariables.ContainsKey(funcRef.Name) || _macros.ContainsKey(funcRef.Name))
         {
-            diagnostics.ReportError("ERA1205", $"Identifier '{funcRef.Name}' is already declared.", funcRef.DeclarationSpan, filePath);
+            diagnostics.ReportError("ERA1205", $"Identifier '{funcRef.Name}' is already declared.", funcRef.DeclarationSpan, filePath, null, [funcRef.Name]);
             return false;
         }
 
@@ -330,7 +330,7 @@ public sealed partial class SymbolTable
     {
         if (IsReservedKeyword(variable.Name))
         {
-            diagnostics.ReportError("ERA1206", $"Variable name '{variable.Name}' is a reserved keyword.", span, filePath);
+            diagnostics.ReportError("ERA1206", $"Variable name '{variable.Name}' is a reserved keyword.", span, filePath, null, [variable.Name]);
             return false;
         }
 
@@ -338,20 +338,20 @@ public sealed partial class SymbolTable
             || _macros.ContainsKey(variable.Name)
             || IsFunctionLocalBuiltinName(variable.Name))
         {
-            diagnostics.ReportError("ERA1207", $"Global variable '{variable.Name}' is already defined.", span, filePath);
+            diagnostics.ReportError("ERA1207", $"Global variable '{variable.Name}' is already defined.", span, filePath, null, [variable.Name]);
             return false;
         }
 
         if (BuiltinInstructionCatalog.TryGet(variable.Name, _options.IgnoreCase, _options.UseScopedVariableInstruction, out _)
             || BuiltinMethodCatalog.TryGet(variable.Name, _options.IgnoreCase, out _))
         {
-            diagnostics.ReportError("ERA1208", $"Global variable '{variable.Name}' conflicts with a built-in instruction or method.", span, filePath);
+            diagnostics.ReportError("ERA1208", $"Global variable '{variable.Name}' conflicts with a built-in instruction or method.", span, filePath, null, [variable.Name]);
             return false;
         }
 
         if (_options.UseERD && _options.CheckDuplicateIdentifier && _external.ErdIdentifiers?.Contains(variable.Name) == true)
         {
-            diagnostics.ReportWarning("ERA1209", $"Variable '{variable.Name}' conflicts with an ERD identifier.", span, filePath);
+            diagnostics.ReportWarning("ERA1209", $"Variable '{variable.Name}' conflicts with an ERD identifier.", span, filePath, null, [variable.Name]);
         }
 
         variable.SlotId = _staticVariables.Count;
@@ -377,7 +377,9 @@ public sealed partial class SymbolTable
                 "ERA1210",
                 $"Function '@{name}' overrides a built-in method while AllowFunctionOverloading is false.",
                 headerSpan,
-                filePath);
+                filePath,
+                null,
+                [name]);
         }
         else if (_options.WarnFunctionOverloading && BuiltinMethodCatalog.TryGet(name, ignoreFuncCase, out _))
         {
@@ -385,7 +387,9 @@ public sealed partial class SymbolTable
                 "ERA1211",
                 $"Function '@{name}' overrides built-in expression method '{name}'.",
                 headerSpan,
-                filePath);
+                filePath,
+                null,
+                [name]);
         }
 
         var fn = new UserFunctionSymbol
@@ -416,7 +420,9 @@ public sealed partial class SymbolTable
                 "ERA1212",
                 $"Duplicate non-event function '@{name}' (first defined at {first.FilePath}:{first.HeaderSpan.StartLine}); first definition wins.",
                 headerSpan,
-                filePath);
+                filePath,
+                null,
+                [name, first.FilePath, first.HeaderSpan.StartLine.ToString()]);
         }
 
         list.Add(fn);

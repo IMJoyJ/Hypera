@@ -362,12 +362,14 @@ public sealed class ErbProjectCompiler
             {
                 if (seenBodyStatementInCurrentFunc)
                 {
+                    string dirText = trimmed.ToString();
                     diagnostics.ReportError(
                         "ERA1502",
-                        $"Function directive '{trimmed.ToString()}' must appear immediately after '@{currentUnit.Symbol.Name}' before any statements.",
+                        $"Function directive '{dirText}' must appear immediately after '@{currentUnit.Symbol.Name}' before any statements.",
                         line.CreateSpan(leadSkip, trimmed.Length),
                         filePath,
-                        line.RawLineText);
+                        line.RawLineText,
+                        [dirText, currentUnit.Symbol.Name]);
                     continue;
                 }
 
@@ -403,7 +405,8 @@ public sealed class ErbProjectCompiler
                         $"Goto label '${labelName}' cannot be declared inside PRINTDATA/STRDATA/TRYCALLLIST blocks.",
                         lblSpan,
                         filePath,
-                        line.RawLineText);
+                        line.RawLineText,
+                        [labelName]);
                 }
                 else if (!currentUnit.Symbol.DollarLabels.TryAdd(labelName, -1))
                 {
@@ -412,7 +415,8 @@ public sealed class ErbProjectCompiler
                         $"Duplicate goto label '${labelName}' in function '@{currentUnit.Symbol.Name}'.",
                         lblSpan,
                         filePath,
-                        line.RawLineText);
+                        line.RawLineText,
+                        [labelName, currentUnit.Symbol.Name]);
                 }
                 else
                 {
@@ -508,7 +512,7 @@ public sealed class ErbProjectCompiler
         {
             if (fn.IsMethod)
             {
-                diagnostics.ReportError("ERA1510", $"Directive '#SINGLE' cannot be combined with '#FUNCTION(S)' on '@{fn.Name}'.", span, fn.FilePath);
+                diagnostics.ReportError("ERA1510", $"Directive '#SINGLE' cannot be combined with '#FUNCTION(S)' on '@{fn.Name}'.", span, fn.FilePath, null, ["SINGLE", fn.Name]);
                 return;
             }
 
@@ -524,7 +528,7 @@ public sealed class ErbProjectCompiler
         {
             if (fn.IsMethod)
             {
-                diagnostics.ReportError("ERA1510", $"Directive '#PRI' cannot be combined with '#FUNCTION(S)' on '@{fn.Name}'.", span, fn.FilePath);
+                diagnostics.ReportError("ERA1510", $"Directive '#PRI' cannot be combined with '#FUNCTION(S)' on '@{fn.Name}'.", span, fn.FilePath, null, ["PRI", fn.Name]);
                 return;
             }
 
@@ -540,7 +544,7 @@ public sealed class ErbProjectCompiler
         {
             if (fn.IsMethod)
             {
-                diagnostics.ReportError("ERA1510", $"Directive '#LATER' cannot be combined with '#FUNCTION(S)' on '@{fn.Name}'.", span, fn.FilePath);
+                diagnostics.ReportError("ERA1510", $"Directive '#LATER' cannot be combined with '#FUNCTION(S)' on '@{fn.Name}'.", span, fn.FilePath, null, ["LATER", fn.Name]);
                 return;
             }
 
@@ -556,7 +560,7 @@ public sealed class ErbProjectCompiler
         {
             if (fn.IsMethod)
             {
-                diagnostics.ReportError("ERA1510", $"Directive '#ONLY' cannot be combined with '#FUNCTION(S)' on '@{fn.Name}'.", span, fn.FilePath);
+                diagnostics.ReportError("ERA1510", $"Directive '#ONLY' cannot be combined with '#FUNCTION(S)' on '@{fn.Name}'.", span, fn.FilePath, null, ["ONLY", fn.Name]);
                 return;
             }
 
@@ -573,7 +577,9 @@ public sealed class ErbProjectCompiler
                     "ERA1511",
                     $"Event/system function '@{fn.Name}' cannot be declared as '#{directive}'.",
                     span,
-                    fn.FilePath);
+                    fn.FilePath,
+                    null,
+                    [fn.Name, directive]);
                 return;
             }
 
@@ -583,7 +589,9 @@ public sealed class ErbProjectCompiler
                     "ERA1512",
                     $"Expression function '@{fn.Name}' cannot start with a digit.",
                     span,
-                    fn.FilePath);
+                    fn.FilePath,
+                    null,
+                    [fn.Name]);
                 return;
             }
 
@@ -593,7 +601,9 @@ public sealed class ErbProjectCompiler
                     "ERA1513",
                     $"Duplicate or conflicting '#FUNCTION'/'#FUNCTIONS' directive on '@{fn.Name}'.",
                     span,
-                    fn.FilePath);
+                    fn.FilePath,
+                    null,
+                    [fn.Name]);
                 return;
             }
 
@@ -617,14 +627,14 @@ public sealed class ErbProjectCompiler
             var ts = new TokenStream(sizeTokens, span);
             if (ts.IsAtEnd)
             {
-                diagnostics.ReportError("ERA1514", $"Missing integer constant after '#{directive}'.", span, fn.FilePath);
+                diagnostics.ReportError("ERA1514", $"Missing integer constant after '#{directive}'.", span, fn.FilePath, null, [directive]);
                 return;
             }
 
             ExprNode sizeExpr = exprParser.ParseIntExpression(ts, activeFunction: null, fn.FilePath, diagnostics);
             if (sizeExpr is not IntLiteralExpr sizeLit || sizeLit.Value <= 0 || sizeLit.Value > 1_000_000)
             {
-                diagnostics.ReportError("ERA1515", $"Invalid size in '#{directive}': expected positive constant integer.", span, fn.FilePath);
+                diagnostics.ReportError("ERA1515", $"Invalid size in '#{directive}': expected positive constant integer.", span, fn.FilePath, null, [directive]);
                 return;
             }
 
@@ -648,7 +658,7 @@ public sealed class ErbProjectCompiler
             return;
         }
 
-        diagnostics.ReportError("ERA1519", $"Unknown function directive '#{directive}'.", span, fn.FilePath);
+        diagnostics.ReportError("ERA1519", $"Unknown function directive '#{directive}'.", span, fn.FilePath, null, [directive]);
     }
 
     private void PreRegisterScopedVariable(
@@ -675,7 +685,8 @@ public sealed class ErbProjectCompiler
 
         if (string.IsNullOrEmpty(varName) || char.IsAsciiDigit(varName[0]))
         {
-            diagnostics.ReportError("ERA1520", $"Invalid variable name '{varName}' in {(isString ? "VARS" : "VARI")}.", span, fn.FilePath);
+            string kind = isString ? "VARS" : "VARI";
+            diagnostics.ReportError("ERA1520", $"Invalid variable name '{varName}' in {kind}.", span, fn.FilePath, null, [varName, kind]);
             return;
         }
 
@@ -684,7 +695,7 @@ public sealed class ErbProjectCompiler
             || BuiltinInstructionCatalog.TryGet(varName, _options.IgnoreCase, _options.UseScopedVariableInstruction, out _)
             || BuiltinMethodCatalog.TryGet(varName, _options.IgnoreCase, out _))
         {
-            diagnostics.ReportError("ERA1521", $"Scoped variable '{varName}' conflicts with a reserved keyword, instruction, or method.", span, fn.FilePath);
+            diagnostics.ReportError("ERA1521", $"Scoped variable '{varName}' conflicts with a reserved keyword, instruction, or method.", span, fn.FilePath, null, [varName], "diag.ERA1521.conflict");
             return;
         }
 
@@ -692,7 +703,7 @@ public sealed class ErbProjectCompiler
         {
             if (existing.ValueKind != (isString ? VariableValueKind.Str : VariableValueKind.Int))
             {
-                diagnostics.ReportError("ERA1521", $"Conflicting redeclaration of scoped variable '{varName}'.", span, fn.FilePath);
+                diagnostics.ReportError("ERA1521", $"Conflicting redeclaration of scoped variable '{varName}'.", span, fn.FilePath, null, [varName], "diag.ERA1521.redecl");
             }
 
             return;
@@ -706,7 +717,9 @@ public sealed class ErbProjectCompiler
             {
                 if (!int.TryParse(parts[i].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int d) || d <= 0 || d > 1_000_000)
                 {
-                    diagnostics.ReportError("ERA1522", $"Invalid array dimension '{parts[i].Trim()}' in {(isString ? "VARS" : "VARI")}.", span, fn.FilePath);
+                    string dimStr = parts[i].Trim();
+                    string kind = isString ? "VARS" : "VARI";
+                    diagnostics.ReportError("ERA1522", $"Invalid array dimension '{dimStr}' in {kind}.", span, fn.FilePath, null, [dimStr, kind]);
                     return;
                 }
 
@@ -754,7 +767,9 @@ public sealed class ErbProjectCompiler
                 "ERA1530",
                 $"Event function '@{fn.Name}' cannot declare formal parameters.",
                 span,
-                fn.FilePath);
+                fn.FilePath,
+                null,
+                [fn.Name]);
             return;
         }
 
@@ -776,7 +791,7 @@ public sealed class ErbProjectCompiler
             {
                 if (!stream.IsAtEnd)
                 {
-                    diagnostics.ReportError("ERA1531", $"Unexpected tokens after ')' in '@{fn.Name}'.", stream.Current.Span, fn.FilePath);
+                    diagnostics.ReportError("ERA1531", $"Unexpected tokens after ')' in '@{fn.Name}'.", stream.Current.Span, fn.FilePath, null, [fn.Name]);
                 }
 
                 return;
@@ -788,7 +803,9 @@ public sealed class ErbProjectCompiler
                 "ERA1532",
                 $"Invalid parameter list syntax in '@{fn.Name}': expected '(' or ','.",
                 stream.Current.Span,
-                fn.FilePath);
+                fn.FilePath,
+                null,
+                [fn.Name]);
             return;
         }
 
@@ -855,7 +872,9 @@ public sealed class ErbProjectCompiler
                     "ERA1533",
                     $"Variable '{v.Name}' cannot be used as a formal parameter in '@{fn.Name}'.",
                     paramVar.Span,
-                    fn.FilePath);
+                    fn.FilePath,
+                    null,
+                    [v.Name, fn.Name]);
             }
 
             bool isArg = ReferenceEquals(v, fn.ArgArray);
@@ -900,7 +919,9 @@ public sealed class ErbProjectCompiler
                         "ERA1534",
                         $"Formal parameter '{v.Name}' in '@{fn.Name}' must have a constant subscript.",
                         paramVar.Span,
-                        fn.FilePath);
+                        fn.FilePath,
+                        null,
+                        [v.Name, fn.Name]);
                 }
             }
             else if (!v.IsByRef && paramVar.Subscripts.Length > 0 && paramVar.Subscripts[0] is not IntLiteralExpr)
@@ -909,7 +930,9 @@ public sealed class ErbProjectCompiler
                     "ERA1534",
                     $"Formal parameter '{v.Name}' in '@{fn.Name}' must have a constant subscript.",
                     paramVar.Span,
-                    fn.FilePath);
+                    fn.FilePath,
+                    null,
+                    [v.Name, fn.Name]);
             }
 
             bool hasDefault = false;
@@ -926,7 +949,9 @@ public sealed class ErbProjectCompiler
                         "ERA1535",
                         $"By-reference parameter '{v.Name}' in '@{fn.Name}' cannot specify a default value.",
                         opTok.Span,
-                        fn.FilePath);
+                        fn.FilePath,
+                        null,
+                        [v.Name, fn.Name]);
                 }
 
                 hasDefault = true;
@@ -943,7 +968,10 @@ public sealed class ErbProjectCompiler
                             "ERA1536",
                             $"Default value for string parameter '{v.Name}' in '@{fn.Name}' must be a constant string literal.",
                             defExpr.Span,
-                            fn.FilePath);
+                            fn.FilePath,
+                            null,
+                            [v.Name, fn.Name],
+                            "diag.ERA1536.str");
                     }
                 }
                 else
@@ -959,7 +987,10 @@ public sealed class ErbProjectCompiler
                             "ERA1536",
                             $"Default value for integer parameter '{v.Name}' in '@{fn.Name}' must be a constant integer.",
                             defExpr.Span,
-                            fn.FilePath);
+                            fn.FilePath,
+                            null,
+                            [v.Name, fn.Name],
+                            "diag.ERA1536.int");
                     }
                 }
             }
@@ -975,11 +1006,14 @@ public sealed class ErbProjectCompiler
             {
                 if (!stream.IsAtEnd)
                 {
+                    string foundTok = stream.Current.Text ?? stream.Current.Kind.ToString();
                     diagnostics.ReportError(
                         "ERA1537",
-                        $"Expected ',' or ')' after parameter '{v.Name}' in '@{fn.Name}', found '{stream.Current.Text}'.",
+                        $"Expected ',' or ')' after parameter '{v.Name}' in '@{fn.Name}', found '{foundTok}'.",
                         stream.Current.Span,
-                        fn.FilePath);
+                        fn.FilePath,
+                        null,
+                        [v.Name, fn.Name, foundTok]);
                 }
 
                 break;
@@ -1235,30 +1269,30 @@ public sealed class ErbProjectCompiler
             while (_ifStack.Count > 0)
             {
                 IfBlockFrame open = _ifStack.Pop();
-                _diagnostics.ReportError("ERA1701", $"Unclosed 'IF' block in function '@{_fn.Name}' (missing 'ENDIF').", open.OpenSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1701", $"Unclosed 'IF' block in function '@{_fn.Name}' (missing 'ENDIF').", open.OpenSpan, _fn.FilePath, null, [_fn.Name]);
             }
 
             while (_selectStack.Count > 0)
             {
                 SelectCaseFrame open = _selectStack.Pop();
-                _diagnostics.ReportError("ERA1702", $"Unclosed 'SELECTCASE' block in function '@{_fn.Name}' (missing 'ENDSELECT').", open.OpenSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1702", $"Unclosed 'SELECTCASE' block in function '@{_fn.Name}' (missing 'ENDSELECT').", open.OpenSpan, _fn.FilePath, null, [_fn.Name]);
             }
 
             while (_loopStack.Count > 0)
             {
                 LoopFrame open = _loopStack.Pop();
-                _diagnostics.ReportError("ERA1703", $"Unclosed '{open.Kind}' loop in function '@{_fn.Name}'.", open.OpenSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1703", $"Unclosed '{open.Kind}' loop in function '@{_fn.Name}'.", open.OpenSpan, _fn.FilePath, null, [_fn.Name, open.Kind.ToString()]);
             }
 
             while (_catchStack.Count > 0)
             {
                 CatchFrame open = _catchStack.Pop();
-                _diagnostics.ReportError("ERA1704", $"Unclosed '{open.OpenKeyword}' block in function '@{_fn.Name}' (missing 'CATCH'/'ENDCATCH').", open.OpenSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1704", $"Unclosed '{open.OpenKeyword}' block in function '@{_fn.Name}' (missing 'CATCH'/'ENDCATCH').", open.OpenSpan, _fn.FilePath, null, [_fn.Name, open.OpenKeyword]);
             }
 
             if (_noSkipSavedRegStack.Count > 0)
             {
-                _diagnostics.ReportError("ERA1705", $"Unclosed 'NOSKIP' block in function '@{_fn.Name}' (missing 'ENDNOSKIP').", _fn.HeaderSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1705", $"Unclosed 'NOSKIP' block in function '@{_fn.Name}' (missing 'ENDNOSKIP').", _fn.HeaderSpan, _fn.FilePath, null, [_fn.Name]);
             }
 
             _emitter.ResolvePendingLabelJumps(_catchGroupTargetPcs);
@@ -1340,7 +1374,9 @@ public sealed class ErbProjectCompiler
                                 "ERA1505",
                                 $"Full-width space after instruction '{spec.Name}' is forbidden when SystemAllowFullSpace is false.",
                                 line.CreateSpan(leadSkip + kw.Length, 1),
-                                _fn.FilePath);
+                                _fn.FilePath,
+                                null,
+                                [spec.Name]);
                         }
                         else
                         {
@@ -1348,7 +1384,9 @@ public sealed class ErbProjectCompiler
                                 "ERA1506",
                                 $"Unexpected character '{sep}' immediately after instruction '{spec.Name}'.",
                                 line.CreateSpan(leadSkip + kw.Length, 1),
-                                _fn.FilePath);
+                                _fn.FilePath,
+                                null,
+                                [spec.Name, sep.ToString()]);
                         }
 
                         index++;
@@ -1362,7 +1400,9 @@ public sealed class ErbProjectCompiler
                         "ERA1540",
                         $"Instruction '{spec.Name}' is forbidden inside '#FUNCTION'/'#FUNCTIONS' method '@{_fn.Name}'.",
                         line.CreateSpan(leadSkip, kw.Length),
-                        _fn.FilePath);
+                        _fn.FilePath,
+                        null,
+                        [spec.Name, _fn.Name]);
                     index++;
                     return;
                 }
@@ -1477,7 +1517,7 @@ public sealed class ErbProjectCompiler
             TokenStream stream = MakeStream(trimmed.ToString(), line, col1Based, lineSpan);
             if (stream.Current.Kind != ErbTokenKind.Operator || stream.Current.Operator is not (OperatorKind.Increment or OperatorKind.Decrement))
             {
-                _diagnostics.ReportError("ERA1550", $"Invalid statement starting with '{trimmed[0]}': expected '++' or '--'.", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1550", $"Invalid statement starting with '{trimmed[0]}': expected '++' or '--'.", lineSpan, _fn.FilePath, null, [trimmed[0].ToString()]);
                 return;
             }
 
@@ -1490,13 +1530,15 @@ public sealed class ErbProjectCompiler
 
             if (target.ValueKind != VariableValueKind.Int)
             {
-                _diagnostics.ReportError("ERA1551", $"Cannot apply '{(op == OperatorKind.Increment ? "++" : "--")}' to string variable '{target.Variable.Name}'.", target.Span, _fn.FilePath);
+                string opStr = op == OperatorKind.Increment ? "++" : "--";
+                _diagnostics.ReportError("ERA1551", $"Cannot apply '{opStr}' to string variable '{target.Variable.Name}'.", target.Span, _fn.FilePath, null, [opStr, target.Variable.Name]);
                 return;
             }
 
             if (!stream.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1552", $"Unexpected token '{stream.Current.Text}' after increment/decrement target.", stream.Current.Span, _fn.FilePath);
+                string tok = stream.Current.Text ?? stream.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1552", $"Unexpected token '{tok}' after increment/decrement target.", stream.Current.Span, _fn.FilePath, null, [tok]);
                 return;
             }
 
@@ -1538,11 +1580,15 @@ public sealed class ErbProjectCompiler
 
                 if (!_diagnostics.HasErrors)
                 {
+                    string stmtText = text.ToString();
                     _diagnostics.ReportError(
                         "ERA1554",
-                        $"Unknown instruction or invalid assignment statement '{text.ToString()}'.",
+                        $"Unknown instruction or invalid assignment statement '{stmtText}'.",
                         lineSpan,
-                        _fn.FilePath);
+                        _fn.FilePath,
+                        null,
+                        [stmtText],
+                        "diag.ERA1554.unknown");
                 }
 
                 return;
@@ -1560,7 +1606,10 @@ public sealed class ErbProjectCompiler
                     "ERA1554",
                     $"Expected assignment operator after '{lhs.Variable.Name}'.",
                     probeStream.Current.Span,
-                    _fn.FilePath);
+                    _fn.FilePath,
+                    null,
+                    [lhs.Variable.Name],
+                    "diag.ERA1554.expected_op");
                 return;
             }
 
@@ -1581,19 +1630,20 @@ public sealed class ErbProjectCompiler
 
             if (assignOp == OperatorKind.AssignStr)
             {
-                _diagnostics.ReportError("ERA1556", $"String assignment operator ''='' cannot be applied to integer variable '{lhs.Variable.Name}'.", opTok.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1556", $"String assignment operator ''='' cannot be applied to integer variable '{lhs.Variable.Name}'.", opTok.Span, _fn.FilePath, null, [lhs.Variable.Name]);
                 return;
             }
 
             if (!IsAssignmentOperator(assignOp))
             {
-                _diagnostics.ReportError("ERA1557", $"Invalid integer assignment operator '{opTok.Text}'.", opTok.Span, _fn.FilePath);
+                string opText = opTok.Text ?? opTok.Operator.ToString();
+                _diagnostics.ReportError("ERA1557", $"Invalid integer assignment operator '{opText}'.", opTok.Span, _fn.FilePath, null, [opText]);
                 return;
             }
 
             if (probeStream.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1558", $"Missing right-hand expression in assignment to '{lhs.Variable.Name}'.", opTok.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1558", $"Missing right-hand expression in assignment to '{lhs.Variable.Name}'.", opTok.Span, _fn.FilePath, null, [lhs.Variable.Name]);
                 return;
             }
 
@@ -1610,7 +1660,7 @@ public sealed class ErbProjectCompiler
 
                 if (lhs.Variable.ArrayRank == 0 && !lhs.Variable.IsByRef)
                 {
-                    _diagnostics.ReportError("ERA1560", $"Cannot perform bulk comma-list assignment to 0D scalar variable '{lhs.Variable.Name}'.", lhs.Span, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1560", $"Cannot perform bulk comma-list assignment to 0D scalar variable '{lhs.Variable.Name}'.", lhs.Span, _fn.FilePath, null, [lhs.Variable.Name]);
                     return;
                 }
 
@@ -1623,7 +1673,8 @@ public sealed class ErbProjectCompiler
 
                 if (!probeStream.IsAtEnd)
                 {
-                    _diagnostics.ReportError("ERA1561", $"Unexpected token '{probeStream.Current.Text}' in array assignment.", probeStream.Current.Span, _fn.FilePath);
+                    string tok = probeStream.Current.Text ?? probeStream.Current.Kind.ToString();
+                    _diagnostics.ReportError("ERA1561", $"Unexpected token '{tok}' in array assignment.", probeStream.Current.Span, _fn.FilePath, null, [tok]);
                     return;
                 }
 
@@ -1633,7 +1684,8 @@ public sealed class ErbProjectCompiler
 
             if (!probeStream.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1561", $"Unexpected token '{probeStream.Current.Text}' after assignment expression.", probeStream.Current.Span, _fn.FilePath);
+                string tok = probeStream.Current.Text ?? probeStream.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1561", $"Unexpected token '{tok}' after assignment expression.", probeStream.Current.Span, _fn.FilePath, null, [tok]);
                 return;
             }
 
@@ -1667,7 +1719,9 @@ public sealed class ErbProjectCompiler
                         "ERA1562",
                         $"Assigning to string variable '{lhs.Variable.Name}' with '=' is forbidden when SystemIgnoreStringSet is enabled; use ''=''.",
                         opTok.Span,
-                        _fn.FilePath);
+                        _fn.FilePath,
+                        null,
+                        [lhs.Variable.Name]);
                     return;
                 }
 
@@ -1696,13 +1750,14 @@ public sealed class ErbProjectCompiler
 
             if (assignOp is not (OperatorKind.AssignStr or OperatorKind.AddAssign))
             {
-                _diagnostics.ReportError("ERA1563", $"Operator '{opTok.Text}' cannot be applied to string variable '{lhs.Variable.Name}'.", opTok.Span, _fn.FilePath);
+                string opText = opTok.Text ?? opTok.Operator.ToString();
+                _diagnostics.ReportError("ERA1563", $"Operator '{opText}' cannot be applied to string variable '{lhs.Variable.Name}'.", opTok.Span, _fn.FilePath, null, [opText, lhs.Variable.Name]);
                 return;
             }
 
             if (stream.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1558", $"Missing string expression in assignment to '{lhs.Variable.Name}'.", opTok.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1558", $"Missing string expression in assignment to '{lhs.Variable.Name}'.", opTok.Span, _fn.FilePath, null, [lhs.Variable.Name]);
                 return;
             }
 
@@ -1717,7 +1772,7 @@ public sealed class ErbProjectCompiler
 
                 if (lhs.Variable.ArrayRank == 0 && !lhs.Variable.IsByRef)
                 {
-                    _diagnostics.ReportError("ERA1560", $"Cannot perform bulk comma-list assignment to 0D string variable '{lhs.Variable.Name}'.", lhs.Span, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1560", $"Cannot perform bulk comma-list assignment to 0D string variable '{lhs.Variable.Name}'.", lhs.Span, _fn.FilePath, null, [lhs.Variable.Name]);
                     return;
                 }
 
@@ -1730,7 +1785,8 @@ public sealed class ErbProjectCompiler
 
                 if (!stream.IsAtEnd)
                 {
-                    _diagnostics.ReportError("ERA1561", $"Unexpected token '{stream.Current.Text}' in string array assignment.", stream.Current.Span, _fn.FilePath);
+                    string tok = stream.Current.Text ?? stream.Current.Kind.ToString();
+                    _diagnostics.ReportError("ERA1561", $"Unexpected token '{tok}' in string array assignment.", stream.Current.Span, _fn.FilePath, null, [tok]);
                     return;
                 }
 
@@ -1740,7 +1796,8 @@ public sealed class ErbProjectCompiler
 
             if (!stream.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1561", $"Unexpected token '{stream.Current.Text}' after string assignment.", stream.Current.Span, _fn.FilePath);
+                string tok = stream.Current.Text ?? stream.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1561", $"Unexpected token '{tok}' after string assignment.", stream.Current.Span, _fn.FilePath, null, [tok]);
                 return;
             }
 
@@ -1961,7 +2018,7 @@ public sealed class ErbProjectCompiler
 
             if (spec.ArgPattern == InstructionArgumentPattern.Void && !argSpan.IsEmpty)
             {
-                _diagnostics.ReportError("ERA1570", $"Instruction '{spec.Name}' does not accept arguments.", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1570", $"Instruction '{spec.Name}' does not accept arguments.", lineSpan, _fn.FilePath, null, [spec.Name]);
                 return;
             }
 
@@ -2128,7 +2185,7 @@ public sealed class ErbProjectCompiler
 
                 case BuiltinInstructionKind.FUNC:
                 case BuiltinInstructionKind.ENDFUNC:
-                    _diagnostics.ReportError("ERA1720", $"'{spec.Name}' can only appear inside a 'TRYCALLLIST'/'TRYJUMPLIST'/'TRYGOTOLIST' block.", lineSpan, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1720", $"'{spec.Name}' can only appear inside a 'TRYCALLLIST'/'TRYJUMPLIST'/'TRYGOTOLIST' block.", lineSpan, _fn.FilePath, null, [spec.Name]);
                     return;
 
                 case BuiltinInstructionKind.DATA:
@@ -2136,7 +2193,7 @@ public sealed class ErbProjectCompiler
                 case BuiltinInstructionKind.DATALIST:
                 case BuiltinInstructionKind.ENDLIST:
                 case BuiltinInstructionKind.ENDDATA:
-                    _diagnostics.ReportError("ERA1721", $"'{spec.Name}' can only appear inside a 'PRINTDATA*' or 'STRDATA' block.", lineSpan, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1721", $"'{spec.Name}' can only appear inside a 'PRINTDATA*' or 'STRDATA' block.", lineSpan, _fn.FilePath, null, [spec.Name]);
                     return;
 
                 case BuiltinInstructionKind.CALLF:
@@ -2387,7 +2444,8 @@ public sealed class ErbProjectCompiler
                     string align = argSpan.Trim().ToString().ToUpperInvariant();
                     if (align is not ("LEFT" or "CENTER" or "RIGHT"))
                     {
-                        _diagnostics.ReportError("ERA1572", $"Invalid ALIGNMENT keyword '{argSpan.ToString()}': expected LEFT, CENTER, or RIGHT.", lineSpan, _fn.FilePath);
+                        string rawAlign = argSpan.ToString();
+                        _diagnostics.ReportError("ERA1572", $"Invalid ALIGNMENT keyword '{rawAlign}': expected LEFT, CENTER, or RIGHT.", lineSpan, _fn.FilePath, null, [rawAlign]);
                         return;
                     }
 
@@ -2817,7 +2875,7 @@ public sealed class ErbProjectCompiler
                     targetVar = _exprParser.ParseVariableLValue(ts, _fn, _fn.FilePath, _diagnostics);
                     if (targetVar is not null && targetVar.ValueKind != VariableValueKind.Str)
                     {
-                        _diagnostics.ReportError("ERA1722", $"'STRDATA' target '{targetVar.Variable.Name}' must be a string variable.", targetVar.Span, _fn.FilePath);
+                        _diagnostics.ReportError("ERA1722", $"'STRDATA' target '{targetVar.Variable.Name}' must be a string variable.", targetVar.Span, _fn.FilePath, null, [targetVar.Variable.Name]);
                     }
                 }
             }
@@ -2827,7 +2885,7 @@ public sealed class ErbProjectCompiler
                 targetVar = _exprParser.ParseVariableLValue(ts, _fn, _fn.FilePath, _diagnostics);
                 if (targetVar is not null && targetVar.ValueKind != VariableValueKind.Int)
                 {
-                    _diagnostics.ReportError("ERA1723", $"'{openSpec.Name}' target '{targetVar.Variable.Name}' must be an integer variable.", targetVar.Span, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1723", $"'{openSpec.Name}' target '{targetVar.Variable.Name}' must be an integer variable.", targetVar.Span, _fn.FilePath, null, [openSpec.Name, targetVar.Variable.Name]);
                 }
             }
 
@@ -2909,16 +2967,19 @@ public sealed class ErbProjectCompiler
                     continue;
                 }
 
+                string badKw = bKw.ToString();
                 _diagnostics.ReportError(
                     "ERA1727",
-                    $"Invalid instruction '{bKw.ToString()}' inside '{openSpec.Name}': only DATA, DATAFORM, DATALIST, ENDLIST, and ENDDATA are permitted.",
+                    $"Invalid instruction '{badKw}' inside '{openSpec.Name}': only DATA, DATAFORM, DATALIST, ENDLIST, and ENDDATA are permitted.",
                     bSpan,
-                    _fn.FilePath);
+                    _fn.FilePath,
+                    null,
+                    [badKw, openSpec.Name]);
             }
 
             if (!closed)
             {
-                _diagnostics.ReportError("ERA1728", $"Unclosed '{openSpec.Name}' block in function '@{_fn.Name}' (missing 'ENDDATA').", openSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1728", $"Unclosed '{openSpec.Name}' block in function '@{_fn.Name}' (missing 'ENDDATA').", openSpan, _fn.FilePath, null, [_fn.Name, openSpec.Name]);
                 return;
             }
 
@@ -3123,7 +3184,9 @@ public sealed class ErbProjectCompiler
                     "ERA1737",
                     $"Block/partial instruction '{targetSpec.Name}' cannot be the target of 'SIF'.",
                     targetLine.CreateSpan(0, targetLine.Text.Length),
-                    _fn.FilePath);
+                    _fn.FilePath,
+                    null,
+                    [targetSpec.Name]);
                 return;
             }
 
@@ -3160,7 +3223,8 @@ public sealed class ErbProjectCompiler
             ExprNode subject = _exprParser.ParseExpression(ts, _fn, _fn.FilePath, _diagnostics);
             if (!ts.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1741", $"Unexpected token '{ts.Current.Text}' in 'SELECTCASE'.", ts.Current.Span, _fn.FilePath);
+                string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1741", $"Unexpected token '{tok}' in 'SELECTCASE'.", ts.Current.Span, _fn.FilePath, null, [tok]);
             }
 
             ushort subjectReg;
@@ -3364,7 +3428,7 @@ public sealed class ErbProjectCompiler
 
             if (counterVar.ValueKind != VariableValueKind.Int)
             {
-                _diagnostics.ReportError("ERA1750", $"'FOR' counter '{counterVar.Variable.Name}' must be an integer variable.", counterVar.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1750", $"'FOR' counter '{counterVar.Variable.Name}' must be an integer variable.", counterVar.Span, _fn.FilePath, null, [counterVar.Variable.Name]);
                 return;
             }
 
@@ -3388,7 +3452,8 @@ public sealed class ErbProjectCompiler
 
             if (!ts.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1753", $"Unexpected token '{ts.Current.Text}' in 'FOR' header.", ts.Current.Span, _fn.FilePath);
+                string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1753", $"Unexpected token '{tok}' in 'FOR' header.", ts.Current.Span, _fn.FilePath, null, [tok]);
             }
 
             ushort cntReg = _emitter.AllocateIntReg();
@@ -3614,7 +3679,7 @@ public sealed class ErbProjectCompiler
             string labelName = ExtractTargetIdentifier(argSpan, stripDollarOrAt: '$');
             if (string.IsNullOrEmpty(labelName))
             {
-                _diagnostics.ReportError("ERA1604", $"Missing target label name after '{spec.Name}'.", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1604", $"Missing target label name after '{spec.Name}'.", lineSpan, _fn.FilePath, null, [spec.Name]);
                 return;
             }
 
@@ -3634,7 +3699,7 @@ public sealed class ErbProjectCompiler
         {
             if (argSpan.IsEmpty)
             {
-                _diagnostics.ReportError("ERA1604", $"Missing FORM label expression after '{spec.Name}'.", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1604", $"Missing FORM label expression after '{spec.Name}'.", lineSpan, _fn.FilePath, null, [spec.Name]);
                 return;
             }
 
@@ -3735,7 +3800,7 @@ public sealed class ErbProjectCompiler
 
             if (!TrySplitCallTargetAndArgs(argSpan, isForm: false, out string rawName, out string rawArgs, out int argsOffset))
             {
-                _diagnostics.ReportError("ERA1610", $"Missing target function name in '{spec.Name}'.", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1610", $"Missing target function name in '{spec.Name}'.", lineSpan, _fn.FilePath, null, [spec.Name]);
                 return;
             }
 
@@ -3749,7 +3814,9 @@ public sealed class ErbProjectCompiler
                             "ERA1611",
                             $"Cannot '{spec.Name}' event function '@{rawName}' unless CompatiCallEvent is enabled.",
                             lineSpan,
-                            _fn.FilePath);
+                            _fn.FilePath,
+                            null,
+                            [spec.Name, rawName]);
                         return;
                     }
 
@@ -3783,7 +3850,9 @@ public sealed class ErbProjectCompiler
                         "ERA1612",
                         $"Undefined function '@{rawName}' in '{spec.Name}'.",
                         lineSpan,
-                        _fn.FilePath);
+                        _fn.FilePath,
+                        null,
+                        [spec.Name, rawName]);
                     return;
                 }
 
@@ -3804,7 +3873,9 @@ public sealed class ErbProjectCompiler
                         "ERA1613",
                         $"Cannot '{spec.Name}' expression method '@{targetFn.Name}'; use 'CALLF' or an expression instead.",
                         lineSpan,
-                        _fn.FilePath);
+                        _fn.FilePath,
+                        null,
+                        [spec.Name, targetFn.Name]);
                     return;
                 }
 
@@ -3857,7 +3928,7 @@ public sealed class ErbProjectCompiler
 
             if (!TrySplitCallTargetAndArgs(argSpan, isForm: true, out string rawFormTarget, out string rawArgs, out int argsOffset))
             {
-                _diagnostics.ReportError("ERA1610", $"Missing FORM target in '{spec.Name}'.", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1610", $"Missing FORM target in '{spec.Name}'.", lineSpan, _fn.FilePath, null, [spec.Name]);
                 return;
             }
 
@@ -3983,7 +4054,8 @@ public sealed class ErbProjectCompiler
 
                 if (!fKw.Equals("FUNC", cmp))
                 {
-                    _diagnostics.ReportError("ERA1762", $"Expected 'FUNC' or 'ENDFUNC' inside '{blockName}', found '{fKw.ToString()}'.", fSpan, _fn.FilePath);
+                    string kwStr = fKw.ToString();
+                    _diagnostics.ReportError("ERA1762", $"Expected 'FUNC' or 'ENDFUNC' inside '{blockName}', found '{kwStr}'.", fSpan, _fn.FilePath, null, [blockName, kwStr]);
                     continue;
                 }
 
@@ -4005,7 +4077,7 @@ public sealed class ErbProjectCompiler
 
             if (!closed)
             {
-                _diagnostics.ReportError("ERA1763", $"Unclosed '{blockName}' block in function '@{_fn.Name}' (missing 'ENDFUNC').", openSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1763", $"Unclosed '{blockName}' block in function '@{_fn.Name}' (missing 'ENDFUNC').", openSpan, _fn.FilePath, null, [_fn.Name, blockName]);
             }
 
             return items;
@@ -4015,7 +4087,8 @@ public sealed class ErbProjectCompiler
         {
             if (!TrySplitCallTargetAndArgs(argSpan, isForm: false, out string rawName, out string rawArgs, out int argsOffset))
             {
-                _diagnostics.ReportError("ERA1614", $"Missing method name in '{(isTry ? "TRYCALLF" : "CALLF")}'.", lineSpan, _fn.FilePath);
+                string kw = isTry ? "TRYCALLF" : "CALLF";
+                _diagnostics.ReportError("ERA1614", $"Missing method name in '{kw}'.", lineSpan, _fn.FilePath, null, [kw]);
                 return;
             }
 
@@ -4026,7 +4099,7 @@ public sealed class ErbProjectCompiler
                 {
                     if (!isTry)
                     {
-                        _diagnostics.ReportError("ERA1615", $"'CALLF' target '@{targetFn.Name}' is not declared with '#FUNCTION' or '#FUNCTIONS'.", lineSpan, _fn.FilePath);
+                        _diagnostics.ReportError("ERA1615", $"'CALLF' target '@{targetFn.Name}' is not declared with '#FUNCTION' or '#FUNCTIONS'.", lineSpan, _fn.FilePath, null, [targetFn.Name]);
                     }
 
                     return;
@@ -4045,7 +4118,7 @@ public sealed class ErbProjectCompiler
 
             if (!isTry)
             {
-                _diagnostics.ReportError("ERA1616", $"Undefined '#FUNCTION(S)' method '{rawName}' in 'CALLF'.", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1616", $"Undefined '#FUNCTION(S)' method '{rawName}' in 'CALLF'.", lineSpan, _fn.FilePath, null, [rawName]);
             }
         }
 
@@ -4053,7 +4126,8 @@ public sealed class ErbProjectCompiler
         {
             if (!TrySplitCallTargetAndArgs(argSpan, isForm: true, out string rawFormTarget, out string rawArgs, out int argsOffset))
             {
-                _diagnostics.ReportError("ERA1614", $"Missing FORM method name in '{(isTry ? "TRYCALLFORMF" : "CALLFORMF")}'.", lineSpan, _fn.FilePath);
+                string kw = isTry ? "TRYCALLFORMF" : "CALLFORMF";
+                _diagnostics.ReportError("ERA1614", $"Missing FORM method name in '{kw}'.", lineSpan, _fn.FilePath, null, [kw]);
                 return;
             }
 
@@ -4100,7 +4174,8 @@ public sealed class ErbProjectCompiler
             ExprNode callExpr = _exprParser.ParseExpression(ts, _fn, _fn.FilePath, _diagnostics);
             if (!ts.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1617", $"Unexpected token '{ts.Current.Text}' in method statement '{methodName}'.", ts.Current.Span, _fn.FilePath);
+                string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1617", $"Unexpected token '{tok}' in method statement '{methodName}'.", ts.Current.Span, _fn.FilePath, null, [methodName, tok]);
             }
 
             var mark = _emitter.MarkTempRegs();
@@ -4227,7 +4302,7 @@ public sealed class ErbProjectCompiler
         {
             if (!_fn.IsMethod)
             {
-                _diagnostics.ReportError("ERA1630", $"'RETURNF' can only be used inside a '#FUNCTION' or '#FUNCTIONS' method (in '@{_fn.Name}').", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1630", $"'RETURNF' can only be used inside a '#FUNCTION' or '#FUNCTIONS' method (in '@{_fn.Name}').", lineSpan, _fn.FilePath, null, [_fn.Name]);
                 return;
             }
 
@@ -4255,14 +4330,15 @@ public sealed class ErbProjectCompiler
             ExprNode retExpr = _exprParser.ParseExpression(ts, _fn, _fn.FilePath, _diagnostics);
             if (!ts.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1631", $"Unexpected token '{ts.Current.Text}' after 'RETURNF' expression.", ts.Current.Span, _fn.FilePath);
+                string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1631", $"Unexpected token '{tok}' after 'RETURNF' expression.", ts.Current.Span, _fn.FilePath, null, [tok]);
             }
 
             if (_fn.MethodReturnKind == VariableValueKind.Str)
             {
                 if (retExpr.ValueKind != VariableValueKind.Str)
                 {
-                    _diagnostics.ReportError("ERA1632", $"Cannot return integer expression from '#FUNCTIONS' string method '@{_fn.Name}'.", retExpr.Span, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1632", $"Cannot return integer expression from '#FUNCTIONS' string method '@{_fn.Name}'.", retExpr.Span, _fn.FilePath, null, [_fn.Name]);
                 }
                 else
                 {
@@ -4274,7 +4350,7 @@ public sealed class ErbProjectCompiler
             {
                 if (retExpr.ValueKind != VariableValueKind.Int)
                 {
-                    _diagnostics.ReportError("ERA1633", $"Cannot return string expression from '#FUNCTION' integer method '@{_fn.Name}'.", retExpr.Span, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1633", $"Cannot return string expression from '#FUNCTION' integer method '@{_fn.Name}'.", retExpr.Span, _fn.FilePath, null, [_fn.Name]);
                 }
                 else
                 {
@@ -4303,11 +4379,15 @@ public sealed class ErbProjectCompiler
 
             if (phase == SystemPhaseKind.Unknown)
             {
+                string phaseStr = argSpan.Trim().ToString();
+                string beginKw = isForce ? "FORCE_BEGIN" : "BEGIN";
                 _diagnostics.ReportError(
                     "ERA1635",
-                    $"Unknown system phase '{argSpan.Trim().ToString()}' in '{(isForce ? "FORCE_BEGIN" : "BEGIN")}'.",
+                    $"Unknown system phase '{phaseStr}' in '{beginKw}'.",
                     lineSpan,
-                    _fn.FilePath);
+                    _fn.FilePath,
+                    null,
+                    [beginKw, phaseStr]);
                 return;
             }
 
@@ -4325,14 +4405,15 @@ public sealed class ErbProjectCompiler
             ExprNode labelExpr = ParseCommaItemStr(ts);
             if (!ts.Match(ErbTokenKind.Comma))
             {
-                _diagnostics.ReportError("ERA1574", $"Expected ',' before button value in '{spec.Name}'.", ts.Current.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1574", $"Expected ',' before button value in '{spec.Name}'.", ts.Current.Span, _fn.FilePath, null, [spec.Name]);
                 return;
             }
 
             ExprNode valExpr = _exprParser.ParseExpression(ts, _fn, _fn.FilePath, _diagnostics);
             if (!ts.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1575", $"Unexpected token '{ts.Current.Text}' in '{spec.Name}'.", ts.Current.Span, _fn.FilePath);
+                string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1575", $"Unexpected token '{tok}' in '{spec.Name}'.", ts.Current.Span, _fn.FilePath, null, [spec.Name, tok]);
             }
 
             var mark = _emitter.MarkTempRegs();
@@ -4520,7 +4601,8 @@ public sealed class ErbProjectCompiler
             List<ExprNode?> args = ParseCommaExprList(line, argSpan, argCol, lineSpan, minCount: 1, maxCount: 3, static _ => VariableValueKind.Int);
             if (args.Count is not (1 or 3))
             {
-                _diagnostics.ReportError("ERA1576", $"'{(isBg ? "SETBGCOLOR" : "SETCOLOR")}' expects 1 (0xRRGGBB) or 3 (R, G, B) integer arguments.", lineSpan, _fn.FilePath);
+                string colorKw = isBg ? "SETBGCOLOR" : "SETCOLOR";
+                _diagnostics.ReportError("ERA1576", $"'{colorKw}' expects 1 (0xRRGGBB) or 3 (R, G, B) integer arguments.", lineSpan, _fn.FilePath, null, [colorKw]);
                 return;
             }
 
@@ -4545,7 +4627,8 @@ public sealed class ErbProjectCompiler
             string colorName = argSpan.Trim().ToString();
             if (string.IsNullOrEmpty(colorName))
             {
-                _diagnostics.ReportError("ERA1577", $"Missing color name in '{(isBg ? "SETBGCOLORBYNAME" : "SETCOLORBYNAME")}'.", lineSpan, _fn.FilePath);
+                string colorKw = isBg ? "SETBGCOLORBYNAME" : "SETCOLORBYNAME";
+                _diagnostics.ReportError("ERA1577", $"Missing color name in '{colorKw}'.", lineSpan, _fn.FilePath, null, [colorKw]);
                 return;
             }
 
@@ -4648,13 +4731,14 @@ public sealed class ErbProjectCompiler
 
             if (dst.ValueKind != VariableValueKind.Int)
             {
-                _diagnostics.ReportError("ERA1581", $"'TIMES' target '{dst.Variable.Name}' must be an integer variable.", dst.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1581", $"'TIMES' target '{dst.Variable.Name}' must be an integer variable.", dst.Span, _fn.FilePath, null, [dst.Variable.Name]);
                 return;
             }
 
             if (!double.TryParse(floatPart, NumberStyles.Float, CultureInfo.InvariantCulture, out double factor))
             {
-                _diagnostics.ReportError("ERA1582", $"Invalid floating-point literal '{floatPart.ToString()}' in 'TIMES'.", lineSpan, _fn.FilePath);
+                string floatStr = floatPart.ToString();
+                _diagnostics.ReportError("ERA1582", $"Invalid floating-point literal '{floatStr}' in 'TIMES'.", lineSpan, _fn.FilePath, null, [floatStr]);
                 return;
             }
 
@@ -4675,7 +4759,7 @@ public sealed class ErbProjectCompiler
             if (dst is null) return;
             if (dst.ValueKind != VariableValueKind.Int)
             {
-                _diagnostics.ReportError("ERA1583", $"'POWER' destination '{dst.Variable.Name}' must be an integer variable.", dst.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1583", $"'POWER' destination '{dst.Variable.Name}' must be an integer variable.", dst.Span, _fn.FilePath, null, [dst.Variable.Name]);
                 return;
             }
 
@@ -4717,7 +4801,7 @@ public sealed class ErbProjectCompiler
 
             if (v1.ValueKind != v2.ValueKind)
             {
-                _diagnostics.ReportError("ERA1586", $"'SWAP' variables '{v1.Variable.Name}' and '{v2.Variable.Name}' must have matching types.", lineSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1586", $"'SWAP' variables '{v1.Variable.Name}' and '{v2.Variable.Name}' must have matching types.", lineSpan, _fn.FilePath, null, [v1.Variable.Name, v2.Variable.Name]);
                 return;
             }
 
@@ -4754,13 +4838,13 @@ public sealed class ErbProjectCompiler
             if (dst is null) return;
             if (dst.ValueKind != VariableValueKind.Int)
             {
-                _diagnostics.ReportError("ERA1587", $"'{kind}' target '{dst.Variable.Name}' must be an integer variable.", dst.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1587", $"'{kind}' target '{dst.Variable.Name}' must be an integer variable.", dst.Span, _fn.FilePath, null, [kind.ToString(), dst.Variable.Name]);
                 return;
             }
 
             if (!ts.Match(ErbTokenKind.Comma))
             {
-                _diagnostics.ReportError("ERA1588", $"Expected ',' and bit index after '{dst.Variable.Name}' in '{kind}'.", ts.Current.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1588", $"Expected ',' and bit index after '{dst.Variable.Name}' in '{kind}'.", ts.Current.Span, _fn.FilePath, null, [kind.ToString(), dst.Variable.Name]);
                 return;
             }
 
@@ -4811,13 +4895,14 @@ public sealed class ErbProjectCompiler
 
             if (!refTarget.Variable.IsByRef || !_emitter.LocalSlotMap.TryGetValue(refTarget.Variable, out int refSlotIdx))
             {
-                _diagnostics.ReportError("ERA1589", $"First argument '{refTarget.Variable.Name}' of '{(byName ? "REFBYNAME" : "REF")}' must be a '#DIM(S) REF' variable.", refTarget.Span, _fn.FilePath);
+                string refKw = byName ? "REFBYNAME" : "REF";
+                _diagnostics.ReportError("ERA1589", $"First argument '{refTarget.Variable.Name}' of '{refKw}' must be a '#DIM(S) REF' variable.", refTarget.Span, _fn.FilePath, null, [refKw, refTarget.Variable.Name]);
                 return;
             }
 
             if (!ts.Match(ErbTokenKind.Comma))
             {
-                _diagnostics.ReportError("ERA1590", $"Expected ',' after '{refTarget.Variable.Name}'.", ts.Current.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1590", $"Expected ',' after '{refTarget.Variable.Name}'.", ts.Current.Span, _fn.FilePath, null, [refTarget.Variable.Name]);
                 return;
             }
 
@@ -4839,7 +4924,7 @@ public sealed class ErbProjectCompiler
 
                 if (srcVar.ValueKind != refTarget.ValueKind)
                 {
-                    _diagnostics.ReportError("ERA1591", $"Cannot bind '{refTarget.Variable.Name}' ({refTarget.ValueKind}) to '{srcVar.Variable.Name}' ({srcVar.ValueKind}).", srcVar.Span, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1591", $"Cannot bind '{refTarget.Variable.Name}' ({refTarget.ValueKind}) to '{srcVar.Variable.Name}' ({srcVar.ValueKind}).", srcVar.Span, _fn.FilePath, null, [refTarget.Variable.Name, refTarget.ValueKind.ToString(), srcVar.Variable.Name, srcVar.ValueKind.ToString()]);
                     _emitter.ReleaseTempRegs(mark);
                     return;
                 }
@@ -4905,7 +4990,7 @@ public sealed class ErbProjectCompiler
             if (dst is null) return;
             if (!dst.Variable.IsCharaData)
             {
-                _diagnostics.ReportError("ERA1592", $"'CVARSET' variable '{dst.Variable.Name}' must be a character variable.", dst.Span, _fn.FilePath);
+                _diagnostics.ReportError("ERA1592", $"'CVARSET' variable '{dst.Variable.Name}' must be a character variable.", dst.Span, _fn.FilePath, null, [dst.Variable.Name]);
                 return;
             }
 
@@ -5228,7 +5313,7 @@ public sealed class ErbProjectCompiler
         {
             if (argSpan.IsEmpty)
             {
-                _diagnostics.ReportError("ERA1595", $"Missing integer expression after '{instrName}'.", fallbackSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1595", $"Missing integer expression after '{instrName}'.", fallbackSpan, _fn.FilePath, null, [instrName]);
                 return new IntLiteralExpr(0, fallbackSpan);
             }
 
@@ -5236,7 +5321,8 @@ public sealed class ErbProjectCompiler
             ExprNode expr = _exprParser.ParseIntExpression(ts, _fn, _fn.FilePath, _diagnostics);
             if (!ts.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1596", $"Unexpected token '{ts.Current.Text}' after '{instrName}' expression.", ts.Current.Span, _fn.FilePath);
+                string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1596", $"Unexpected token '{tok}' after '{instrName}' expression.", ts.Current.Span, _fn.FilePath, null, [instrName, tok]);
             }
 
             return expr;
@@ -5246,7 +5332,7 @@ public sealed class ErbProjectCompiler
         {
             if (argSpan.IsEmpty)
             {
-                _diagnostics.ReportError("ERA1597", $"Missing string expression after '{instrName}'.", fallbackSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1597", $"Missing string expression after '{instrName}'.", fallbackSpan, _fn.FilePath, null, [instrName]);
                 return new StrLiteralExpr(string.Empty, fallbackSpan);
             }
 
@@ -5254,7 +5340,8 @@ public sealed class ErbProjectCompiler
             ExprNode expr = _exprParser.ParseStrExpression(ts, _fn, _fn.FilePath, _diagnostics);
             if (!ts.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1598", $"Unexpected token '{ts.Current.Text}' after '{instrName}' string expression.", ts.Current.Span, _fn.FilePath);
+                string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1598", $"Unexpected token '{tok}' after '{instrName}' string expression.", ts.Current.Span, _fn.FilePath, null, [instrName, tok]);
             }
 
             return expr;
@@ -5274,7 +5361,7 @@ public sealed class ErbProjectCompiler
             {
                 if (minCount > 0)
                 {
-                    _diagnostics.ReportError("ERA1599", $"Expected at least {minCount} argument(s).", fallbackSpan, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1599", $"Expected at least {minCount} argument(s).", fallbackSpan, _fn.FilePath, null, [minCount.ToString()], "diag.ERA1599.min");
                 }
 
                 return result;
@@ -5319,12 +5406,13 @@ public sealed class ErbProjectCompiler
 
             if (!ts.IsAtEnd)
             {
-                _diagnostics.ReportError("ERA1596", $"Unexpected token '{ts.Current.Text}' in argument list.", ts.Current.Span, _fn.FilePath);
+                string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1596", $"Unexpected token '{tok}' in argument list.", ts.Current.Span, _fn.FilePath, null, ["argument list", tok]);
             }
 
             if (result.Count < minCount || result.Count > maxCount)
             {
-                _diagnostics.ReportError("ERA1599", $"Invalid argument count ({result.Count}); expected {minCount}..{maxCount}.", fallbackSpan, _fn.FilePath);
+                _diagnostics.ReportError("ERA1599", $"Invalid argument count ({result.Count}); expected {minCount}..{maxCount}.", fallbackSpan, _fn.FilePath, null, [result.Count.ToString(), minCount.ToString(), maxCount.ToString()], "diag.ERA1599.range");
             }
 
             return result;
@@ -5430,7 +5518,9 @@ public sealed class ErbProjectCompiler
                     "ERA1621",
                     $"Too many arguments ({args.Count}) passed to '@{targetFn.Name}' (expects at most {targetFn.Parameters.Count}).",
                     callSpan,
-                    _fn.FilePath);
+                    _fn.FilePath,
+                    null,
+                    [targetFn.Name, args.Count.ToString(), targetFn.Parameters.Count.ToString()]);
                 return;
             }
 
@@ -5448,7 +5538,9 @@ public sealed class ErbProjectCompiler
                             "ERA1622",
                             $"By-reference argument #{i + 1} ('{fv.Name}') to '@{targetFn.Name}' cannot be omitted.",
                             callSpan,
-                            _fn.FilePath);
+                            _fn.FilePath,
+                            null,
+                            [targetFn.Name, (i + 1).ToString(), fv.Name]);
                     }
                     else if (!formal.HasExplicitDefault && !_options.CompatiFuncArgOptional)
                     {
@@ -5456,7 +5548,9 @@ public sealed class ErbProjectCompiler
                             "ERA1623",
                             $"Argument #{i + 1} ('{fv.Name}') to '@{targetFn.Name}' cannot be omitted without a default value.",
                             callSpan,
-                            _fn.FilePath);
+                            _fn.FilePath,
+                            null,
+                            [targetFn.Name, (i + 1).ToString(), fv.Name]);
                     }
 
                     continue;
@@ -5470,7 +5564,9 @@ public sealed class ErbProjectCompiler
                             "ERA1624",
                             $"By-reference argument #{i + 1} to '@{targetFn.Name}' must be a writable {fv.ValueKind} array variable.",
                             actual.Span,
-                            _fn.FilePath);
+                            _fn.FilePath,
+                            null,
+                            [targetFn.Name, (i + 1).ToString(), fv.ValueKind.ToString()]);
                     }
 
                     continue;
@@ -5487,7 +5583,9 @@ public sealed class ErbProjectCompiler
                         "ERA1625",
                         $"Argument #{i + 1} to '@{targetFn.Name}' has type {actual.ValueKind}, expected {fv.ValueKind}.",
                         actual.Span,
-                        _fn.FilePath);
+                        _fn.FilePath,
+                        null,
+                        [targetFn.Name, (i + 1).ToString(), actual.ValueKind.ToString(), fv.ValueKind.ToString()]);
                 }
             }
         }

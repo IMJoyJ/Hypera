@@ -1,0 +1,742 @@
+@page "/admin"
+@implements IDisposable
+@inject UiSessionState Ui
+@inject IPackagePipelineService PipelineService
+@inject IBinaryReputationService ReputationService
+@inject IAuthService AuthService
+@inject IAppCatalogService CatalogService
+@inject IDialogService DialogService
+@inject ISnackbar Snackbar
+@inject IJSRuntime Js
+
+<MudText Typo="Typo.h5" Class="mb-4" Style="font-weight: 600;">@Ui.T("admin.title")</MudText>
+
+@if (!Ui.IsInitialized)
+{
+    <MudProgressLinear Indeterminate="true" Color="Color.Primary" />
+}
+else if (!Ui.ShowAdminNav)
+{
+    <MudAlert Severity="Severity.Error">@Ui.T("admin.accessDenied")</MudAlert>
+}
+else
+{
+    <MudTabs Elevation="0" Outlined="true" Rounded="true" ApplyEffectsToContainer="true" PanelClass="pa-4">
+        @* 1. Review Queue Tab *@
+        <MudTabPanel Text="@Ui.T("admin.tabReview")" BadgeData="@(_pendingItems.Count > 0 ? _pendingItems.Count : null)" BadgeColor="Color.Warning">
+            <div class="d-flex justify-end mb-3">
+                <MudButton Variant="Variant.Text" Size="Size.Small" StartIcon="@Icons.Material.Filled.Refresh" OnClick="@LoadPendingReviewsAsync">
+                    @Ui.T("app.refresh")
+                </MudButton>
+            </div>
+
+            @if (_loadingReview)
+            {
+                <MudProgressLinear Indeterminate="true" Color="Color.Primary" />
+            }
+            else if (_pendingItems.Count == 0)
+            {
+                <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("admin.pendingEmpty")</MudText>
+            }
+            else
+            {
+                <MudStack Spacing="3">
+                    @foreach (PendingReviewItem item in _pendingItems)
+                    {
+                        GameLanguageSubmission sub = item.Submission;
+                        bool hasHighRisk = item.Binaries.Any(static b => b.EffectiveStatus == BinaryReputationStatus.HighRisk);
+                        bool hasUnknown = item.Binaries.Any(static b => b.EffectiveStatus == BinaryReputationStatus.Unknown);
+
+                        <MudPaper Outlined="true" Class="pa-4">
+                            <div class="d-flex flex-wrap align-center justify-space-between gap-2 mb-3">
+                                <div class="d-flex flex-wrap align-center gap-2">
+                                    <MudText Typo="Typo.subtitle1" Style="font-weight: 600;">
+                                        @(sub.Version?.App?.Title ?? sub.VersionId.ToString())
+                                    </MudText>
+                                    @if (!string.IsNullOrWhiteSpace(sub.Version?.VersionLabel))
+                                    {
+                                        <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined">@sub.Version!.VersionLabel</MudChip>
+                                    }
+                                    <MudChip T="string" Size="Size.Small" Color="Color.Primary" Variant="Variant.Outlined">@sub.LanguageCode</MudChip>
+                                    @if (sub.UploadedByUser is not null)
+                                    {
+                                        <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                            @Ui.T("admin.uploader"): @sub.UploadedByUser.Username
+                                        </MudText>
+                                    }
+                                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                        @FormatHelpers.FormatUtc(sub.CreatedAtUtc)
+                                    </MudText>
+                                </div>
+
+                                <MudIconButton Icon="@Icons.Material.Filled.Download"
+                                               Size="Size.Small"
+                                               Color="Color.Secondary"
+                                               title="@Ui.T("appDetail.sourceDownloadTooltip")"
+                                               OnClick="@(() => DownloadSubmissionSourceAsync(sub))" />
+                            </div>
+
+                            @if (hasHighRisk)
+                            {
+                                <MudAlert Severity="Severity.Error" Variant="Variant.Filled" Dense="true" Class="mb-3">
+                                    @Ui.T("admin.binaryHighRiskAlert")
+                                </MudAlert>
+                            }
+                            else if (hasUnknown)
+                            {
+                                <MudAlert Severity="Severity.Warning" Variant="Variant.Outlined" Dense="true" Class="mb-3">
+                                    @Ui.T("admin.binaryUnknownAlert")
+                                </MudAlert>
+                            }
+
+                            @if (item.Binaries.Count == 0)
+                            {
+                                <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-3 d-block">
+                                    @Ui.T("admin.noBinaries")
+                                </MudText>
+                            }
+                            else
+                            {
+                                <MudText Typo="Typo.subtitle2" Class="mb-1">@Ui.T("admin.binaries")</MudText>
+                                <MudSimpleTable Dense="true" Outlined="true" Class="mb-3">
+                                    <thead>
+                                        <tr>
+                                            <th>@Ui.T("admin.binaryPath")</th>
+                                            <th>@Ui.T("admin.binaryHash")</th>
+                                            <th style="width: 90px;">@Ui.T("admin.binarySize")</th>
+                                            <th style="width: 110px;">@Ui.T("admin.binaryStatus")</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        @foreach (BinaryInspectionItem bin in item.Binaries)
+                                        {
+                                            <tr>
+                                                <td class="hypera-mono">@bin.RelativePath</td>
+                                                <td class="hypera-hash">@bin.Sha256Hex</td>
+                                                <td>@FormatHelpers.FormatBytes(bin.ByteSize)</td>
+                                                <td>
+                                                    <MudChip T="string"
+                                                             Size="Size.Small"
+                                                             Variant="@(bin.EffectiveStatus == BinaryReputationStatus.Trusted ? Variant.Outlined : Variant.Filled)"
+                                                             Color="@FormatHelpers.GetReputationColor(bin.EffectiveStatus)">
+                                                        @FormatHelpers.GetReputationText(bin.EffectiveStatus, Ui)
+                                                    </MudChip>
+                                                </td>
+                                            </tr>
+                                        }
+                                    </tbody>
+                                </MudSimpleTable>
+                            }
+
+                            <div class="d-flex flex-wrap align-center justify-end gap-2 mt-2">
+                                <MudButton Variant="Variant.Outlined"
+                                           Color="Color.Error"
+                                           Size="Size.Small"
+                                           StartIcon="@Icons.Material.Filled.Close"
+                                           Disabled="@_busy"
+                                           OnClick="@(() => RejectAsync(item))">
+                                    @Ui.T("review.reject")
+                                </MudButton>
+                                <MudButton Variant="Variant.Filled"
+                                           Color="Color.Success"
+                                           Size="Size.Small"
+                                           StartIcon="@Icons.Material.Filled.Check"
+                                           Disabled="@_busy"
+                                           OnClick="@(() => ApproveAsync(sub))">
+                                    @Ui.T("review.approve")
+                                </MudButton>
+                            </div>
+                        </MudPaper>
+                    }
+                </MudStack>
+            }
+        </MudTabPanel>
+
+        @* 2. Binary Hash Reputation Tab *@
+        <MudTabPanel Text="@Ui.T("admin.tabBinaries")">
+            <div class="d-flex flex-wrap align-center justify-space-between gap-2 mb-3">
+                <div class="d-flex align-center gap-2">
+                    <MudSelect T="BinaryReputationStatus?"
+                               Value="_reputationFilter"
+                               ValueChanged="@OnReputationFilterChangedAsync"
+                               Variant="Variant.Outlined"
+                               Margin="Margin.Dense"
+                               Style="min-width: 160px;">
+                        <MudSelectItem Value="@((BinaryReputationStatus?)null)">@Ui.T("admin.filterAll")</MudSelectItem>
+                        <MudSelectItem Value="@((BinaryReputationStatus?)BinaryReputationStatus.Trusted)">@Ui.T("admin.binaryTrusted")</MudSelectItem>
+                        <MudSelectItem Value="@((BinaryReputationStatus?)BinaryReputationStatus.HighRisk)">@Ui.T("admin.binaryHighRisk")</MudSelectItem>
+                    </MudSelect>
+                </div>
+
+                <MudButton Variant="Variant.Filled"
+                           Color="Color.Primary"
+                           Size="Size.Small"
+                           StartIcon="@Icons.Material.Filled.Add"
+                           OnClick="@OpenAddReputationDialogAsync">
+                    @Ui.T("admin.addReputation")
+                </MudButton>
+            </div>
+
+            <MudSimpleTable Dense="true" Hover="true" Outlined="true">
+                <thead>
+                    <tr>
+                        <th>@Ui.T("admin.sampleFile")</th>
+                        <th>@Ui.T("admin.binaryHash")</th>
+                        <th style="width: 90px;">@Ui.T("admin.binarySize")</th>
+                        <th style="width: 110px;">@Ui.T("admin.binaryStatus")</th>
+                        <th>@Ui.T("admin.reasonNote")</th>
+                        <th style="width: 110px;"></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (BinaryHashReputation rep in _reputations)
+                    {
+                        <tr>
+                            <td class="hypera-mono">@rep.SampleFileName</td>
+                            <td class="hypera-hash">@rep.Sha256Hex</td>
+                            <td>@FormatHelpers.FormatBytes(rep.ByteSize)</td>
+                            <td>
+                                <MudChip T="string"
+                                         Size="Size.Small"
+                                         Variant="Variant.Filled"
+                                         Color="@FormatHelpers.GetReputationColor(rep.ReputationStatus)">
+                                    @FormatHelpers.GetReputationText(rep.ReputationStatus, Ui)
+                                </MudChip>
+                            </td>
+                            <td>@rep.ReasonNote</td>
+                            <td>
+                                <div class="d-flex justify-end gap-1">
+                                    <MudIconButton Icon="@Icons.Material.Filled.SwapHoriz"
+                                                   Size="Size.Small"
+                                                   Color="Color.Primary"
+                                                   Disabled="@_busy"
+                                                   OnClick="@(() => ToggleReputationStatusAsync(rep))" />
+                                    <MudIconButton Icon="@Icons.Material.Filled.Delete"
+                                                   Size="Size.Small"
+                                                   Color="Color.Error"
+                                                   Disabled="@_busy"
+                                                   OnClick="@(() => DeleteReputationAsync(rep))" />
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </MudSimpleTable>
+        </MudTabPanel>
+
+        @* 3. Users & System Settings Tab *@
+        <MudTabPanel Text="@Ui.T("admin.tabUsersSettings")">
+            <MudStack Spacing="4">
+                <MudPaper Outlined="true" Class="pa-4">
+                    <MudGrid Spacing="3">
+                        <MudItem xs="12">
+                            <MudSwitch @bind-Value="_allowOpenRegistration"
+                                       Color="Color.Primary"
+                                       Label="@Ui.T("admin.openRegistration")" />
+                        </MudItem>
+                        <MudItem xs="12" sm="6" md="3">
+                            <MudNumericField T="long"
+                                             @bind-Value="_maxUploadMiB"
+                                             Label="@Ui.T("admin.maxUploadMb")"
+                                             Variant="Variant.Outlined"
+                                             Margin="Margin.Dense"
+                                             Min="1" />
+                        </MudItem>
+                        <MudItem xs="12" sm="6" md="3">
+                            <MudNumericField T="long"
+                                             @bind-Value="_maxSaveQuotaMiB"
+                                             Label="@Ui.T("admin.maxSaveQuotaMb")"
+                                             Variant="Variant.Outlined"
+                                             Margin="Margin.Dense"
+                                             Min="1" />
+                        </MudItem>
+                        <MudItem xs="12" sm="6" md="3">
+                            <MudNumericField T="int"
+                                             @bind-Value="_maxStepsPerTurn"
+                                             Label="@Ui.T("admin.maxStepsPerTurn")"
+                                             Variant="Variant.Outlined"
+                                             Margin="Margin.Dense"
+                                             Min="1000" />
+                        </MudItem>
+                        <MudItem xs="12" sm="6" md="3">
+                            <MudNumericField T="int"
+                                             @bind-Value="_idleTimeoutMinutes"
+                                             Label="@Ui.T("admin.idleTimeoutMin")"
+                                             Variant="Variant.Outlined"
+                                             Margin="Margin.Dense"
+                                             Min="1" />
+                        </MudItem>
+                        <MudItem xs="12" Class="d-flex justify-end">
+                            <MudButton Variant="Variant.Filled"
+                                       Color="Color.Primary"
+                                       StartIcon="@Icons.Material.Filled.Save"
+                                       Disabled="@_busy"
+                                       OnClick="@SaveSystemSettingsAsync">
+                                @Ui.T("admin.saveSettings")
+                            </MudButton>
+                        </MudItem>
+                    </MudGrid>
+                </MudPaper>
+
+                <MudSimpleTable Dense="true" Hover="true" Outlined="true">
+                    <thead>
+                        <tr>
+                            <th>@Ui.T("auth.username")</th>
+                            <th style="width: 100px;">@Ui.T("admin.role")</th>
+                            <th style="width: 100px;">@Ui.T("version.status")</th>
+                            <th style="width: 150px;">@Ui.T("saves.timestamp")</th>
+                            <th style="width: 220px;"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (AppUser user in _users)
+                        {
+                            bool isSelf = user.Id == Ui.CurrentUser!.Id;
+                            <tr>
+                                <td>@user.Username</td>
+                                <td>
+                                    <MudChip T="string"
+                                             Size="Size.Small"
+                                             Color="@(user.Role == UserRole.Admin ? Color.Primary : Color.Default)"
+                                             Variant="Variant.Outlined">
+                                        @(user.Role == UserRole.Admin ? Ui.T("admin.roleAdmin") : Ui.T("admin.roleUser"))
+                                    </MudChip>
+                                </td>
+                                <td>
+                                    <MudChip T="string"
+                                             Size="Size.Small"
+                                             Color="@(user.IsDisabled ? Color.Error : Color.Success)"
+                                             Variant="Variant.Text">
+                                        @(user.IsDisabled ? Ui.T("admin.disabled") : Ui.T("admin.active"))
+                                    </MudChip>
+                                </td>
+                                <td>@FormatHelpers.FormatUtc(user.CreatedAtUtc)</td>
+                                <td>
+                                    <div class="d-flex justify-end gap-1">
+                                        <MudButton Variant="Variant.Text"
+                                                   Size="Size.Small"
+                                                   Disabled="@(_busy || isSelf)"
+                                                   OnClick="@(() => ToggleUserRoleAsync(user))">
+                                            @(user.Role == UserRole.Admin ? Ui.T("admin.demote") : Ui.T("admin.promote"))
+                                        </MudButton>
+                                        <MudButton Variant="Variant.Text"
+                                                   Size="Size.Small"
+                                                   Color="@(user.IsDisabled ? Color.Success : Color.Error)"
+                                                   Disabled="@(_busy || isSelf)"
+                                                   OnClick="@(() => ToggleUserDisabledAsync(user))">
+                                            @(user.IsDisabled ? Ui.T("admin.enable") : Ui.T("admin.disable"))
+                                        </MudButton>
+                                    </div>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </MudSimpleTable>
+            </MudStack>
+        </MudTabPanel>
+
+        @* 4. Apps Moderation Tab *@
+        <MudTabPanel Text="@Ui.T("admin.tabApps")">
+            <MudSimpleTable Dense="true" Hover="true" Outlined="true">
+                <thead>
+                    <tr>
+                        <th>@Ui.T("catalog.appTitle")</th>
+                        <th style="width: 110px;">@Ui.T("version.status")</th>
+                        <th style="width: 110px;">@Ui.T("version.title")</th>
+                        <th style="width: 220px;"></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (GameApp app in _allApps)
+                    {
+                        <tr>
+                            <td>
+                                <MudLink Href="@($"/apps/{app.Id}")">@app.Title</MudLink>
+                            </td>
+                            <td>
+                                @if (app.IsUnlistedOrDeleted)
+                                {
+                                    <MudChip T="string" Size="Size.Small" Color="Color.Error" Variant="Variant.Outlined">
+                                        @Ui.T("catalog.unlisted")
+                                    </MudChip>
+                                }
+                                else if (app.IsPublicPool)
+                                {
+                                    <MudChip T="string" Size="Size.Small" Color="Color.Success" Variant="Variant.Text">
+                                        @Ui.T("admin.publicPool")
+                                    </MudChip>
+                                }
+                                else
+                                {
+                                    <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Text">
+                                        @Ui.T("admin.privatePool")
+                                    </MudChip>
+                                }
+                            </td>
+                            <td>@Ui.T("catalog.versionCount", app.Versions.Count.ToString())</td>
+                            <td>
+                                <div class="d-flex justify-end gap-1">
+                                    <MudButton Variant="Variant.Text"
+                                               Size="Size.Small"
+                                               Disabled="@(_busy || app.Versions.Count < 2)"
+                                               OnClick="@(() => OpenReorderVersionsDialogAsync(app))">
+                                        @Ui.T("admin.reorderVersions")
+                                    </MudButton>
+                                    <MudButton Variant="Variant.Text"
+                                               Size="Size.Small"
+                                               Color="@(app.IsUnlistedOrDeleted ? Color.Success : Color.Error)"
+                                               Disabled="@_busy"
+                                               OnClick="@(() => ToggleAppUnlistedAsync(app))">
+                                        @(app.IsUnlistedOrDeleted ? Ui.T("admin.restore") : Ui.T("admin.unlist"))
+                                    </MudButton>
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </MudSimpleTable>
+        </MudTabPanel>
+    </MudTabs>
+}
+
+@code {
+    private List<PendingReviewItem> _pendingItems = [];
+    private List<BinaryHashReputation> _reputations = [];
+    private List<AppUser> _users = [];
+    private List<GameApp> _allApps = [];
+    private BinaryReputationStatus? _reputationFilter;
+
+    private bool _allowOpenRegistration = true;
+    private long _maxUploadMiB = 512;
+    private long _maxSaveQuotaMiB = 64;
+    private int _maxStepsPerTurn = PlatformSettings.DefaultMaxStepInstructionsPerTurn;
+    private int _idleTimeoutMinutes = PlatformSettings.DefaultSessionIdleTimeoutMinutes;
+
+    private bool _loadingReview = true;
+    private bool _busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Ui.Changed += OnUiChanged;
+        await Ui.InitializeAsync();
+        if (!Ui.ShowAdminNav)
+        {
+            return;
+        }
+
+        await Task.WhenAll(
+            LoadPendingReviewsAsync(),
+            LoadReputationsAsync(),
+            LoadUsersAndSettingsAsync(),
+            LoadAppsAsync());
+    }
+
+    private async Task LoadPendingReviewsAsync()
+    {
+        _loadingReview = true;
+        try
+        {
+            IReadOnlyList<GameLanguageSubmission> pending = await PipelineService.ListPendingReviewsAsync();
+            var list = new List<PendingReviewItem>(pending.Count);
+            foreach (GameLanguageSubmission sub in pending)
+            {
+                IReadOnlyList<BinaryInspectionItem> bins = await ReputationService.EvaluateSubmissionBinariesAsync(sub.Id);
+                list.Add(new PendingReviewItem(sub, bins));
+            }
+
+            _pendingItems = list;
+        }
+        finally
+        {
+            _loadingReview = false;
+        }
+    }
+
+    private async Task LoadReputationsAsync()
+    {
+        IReadOnlyList<BinaryHashReputation> list = await ReputationService.ListReputationsAsync(_reputationFilter);
+        _reputations = list.ToList();
+    }
+
+    private async Task LoadUsersAndSettingsAsync()
+    {
+        PlatformSettings settings = await AuthService.GetSettingsAsync();
+        _allowOpenRegistration = settings.AllowOpenRegistration;
+        _maxUploadMiB = Math.Max(1, settings.MaxUploadBytes / (1024L * 1024L));
+        _maxSaveQuotaMiB = Math.Max(1, settings.MaxSaveQuotaBytesPerApp / (1024L * 1024L));
+        _maxStepsPerTurn = settings.MaxStepInstructionsPerTurn;
+        _idleTimeoutMinutes = settings.SessionIdleTimeoutMinutes;
+
+        IReadOnlyList<AppUser> users = await AuthService.ListUsersAsync();
+        _users = users.OrderBy(static u => u.CreatedAtUtc).ToList();
+    }
+
+    private async Task LoadAppsAsync()
+    {
+        IReadOnlyList<GameApp> apps = await CatalogService.ListVisibleAppsAsync(Ui.CurrentUser!.Id, includeUnlisted: true);
+        _allApps = apps.OrderByDescending(static a => a.UpdatedAtUtc).ToList();
+    }
+
+    private async Task ApproveAsync(GameLanguageSubmission sub)
+    {
+        _busy = true;
+        try
+        {
+            await PipelineService.ApproveSubmissionAsync(Ui.CurrentUser!.Id, sub.Id, markBinariesTrusted: true);
+            Snackbar.Add(Ui.T("admin.approved"), Severity.Success);
+            await LoadPendingReviewsAsync();
+            await LoadReputationsAsync();
+            await LoadAppsAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task RejectAsync(PendingReviewItem item)
+    {
+        var parameters = new DialogParameters<RejectSubmissionDialog>
+        {
+            { x => x.Binaries, item.Binaries },
+        };
+
+        IDialogReference dialog = await DialogService.ShowAsync<RejectSubmissionDialog>(Ui.T("review.reject"), parameters);
+        DialogResult? result = await dialog.Result;
+        if (result is not { Canceled: false, Data: RejectSubmissionDialog.RejectSubmissionDialogResult payload })
+        {
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            await PipelineService.RejectSubmissionAsync(
+                Ui.CurrentUser!.Id,
+                item.Submission.Id,
+                payload.Reason,
+                payload.HighRiskEntryIds);
+
+            Snackbar.Add(Ui.T("admin.rejected"), Severity.Info);
+            await LoadPendingReviewsAsync();
+            await LoadReputationsAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task DownloadSubmissionSourceAsync(GameLanguageSubmission sub)
+    {
+        try
+        {
+            await using Stream stream = await PipelineService.OpenSourceZipStreamAsync(Ui.CurrentUser!.Id, sub.Id);
+            using var streamRef = new DotNetStreamReference(stream, leaveOpen: false);
+            await Js.InvokeVoidAsync("hyperaPlayer.downloadFromStream", $"submission_{sub.Id:N}.zip", "application/zip", streamRef);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+    }
+
+    private async Task OnReputationFilterChangedAsync(BinaryReputationStatus? filter)
+    {
+        _reputationFilter = filter;
+        await LoadReputationsAsync();
+    }
+
+    private async Task OpenAddReputationDialogAsync()
+    {
+        var parameters = new DialogParameters<AddReputationDialog>
+        {
+            { x => x.AdminUserId, Ui.CurrentUser!.Id },
+        };
+
+        IDialogReference dialog = await DialogService.ShowAsync<AddReputationDialog>(Ui.T("admin.addReputation"), parameters);
+        DialogResult? result = await dialog.Result;
+        if (result is { Canceled: false })
+        {
+            await LoadReputationsAsync();
+            await LoadPendingReviewsAsync();
+        }
+    }
+
+    private async Task ToggleReputationStatusAsync(BinaryHashReputation rep)
+    {
+        _busy = true;
+        try
+        {
+            BinaryReputationStatus next = rep.ReputationStatus == BinaryReputationStatus.HighRisk
+                ? BinaryReputationStatus.Trusted
+                : BinaryReputationStatus.HighRisk;
+
+            await ReputationService.SetReputationAsync(
+                Ui.CurrentUser!.Id,
+                rep.Sha256Hex,
+                rep.ByteSize,
+                next,
+                rep.SampleFileName,
+                rep.ReasonNote);
+
+            await LoadReputationsAsync();
+            await LoadPendingReviewsAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task DeleteReputationAsync(BinaryHashReputation rep)
+    {
+        _busy = true;
+        try
+        {
+            await ReputationService.RemoveReputationAsync(Ui.CurrentUser!.Id, rep.Sha256Hex, rep.ByteSize);
+            await LoadReputationsAsync();
+            await LoadPendingReviewsAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task SaveSystemSettingsAsync()
+    {
+        _busy = true;
+        try
+        {
+            var updated = new PlatformSettings
+            {
+                Id = PlatformSettings.SingletonId,
+                AllowOpenRegistration = _allowOpenRegistration,
+                MaxUploadBytes = Math.Max(1L, _maxUploadMiB) * 1024L * 1024L,
+                MaxSaveQuotaBytesPerApp = Math.Max(1L, _maxSaveQuotaMiB) * 1024L * 1024L,
+                MaxStepInstructionsPerTurn = Math.Max(1000, _maxStepsPerTurn),
+                SessionIdleTimeoutMinutes = Math.Max(1, _idleTimeoutMinutes),
+            };
+
+            await AuthService.UpdateSettingsAsync(Ui.CurrentUser!.Id, updated);
+            Snackbar.Add(Ui.T("settings.saved"), Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task ToggleUserRoleAsync(AppUser user)
+    {
+        _busy = true;
+        try
+        {
+            UserRole next = user.Role == UserRole.Admin ? UserRole.User : UserRole.Admin;
+            await AuthService.SetUserRoleAsync(Ui.CurrentUser!.Id, user.Id, next);
+            await LoadUsersAndSettingsAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task ToggleUserDisabledAsync(AppUser user)
+    {
+        _busy = true;
+        try
+        {
+            await AuthService.SetUserDisabledAsync(Ui.CurrentUser!.Id, user.Id, !user.IsDisabled);
+            await LoadUsersAndSettingsAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task OpenReorderVersionsDialogAsync(GameApp app)
+    {
+        GameApp? detail = await CatalogService.GetAppDetailAsync(app.Id, Ui.CurrentUser!.Id);
+        if (detail is null)
+        {
+            return;
+        }
+
+        var parameters = new DialogParameters<ReorderVersionsDialog>
+        {
+            { x => x.AppId, detail.Id },
+            { x => x.AdminUserId, Ui.CurrentUser!.Id },
+            { x => x.Versions, detail.Versions.ToList() },
+        };
+
+        IDialogReference dialog = await DialogService.ShowAsync<ReorderVersionsDialog>(Ui.T("admin.reorderVersions"), parameters);
+        DialogResult? result = await dialog.Result;
+        if (result is { Canceled: false })
+        {
+            await LoadAppsAsync();
+        }
+    }
+
+    private async Task ToggleAppUnlistedAsync(GameApp app)
+    {
+        _busy = true;
+        try
+        {
+            await CatalogService.UpdateAppMetadataAsync(
+                Ui.CurrentUser!.Id,
+                app.Id,
+                app.Title,
+                app.Summary,
+                isUnlistedOrDeleted: !app.IsUnlistedOrDeleted);
+
+            await LoadAppsAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void OnUiChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Ui.Changed -= OnUiChanged;
+
+    private sealed record PendingReviewItem(
+        GameLanguageSubmission Submission,
+        IReadOnlyList<BinaryInspectionItem> Binaries);
+}

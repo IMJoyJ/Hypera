@@ -112,7 +112,7 @@ public sealed class ExpressionParser
             {
                 if (closingDelimiter is not null)
                 {
-                    diagnostics.ReportError("ERA1403", $"Missing closing '{closingDelimiter}' in argument list.", stream.Current.Span, filePath);
+                    diagnostics.ReportError("ERA1403", $"Missing closing '{closingDelimiter}' in argument list.", stream.Current.Span, filePath, null, [closingDelimiter.Value.ToString()]);
                 }
                 else
                 {
@@ -154,7 +154,7 @@ public sealed class ExpressionParser
             {
                 if (!stream.Match(closeKind))
                 {
-                    diagnostics.ReportError("ERA1404", $"Expected ',' or '{closeKind}' in argument list.", stream.Current.Span, filePath);
+                    diagnostics.ReportError("ERA1404", $"Expected ',' or '{closeKind}' in argument list.", stream.Current.Span, filePath, null, [closeKind.ToString()]);
                 }
 
                 break;
@@ -162,7 +162,8 @@ public sealed class ExpressionParser
 
             if (!stream.IsAtEnd)
             {
-                diagnostics.ReportError("ERA1405", $"Unexpected token '{stream.Current.Text ?? stream.Current.Kind.ToString()}' after argument.", stream.Current.Span, filePath);
+                string tokText = stream.Current.Text ?? stream.Current.Kind.ToString();
+                diagnostics.ReportError("ERA1405", $"Unexpected token '{tokText}' after argument.", stream.Current.Span, filePath, null, [tokText]);
                 break;
             }
 
@@ -264,7 +265,7 @@ public sealed class ExpressionParser
 
         if (requireWritable && (varExpr.Variable.IsConst || varExpr.Variable.IsReadOnly))
         {
-            diagnostics.ReportError("ERA1411", $"Variable '{varExpr.Variable.Name}' is read-only/constant and cannot be modified.", varExpr.Span, filePath);
+            diagnostics.ReportError("ERA1411", $"Variable '{varExpr.Variable.Name}' is read-only/constant and cannot be modified.", varExpr.Span, filePath, null, [varExpr.Variable.Name]);
             return null;
         }
 
@@ -303,7 +304,9 @@ public sealed class ExpressionParser
                     "ERA1414",
                     $"Ternary branches have mismatched types ({trueBranch.ValueKind} vs {falseBranch.ValueKind}).",
                     falseBranch.Span,
-                    ctx.FilePath);
+                    ctx.FilePath,
+                    null,
+                    [trueBranch.ValueKind.ToString(), falseBranch.ValueKind.ToString()]);
             }
 
             if (cond is IntLiteralExpr constCond)
@@ -459,7 +462,7 @@ public sealed class ExpressionParser
 
             if (operand.ValueKind != VariableValueKind.Int)
             {
-                ctx.Diagnostics.ReportError("ERA1415", $"Unary operator '{op}' requires an integer operand.", opTok.Span, ctx.FilePath);
+                ctx.Diagnostics.ReportError("ERA1415", $"Unary operator '{op}' requires an integer operand.", opTok.Span, ctx.FilePath, null, [op.ToString()]);
                 return new IntLiteralExpr(0, opTok.Span);
             }
 
@@ -492,7 +495,7 @@ public sealed class ExpressionParser
             ExprNode prim = ParsePrimary(ref ctx);
             if (prim.ValueKind != VariableValueKind.Int)
             {
-                ctx.Diagnostics.ReportError("ERA1415", $"Unary '{opTok.Operator}' requires an integer.", opTok.Span, ctx.FilePath);
+                ctx.Diagnostics.ReportError("ERA1415", $"Unary '{opTok.Operator}' requires an integer.", opTok.Span, ctx.FilePath, null, [opTok.Operator.ToString()]);
                 return new IntLiteralExpr(0, opTok.Span);
             }
 
@@ -586,11 +589,14 @@ public sealed class ExpressionParser
                 return ParseIdentifierPrimary(ref ctx);
 
             default:
+                string curTokText = cur.Text ?? cur.Kind.ToString();
                 ctx.Diagnostics.ReportError(
                     "ERA1419",
-                    $"Expected an expression, but found '{cur.Text ?? cur.Kind.ToString()}'.",
+                    $"Expected an expression, but found '{curTokText}'.",
                     cur.Span,
-                    ctx.FilePath);
+                    ctx.FilePath,
+                    null,
+                    [curTokText]);
                 if (!ctx.Stream.IsAtEnd && !ShouldStop(ref ctx))
                 {
                     ctx.Stream.Advance();
@@ -657,7 +663,7 @@ public sealed class ExpressionParser
         {
             if (ctx.Stream.Current.Kind != ErbTokenKind.Identifier || string.IsNullOrEmpty(ctx.Stream.Current.Text))
             {
-                ctx.Diagnostics.ReportError("ERA1424", $"Expected function name after '{name}@'.", ctx.Stream.Current.Span, ctx.FilePath);
+                ctx.Diagnostics.ReportError("ERA1424", $"Expected function name after '{name}@'.", ctx.Stream.Current.Span, ctx.FilePath, null, [name]);
                 return new IntLiteralExpr(0, idTok.Span);
             }
 
@@ -678,7 +684,9 @@ public sealed class ExpressionParser
                 "ERA1425",
                 $"Cannot resolve scoped variable '{name}@{explicitSubFunc}' (target function or static variable not found).",
                 MergeSpan(idTok.Span, endSpan),
-                ctx.FilePath);
+                ctx.FilePath,
+                null,
+                [name, explicitSubFunc]);
             return new IntLiteralExpr(0, idTok.Span);
         }
 
@@ -691,7 +699,7 @@ public sealed class ExpressionParser
             }
         }
 
-        ctx.Diagnostics.ReportError("ERA1426", $"Unknown variable or identifier '{name}'.", idTok.Span, ctx.FilePath);
+        ctx.Diagnostics.ReportError("ERA1426", $"Unknown variable or identifier '{name}'.", idTok.Span, ctx.FilePath, null, [name]);
         return new IntLiteralExpr(0, idTok.Span);
     }
 
@@ -715,7 +723,9 @@ public sealed class ExpressionParser
                         "ERA1427",
                         $"Too many subscripts on variable '{variable.Name}' (maximum 3).",
                         ctx.Stream.Current.Span,
-                        ctx.FilePath);
+                        ctx.FilePath,
+                        null,
+                        [variable.Name]);
                     break;
                 }
 
@@ -747,7 +757,7 @@ public sealed class ExpressionParser
 
                 if (rawSubs.Count != 3)
                 {
-                    ctx.Diagnostics.ReportError("ERA1428", $"2D character variable '{variable.Name}' requires all 3 subscripts (chara:dim1:dim2).", fullSpan, ctx.FilePath);
+                    ctx.Diagnostics.ReportError("ERA1428", $"2D character variable '{variable.Name}' requires all 3 subscripts (chara:dim1:dim2).", fullSpan, ctx.FilePath, null, [variable.Name], "diag.ERA1428.2d");
                     while (rawSubs.Count < 3) rawSubs.Add(new IntLiteralExpr(0, fullSpan));
                 }
 
@@ -760,7 +770,7 @@ public sealed class ExpressionParser
             {
                 if (rawSubs.Count > 2)
                 {
-                    ctx.Diagnostics.ReportError("ERA1428", $"1D character variable '{variable.Name}' accepts at most 2 subscripts (chara:index).", fullSpan, ctx.FilePath);
+                    ctx.Diagnostics.ReportError("ERA1428", $"1D character variable '{variable.Name}' accepts at most 2 subscripts (chara:index).", fullSpan, ctx.FilePath, null, [variable.Name], "diag.ERA1428.1d");
                 }
 
                 if (hasNoExplicitSubs && _symbols.Options.SystemNoTarget)
@@ -772,7 +782,7 @@ public sealed class ExpressionParser
                 {
                     if (_symbols.Options.SystemNoTarget)
                     {
-                        ctx.Diagnostics.ReportError("ERA1429", $"Character variable '{variable.Name}' requires an explicit character index when SystemNoTarget is enabled.", fullSpan, ctx.FilePath);
+                        ctx.Diagnostics.ReportError("ERA1429", $"Character variable '{variable.Name}' requires an explicit character index when SystemNoTarget is enabled.", fullSpan, ctx.FilePath, null, [variable.Name]);
                     }
 
                     ExprNode targetZero = BuildImplicitTargetExpr(fullSpan);
@@ -792,7 +802,7 @@ public sealed class ExpressionParser
             {
                 if (rawSubs.Count > 1)
                 {
-                    ctx.Diagnostics.ReportError("ERA1428", $"Character variable '{variable.Name}' accepts at most 1 subscript (charaIndex).", fullSpan, ctx.FilePath);
+                    ctx.Diagnostics.ReportError("ERA1428", $"Character variable '{variable.Name}' accepts at most 1 subscript (charaIndex).", fullSpan, ctx.FilePath, null, [variable.Name], "diag.ERA1428.0d");
                 }
 
                 if (hasNoExplicitSubs && _symbols.Options.SystemNoTarget)
@@ -815,7 +825,7 @@ public sealed class ExpressionParser
 
             if (rawSubs.Count != 3)
             {
-                ctx.Diagnostics.ReportError("ERA1430", $"3D array variable '{variable.Name}' requires 3 subscripts.", fullSpan, ctx.FilePath);
+                ctx.Diagnostics.ReportError("ERA1430", $"3D array variable '{variable.Name}' requires 3 subscripts.", fullSpan, ctx.FilePath, null, [variable.Name], "diag.ERA1430.3d");
                 while (rawSubs.Count < 3) rawSubs.Add(new IntLiteralExpr(0, fullSpan));
             }
 
@@ -830,7 +840,7 @@ public sealed class ExpressionParser
 
             if (rawSubs.Count != 2)
             {
-                ctx.Diagnostics.ReportError("ERA1430", $"2D array variable '{variable.Name}' requires 2 subscripts.", fullSpan, ctx.FilePath);
+                ctx.Diagnostics.ReportError("ERA1430", $"2D array variable '{variable.Name}' requires 2 subscripts.", fullSpan, ctx.FilePath, null, [variable.Name], "diag.ERA1430.2d");
                 while (rawSubs.Count < 2) rawSubs.Add(new IntLiteralExpr(0, fullSpan));
             }
 
@@ -840,7 +850,7 @@ public sealed class ExpressionParser
         {
             if (rawSubs.Count > 1)
             {
-                ctx.Diagnostics.ReportError("ERA1430", $"1D variable '{variable.Name}' accepts at most 1 subscript.", fullSpan, ctx.FilePath);
+                ctx.Diagnostics.ReportError("ERA1430", $"1D variable '{variable.Name}' accepts at most 1 subscript.", fullSpan, ctx.FilePath, null, [variable.Name], "diag.ERA1430.1d");
             }
 
             bool isRand = variable.IsCalc && variable.Name.Equals("RAND", StringComparison.OrdinalIgnoreCase);
@@ -868,7 +878,7 @@ public sealed class ExpressionParser
         {
             if (rawSubs.Count > 0)
             {
-                ctx.Diagnostics.ReportError("ERA1433", $"0D variable '{variable.Name}' does not accept subscripts.", fullSpan, ctx.FilePath);
+                ctx.Diagnostics.ReportError("ERA1433", $"0D variable '{variable.Name}' does not accept subscripts.", fullSpan, ctx.FilePath, null, [variable.Name]);
             }
         }
 
@@ -940,7 +950,9 @@ public sealed class ExpressionParser
                 "ERA1434",
                 $"Keyword '{constKey.Value}' is not defined for variable '{variable.Name}' dimension {dimIndex}.",
                 sub.Span,
-                ctx.FilePath);
+                ctx.FilePath,
+                null,
+                [constKey.Value, variable.Name, dimIndex.ToString()]);
             return new IntLiteralExpr(0, sub.Span);
         }
 
@@ -977,14 +989,16 @@ public sealed class ExpressionParser
                     "ERA1435",
                     $"Function '@{userFn.Name}' is not declared with #FUNCTION or #FUNCTIONS and cannot be called inside an expression.",
                     callSpan,
-                    ctx.FilePath);
+                    ctx.FilePath,
+                    null,
+                    [userFn.Name]);
                 return new IntLiteralExpr(0, callSpan);
             }
 
             return BindUserMethodCall(userFn, rawArgs, callSpan, ref ctx);
         }
 
-        ctx.Diagnostics.ReportError("ERA1436", $"Unknown expression function or method '{name}'.", callSpan, ctx.FilePath);
+        ctx.Diagnostics.ReportError("ERA1436", $"Unknown expression function or method '{name}'.", callSpan, ctx.FilePath, null, [name]);
         return new IntLiteralExpr(0, callSpan);
     }
 
@@ -1026,7 +1040,9 @@ public sealed class ExpressionParser
                 "ERA1437",
                 $"Too many arguments in call to '@{targetFn.Name}': expected at most {targetFn.Parameters.Count}, got {effectiveCount}.",
                 callSpan,
-                filePath);
+                filePath,
+                null,
+                [targetFn.Name, targetFn.Parameters.Count.ToString(), effectiveCount.ToString()]);
             effectiveCount = targetFn.Parameters.Count;
         }
 
@@ -1041,13 +1057,13 @@ public sealed class ExpressionParser
             {
                 if (arg is null)
                 {
-                    diagnostics.ReportError("ERA1438", $"By-reference parameter {i + 1} of '@{targetFn.Name}' cannot be omitted.", callSpan, filePath);
+                    diagnostics.ReportError("ERA1438", $"By-reference parameter {i + 1} of '@{targetFn.Name}' cannot be omitted.", callSpan, filePath, null, [targetFn.Name, (i + 1).ToString()]);
                     continue;
                 }
 
                 if (arg is not VariableAccessExpr refArg || refArg.Variable.ArrayRank == 0)
                 {
-                    diagnostics.ReportError("ERA1439", $"By-reference parameter {i + 1} of '@{targetFn.Name}' requires an array variable.", arg.Span, filePath);
+                    diagnostics.ReportError("ERA1439", $"By-reference parameter {i + 1} of '@{targetFn.Name}' requires an array variable.", arg.Span, filePath, null, [targetFn.Name, (i + 1).ToString()]);
                     continue;
                 }
 
@@ -1057,7 +1073,9 @@ public sealed class ExpressionParser
                         "ERA1440",
                         $"By-reference argument {i + 1} type/dimension ({refArg.Variable.ValueKind} {refArg.Variable.ArrayRank}D) does not match parameter '{destVar.Name}' ({destVar.ValueKind} {destVar.ArrayRank}D).",
                         arg.Span,
-                        filePath);
+                        filePath,
+                        null,
+                        [(i + 1).ToString(), refArg.Variable.ValueKind.ToString(), refArg.Variable.ArrayRank.ToString(), destVar.Name, destVar.ValueKind.ToString(), destVar.ArrayRank.ToString()]);
                     continue;
                 }
 
@@ -1078,7 +1096,9 @@ public sealed class ExpressionParser
                         "ERA1441",
                         $"Argument {i + 1} of '@{targetFn.Name}' cannot be omitted unless a default value is declared or CompatiFuncArgOptional is enabled.",
                         callSpan,
-                        filePath);
+                        filePath,
+                        null,
+                        [targetFn.Name, (i + 1).ToString()]);
                     continue;
                 }
 
@@ -1092,7 +1112,7 @@ public sealed class ExpressionParser
 
             if (arg is VariableAccessExpr { IsBareArrayReference: true } bare && bare.Variable.ArrayRank >= 2)
             {
-                diagnostics.ReportError("ERA1442", $"Multi-dimensional variable '{bare.Variable.Name}' requires subscripts when passed by value.", bare.Span, filePath);
+                diagnostics.ReportError("ERA1442", $"Multi-dimensional variable '{bare.Variable.Name}' requires subscripts when passed by value.", bare.Span, filePath, null, [bare.Variable.Name]);
                 continue;
             }
 
@@ -1111,7 +1131,9 @@ public sealed class ExpressionParser
                     "ERA1443",
                     $"Argument {i + 1} of '@{targetFn.Name}' expects {destVar.ValueKind}, but got {arg.ValueKind}.",
                     arg.Span,
-                    filePath);
+                    filePath,
+                    null,
+                    [targetFn.Name, (i + 1).ToString(), destVar.ValueKind.ToString(), arg.ValueKind.ToString()]);
                 continue;
             }
 
@@ -1165,11 +1187,14 @@ public sealed class ExpressionParser
             lastMismatchReason = mismatch;
         }
 
+        string reason = lastMismatchReason ?? "no matching overload";
         ctx.Diagnostics.ReportError(
             "ERA1444",
-            $"Invalid arguments to built-in method '{spec.Name}': {lastMismatchReason ?? "no matching overload"}.",
+            $"Invalid arguments to built-in method '{spec.Name}': {reason}.",
             callSpan,
-            ctx.FilePath);
+            ctx.FilePath,
+            null,
+            [spec.Name, reason]);
         return spec.ReturnKind == VariableValueKind.Str
             ? new StrLiteralExpr(string.Empty, callSpan)
             : new IntLiteralExpr(0, callSpan);
@@ -1386,19 +1411,19 @@ public sealed class ExpressionParser
     {
         if (operand is not VariableAccessExpr varExpr)
         {
-            ctx.Diagnostics.ReportError("ERA1445", $"Operator '{op}' can only be applied to a variable.", span, ctx.FilePath);
+            ctx.Diagnostics.ReportError("ERA1445", $"Operator '{op}' can only be applied to a variable.", span, ctx.FilePath, null, [op.ToString()]);
             return new IntLiteralExpr(0, span);
         }
 
         if (varExpr.ValueKind != VariableValueKind.Int)
         {
-            ctx.Diagnostics.ReportError("ERA1446", $"Operator '{op}' cannot be applied to string variable '{varExpr.Variable.Name}'.", span, ctx.FilePath);
+            ctx.Diagnostics.ReportError("ERA1446", $"Operator '{op}' cannot be applied to string variable '{varExpr.Variable.Name}'.", span, ctx.FilePath, null, [op.ToString(), varExpr.Variable.Name]);
             return new IntLiteralExpr(0, span);
         }
 
         if (varExpr.Variable.IsConst || varExpr.Variable.IsReadOnly)
         {
-            ctx.Diagnostics.ReportError("ERA1447", $"Cannot modify constant/read-only variable '{varExpr.Variable.Name}'.", span, ctx.FilePath);
+            ctx.Diagnostics.ReportError("ERA1447", $"Cannot modify constant/read-only variable '{varExpr.Variable.Name}'.", span, ctx.FilePath, null, [varExpr.Variable.Name]);
             return new IntLiteralExpr(0, span);
         }
 
@@ -1476,7 +1501,9 @@ public sealed class ExpressionParser
                 "ERA1448",
                 $"Operator '{op}' cannot be applied to operands of type '{left.ValueKind}' and '{right.ValueKind}'.",
                 span,
-                ctx.FilePath);
+                ctx.FilePath,
+                null,
+                [op.ToString(), left.ValueKind.ToString(), right.ValueKind.ToString()]);
             return new IntLiteralExpr(0, span);
         }
 
@@ -1612,7 +1639,9 @@ public sealed class ExpressionParser
                 "ERA1450",
                 $"Variable '{va.Variable.Name}' requires explicit subscripts when evaluated as a scalar value.",
                 va.Span,
-                ctx.FilePath);
+                ctx.FilePath,
+                null,
+                [va.Variable.Name]);
         }
     }
 
@@ -1624,7 +1653,9 @@ public sealed class ExpressionParser
                 "ERA1451",
                 $"CASE condition expression type ({expr.ValueKind}) does not match SELECTCASE expression type ({expected}).",
                 expr.Span,
-                filePath);
+                filePath,
+                null,
+                [expr.ValueKind.ToString(), expected.ToString()]);
         }
     }
 

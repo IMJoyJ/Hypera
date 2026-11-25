@@ -1,0 +1,113 @@
+@inject UiSessionState Ui
+@inject IAppCatalogService CatalogService
+@inject ISnackbar Snackbar
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">@Ui.T("admin.reorderVersions")</MudText>
+    </TitleContent>
+    <DialogContent>
+        <MudStack Spacing="2">
+            @if (!string.IsNullOrWhiteSpace(_error))
+            {
+                <MudAlert Severity="Severity.Error" Dense="true">@_error</MudAlert>
+            }
+
+            @for (int i = 0; i < _newestFirst.Count; i++)
+            {
+                int index = i;
+                GameVersion ver = _newestFirst[index];
+                <MudPaper Outlined="true" Class="px-3 py-2 d-flex align-center justify-space-between gap-2">
+                    <div class="d-flex align-center gap-2">
+                        <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined">
+                            #@(_newestFirst.Count - 1 - index)
+                        </MudChip>
+                        <MudText Typo="Typo.body1">@ver.VersionLabel</MudText>
+                    </div>
+                    <div class="d-flex gap-1">
+                        <MudIconButton Icon="@Icons.Material.Filled.ArrowUpward"
+                                       Size="Size.Small"
+                                       Disabled="@(index == 0)"
+                                       OnClick="@(() => Move(index, index - 1))" />
+                        <MudIconButton Icon="@Icons.Material.Filled.ArrowDownward"
+                                       Size="Size.Small"
+                                       Disabled="@(index == _newestFirst.Count - 1)"
+                                       OnClick="@(() => Move(index, index + 1))" />
+                    </div>
+                </MudPaper>
+            }
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="@Cancel" Disabled="@_saving">@Ui.T("app.cancel")</MudButton>
+        <MudButton Variant="Variant.Filled"
+                   Color="Color.Primary"
+                   Disabled="@(_saving || _newestFirst.Count == 0)"
+                   OnClick="@SaveAsync">
+            @Ui.T("app.save")
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter]
+    private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter]
+    public Guid AppId { get; set; }
+
+    [Parameter]
+    public Guid AdminUserId { get; set; }
+
+    [Parameter]
+    public IReadOnlyList<GameVersion> Versions { get; set; } = [];
+
+    private List<GameVersion> _newestFirst = [];
+    private bool _saving;
+    private string? _error;
+
+    protected override void OnInitialized()
+    {
+        _newestFirst = Versions.OrderByDescending(static v => v.OrderIndex).ToList();
+    }
+
+    private void Move(int from, int to)
+    {
+        if (to < 0 || to >= _newestFirst.Count)
+        {
+            return;
+        }
+
+        GameVersion item = _newestFirst[from];
+        _newestFirst.RemoveAt(from);
+        _newestFirst.Insert(to, item);
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private async Task SaveAsync()
+    {
+        _saving = true;
+        _error = null;
+        try
+        {
+            List<Guid> oldestToNewest = _newestFirst
+                .AsEnumerable()
+                .Reverse()
+                .Select(static v => v.Id)
+                .ToList();
+
+            await CatalogService.ReorderVersionsAsync(AdminUserId, AppId, oldestToNewest);
+            Snackbar.Add(Ui.T("admin.reordered"), Severity.Success);
+            MudDialog.Close(DialogResult.Ok(true));
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+}

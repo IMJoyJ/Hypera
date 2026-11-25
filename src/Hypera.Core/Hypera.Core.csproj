@@ -10,4 +10,7 @@
     <PackageReference Include="HarfBuzzSharp" />
     <PackageReference Include="System.Text.Encoding.CodePages" />
   </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Localization\Locales\*.json" />
+  </ItemGroup>
 </Project>

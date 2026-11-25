@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using Hypera.Localization;
 
 namespace Hypera.Diagnostics;
 
@@ -17,6 +18,76 @@ public readonly record struct Diagnostic(
     string? FilePath = null,
     string? RawLineText = null)
 {
+    private readonly ImmutableArray<string> _arguments;
+
+    public Diagnostic(
+        string code,
+        DiagnosticSeverity severity,
+        string message,
+        SourceSpan span,
+        string? filePath,
+        string? rawLineText,
+        ImmutableArray<string> arguments,
+        string? messageKey = null)
+        : this(code, severity, message, span, filePath, rawLineText)
+    {
+        _arguments = arguments;
+        MessageKey = messageKey;
+    }
+
+    public ImmutableArray<string> Arguments
+    {
+        get => _arguments.IsDefault ? ImmutableArray<string>.Empty : _arguments;
+        init => _arguments = value;
+    }
+
+    public string? MessageKey { get; init; }
+
+    public string FormatMessage(HyperaLocalizer localizer, string? cultureCode = null)
+    {
+        ArgumentNullException.ThrowIfNull(localizer);
+
+        string? template = null;
+        if (!string.IsNullOrEmpty(MessageKey)
+            && localizer.TryGetTemplate(MessageKey, cultureCode, out string keyedTemplate))
+        {
+            template = keyedTemplate;
+        }
+        else if (localizer.TryGetTemplate($"diag.{Code}", cultureCode, out string codeTemplate))
+        {
+            template = codeTemplate;
+        }
+
+        if (template is null)
+        {
+            return Message;
+        }
+
+        return Arguments.IsEmpty
+            ? template
+            : HyperaLocalizer.FormatTemplateSafe(template, Arguments.AsSpan());
+    }
+
+    public string FormatFull(HyperaLocalizer localizer, string? cultureCode = null)
+    {
+        ArgumentNullException.ThrowIfNull(localizer);
+
+        string loc = string.IsNullOrEmpty(FilePath)
+            ? $"#{Span.FileId}:{Span.StartLine}:{Span.StartColumn}"
+            : $"{FilePath}({Span.StartLine},{Span.StartColumn})";
+
+        string severityKey = Severity switch
+        {
+            DiagnosticSeverity.Info => "diag.severity.info",
+            DiagnosticSeverity.Warning => "diag.severity.warning",
+            _ => "diag.severity.error",
+        };
+
+        string severityLabel = localizer.Get(severityKey, cultureCode, Severity.ToString().ToLowerInvariant());
+        string formattedMessage = FormatMessage(localizer, cultureCode);
+        return $"{loc}: {severityLabel} {Code}: {formattedMessage}";
+    }
+
     public override string ToString()
     {
         string loc = string.IsNullOrEmpty(FilePath)
@@ -57,11 +128,41 @@ public sealed class DiagnosticBag
     public void ReportError(string code, string message, SourceSpan span, string? filePath = null, string? rawLineText = null) =>
         Add(new Diagnostic(code, DiagnosticSeverity.Error, message, span, filePath, rawLineText));
 
+    public void ReportError(
+        string code,
+        string message,
+        SourceSpan span,
+        string? filePath,
+        string? rawLineText,
+        ImmutableArray<string> arguments,
+        string? messageKey = null) =>
+        Add(new Diagnostic(code, DiagnosticSeverity.Error, message, span, filePath, rawLineText, arguments, messageKey));
+
     public void ReportWarning(string code, string message, SourceSpan span, string? filePath = null, string? rawLineText = null) =>
         Add(new Diagnostic(code, DiagnosticSeverity.Warning, message, span, filePath, rawLineText));
 
+    public void ReportWarning(
+        string code,
+        string message,
+        SourceSpan span,
+        string? filePath,
+        string? rawLineText,
+        ImmutableArray<string> arguments,
+        string? messageKey = null) =>
+        Add(new Diagnostic(code, DiagnosticSeverity.Warning, message, span, filePath, rawLineText, arguments, messageKey));
+
     public void ReportInfo(string code, string message, SourceSpan span, string? filePath = null, string? rawLineText = null) =>
         Add(new Diagnostic(code, DiagnosticSeverity.Info, message, span, filePath, rawLineText));
+
+    public void ReportInfo(
+        string code,
+        string message,
+        SourceSpan span,
+        string? filePath,
+        string? rawLineText,
+        ImmutableArray<string> arguments,
+        string? messageKey = null) =>
+        Add(new Diagnostic(code, DiagnosticSeverity.Info, message, span, filePath, rawLineText, arguments, messageKey));
 
     public ImmutableArray<Diagnostic> ToImmutableArray()
     {
@@ -93,6 +194,26 @@ public sealed class EmueraCompileException : Exception
     }
 
     public IReadOnlyList<Diagnostic> Diagnostics { get; }
+
+    public string FormatMessage(HyperaLocalizer localizer, string? cultureCode = null)
+    {
+        ArgumentNullException.ThrowIfNull(localizer);
+
+        int errors = Diagnostics.Count(static d => d.Severity == DiagnosticSeverity.Error);
+        Diagnostic? first = Diagnostics.FirstOrDefault(static d => d.Severity == DiagnosticSeverity.Error);
+        return first is { } f
+            ? localizer.Format(
+                "diag.compile_failed",
+                cultureCode,
+                "Compilation failed with {0} error(s). First error: {1}",
+                errors.ToString(),
+                f.FormatFull(localizer, cultureCode))
+            : localizer.Format(
+                "diag.compile_failed_count",
+                cultureCode,
+                "Compilation failed with {0} diagnostic(s).",
+                Diagnostics.Count.ToString());
+    }
 
     private static string FormatMessage(IReadOnlyList<Diagnostic> diagnostics)
     {
