@@ -16,6 +16,19 @@ public sealed class ConfigLoader
 
     public static ConfigLoader Default { get; } = new();
 
+    public static bool TryResolveConfigCode(string? key, out ConfigCode code)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            code = default;
+            return false;
+        }
+
+        return KeyMap.TryGetValue(key.Trim(), out code);
+    }
+
+    public static IReadOnlyDictionary<ConfigCode, object> CreateDefaultConfigValues() => CreateDefaultValues();
+
     public ConfigLoadResult Load(IVirtualFileSystem vfs)
     {
         ArgumentNullException.ThrowIfNull(vfs);

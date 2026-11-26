@@ -45,7 +45,9 @@ public sealed record TooltipState(
     int FontSize = 14,
     int DelayMs = 500,
     int DurationMs = 5000,
-    bool CustomEnabled = false);
+    bool CustomEnabled = false,
+    int Format = 0,
+    bool ImageEnabled = false);
 
 /// <summary>
 /// Complete immutable scene snapshot produced by <see cref="VirtualConsoleBuffer"/>
@@ -261,6 +263,31 @@ public sealed class VirtualConsoleBuffer
         }
 
         return _physicalLines[_physicalLines.Count - 1 - lineOffsetFromBottom].PlainText;
+    }
+
+    /// <summary>
+    /// Implements GETDISPLAYLINE(lineIndex): retrieves the plain text of the display line
+    /// at 0-based index <paramref name="lineIndex"/> from the top of the display buffer.
+    /// </summary>
+    public string GetDisplayLineTopIndexed(int lineIndex) =>
+        (uint)lineIndex < (uint)_physicalLines.Count
+            ? _physicalLines[lineIndex].PlainText
+            : string.Empty;
+
+    public IReadOnlyList<string> GetAllPlainTextLines()
+    {
+        var list = new List<string>(_physicalLines.Count + (_pendingHtmlBuffer.Length > 0 ? 1 : 0));
+        for (int i = 0; i < _physicalLines.Count; i++)
+        {
+            list.Add(_physicalLines[i].PlainText);
+        }
+
+        if (_pendingHtmlBuffer.Length > 0)
+        {
+            list.Add(HtmlPrintEngine.ToPlainText(_pendingHtmlBuffer.ToString()));
+        }
+
+        return list;
     }
 
     /// <summary>

@@ -324,6 +324,7 @@ public sealed class HyperaGameHost : IDisposable
             opts.DisplaySink);
 
         // 5. Populate CSV tables, VariableSize overrides, STR.CSV, _Replace.csv, Chara*.csv, ERD, VarExt, and #DIM initializers
+        engine.ConfigureConfigValues(config.RawValues);
         engine.ApplyGameData(gameData);
         compilation?.ApplyStaticInitializers(variables);
 

@@ -11,7 +11,7 @@ namespace Hypera.Runtime;
 /// Unpacks register call windows (<c>B = intBase, C = strBase, D = argCount, Aux = packed CallArgTags</c>)
 /// and dispatches all built-in Emuera expression methods, statements, console/graphics ops, and EM+EE container ops.
 /// </summary>
-internal static class VmBuiltinExecutor
+internal static partial class VmBuiltinExecutor
 {
     internal readonly ref struct CallWindow
     {
@@ -166,8 +166,16 @@ internal static class VmBuiltinExecutor
     public static bool ExecuteConsoleOp(EmueraEngine engine, CallFrame frame, Instruction insn)
     {
         var flags = (PrintModifierFlags)insn.Aux;
-        if ((flags & PrintModifierFlags.DebugOnly) != 0 && !engine.Options.UseDebugCommand)
+        if ((flags & PrintModifierFlags.DebugOnly) != 0)
         {
+            if (engine.Options.UseDebugCommand && insn.Op is OpCode.Print or OpCode.PrintLine)
+            {
+                string[] dbgRegs = frame.StrRegisters;
+                string dbgText = insn.A < dbgRegs.Length ? (dbgRegs[insn.A] ?? string.Empty) : string.Empty;
+                bool dbgNewLine = insn.Op == OpCode.PrintLine || (flags & PrintModifierFlags.NewLine) != 0;
+                engine.AppendDebugLog(dbgText, dbgNewLine);
+            }
+
             return false;
         }
 
@@ -1205,6 +1213,216 @@ internal static class VmBuiltinExecutor
             case BuiltinMethodKind.MAP_REMOVE: return EvalMapInt(engine, MapSubOp.Remove, w);
             case BuiltinMethodKind.MAP_FROMXML: return EvalMapInt(engine, MapSubOp.FromXml, w);
 
+            // Extended Built-in Methods Returning Int (Config, Skip, Save/Var/Chara Data, HTML, Graphics, Input, Reflection, Dynamic)
+            case BuiltinMethodKind.GETCONFIG:
+                return engine.ResolveConfigInt(w.GetStr(0));
+
+            case BuiltinMethodKind.TOINT:
+                return EastAsianStringOps.ParseEmueraInt(w.GetStr(0), engine.Options.LanguageCodePage);
+
+            case BuiltinMethodKind.EXISTVAR:
+                return engine.ActiveDynamicEvaluator.VariableExists(engine, frame, w.GetStr(0));
+
+            case BuiltinMethodKind.GETVAR:
+                return engine.ActiveDynamicEvaluator.GetVariableInt(engine, frame, w.GetStr(0));
+
+            case BuiltinMethodKind.SETVAR:
+                if (w.GetTag(1) == CallArgTag.Str)
+                {
+                    engine.ActiveDynamicEvaluator.SetVariableStr(engine, frame, w.GetStr(0), w.GetStr(1));
+                }
+                else
+                {
+                    engine.ActiveDynamicEvaluator.SetVariableInt(engine, frame, w.GetStr(0), w.GetInt(1));
+                }
+
+                return 1L;
+
+            case BuiltinMethodKind.VARSETEX:
+                return EvalVarSetEx(engine, frame, w);
+
+            case BuiltinMethodKind.MOUSESKIP:
+                return engine.IsMouseSkip ? 1L : 0L;
+
+            case BuiltinMethodKind.MESSKIP:
+                return (engine.IsMessageSkip || engine.IsSkipDisplay) ? 1L : 0L;
+
+            case BuiltinMethodKind.CHKVARDATA:
+            {
+                long st = engine.CheckDatFile(w.GetStr(0), isCharaVar: false, out string msg);
+                return SetResults0AndReturn(vars, msg, st);
+            }
+
+            case BuiltinMethodKind.CHKCHARADATA:
+            {
+                long st = engine.CheckDatFile(w.GetStr(0), isCharaVar: true, out string msg);
+                return SetResults0AndReturn(vars, msg, st);
+            }
+
+            case BuiltinMethodKind.CHKGLOBALDATA:
+            {
+                long st = engine.CheckGlobalData(out string msg);
+                return SetResults0AndReturn(vars, msg, st);
+            }
+
+            case BuiltinMethodKind.FIND_VARDATA:
+                return CopyMatchesToSpan(engine.FindDatFiles(w.HasArg(0) ? w.GetStr(0) : "*", isCharaVar: false), vars.ResultsSpan);
+
+            case BuiltinMethodKind.FIND_CHARADATA:
+                return CopyMatchesToSpan(engine.FindDatFiles(w.HasArg(0) ? w.GetStr(0) : "*", isCharaVar: true), vars.ResultsSpan);
+
+            case BuiltinMethodKind.SAVETEXT:
+            {
+                bool isIntNo = w.GetTag(1) != CallArgTag.Str;
+                long fileNo = isIntNo ? w.GetInt(1) : -1L;
+                string pathArg = isIntNo ? string.Empty : w.GetStr(1);
+                bool forceSavDir = w.HasArg(2) && w.GetInt(2) != 0;
+                bool forceUtf8 = w.HasArg(3) && w.GetInt(3) != 0;
+                return engine.SaveTextFile(w.GetStr(0), isIntNo, fileNo, pathArg, forceSavDir, forceUtf8) ? 1L : 0L;
+            }
+
+            case BuiltinMethodKind.OUTPUTLOG:
+            {
+                string logFile = w.HasArg(0) ? w.GetStr(0) : string.Empty;
+                bool hideTs = w.HasArg(1) && w.GetInt(1) != 0;
+                return engine.WriteOutputLog(logFile, hideTs) ? 1L : 0L;
+            }
+
+            case BuiltinMethodKind.HTML_STRINGLINES:
+                return HtmlPrintEngine.GetStringLines(
+                    w.GetStr(0),
+                    (int)w.GetInt(1, engine.Viewport.LogicalWidth),
+                    engine.Glyphs,
+                    engine.Options.FontSize,
+                    engine.CurrentFontName,
+                    engine.Sprites);
+
+            case BuiltinMethodKind.SPRITEGETCOLOR:
+                return engine.Sprites.GetColor(
+                    w.GetStr(0),
+                    (int)w.GetInt(1),
+                    (int)w.GetInt(2),
+                    engine.Graphics,
+                    engine.ElapsedAnimationMs);
+
+            case BuiltinMethodKind.GGETTEXTSIZE:
+                return EvalGraphicsGetTextSize(engine, vars, w);
+
+            case BuiltinMethodKind.SETANIMETIMER:
+            {
+                long interval = w.GetInt(0);
+                if (interval < int.MinValue || interval > 32767)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(interval), $"SETANIMETIMER interval {interval} is out of valid range.");
+                }
+
+                engine.AnimeTimerIntervalMs = (int)interval;
+                return 1L;
+            }
+
+            case BuiltinMethodKind.BITMAP_CACHE_ENABLE:
+                engine.BitmapCacheEnabledForNextLine = w.HasArg(0) && w.GetInt(0) != 0;
+                return 0L;
+
+            case BuiltinMethodKind.GETKEY:
+                return engine.IsKeyDown((int)w.GetInt(0)) ? 1L : 0L;
+
+            case BuiltinMethodKind.GETKEYTRIGGERED:
+                return engine.ConsumeKeyTriggered((int)w.GetInt(0)) ? 1L : 0L;
+
+            case BuiltinMethodKind.MOUSEX:
+                return engine.MouseX;
+
+            case BuiltinMethodKind.MOUSEY:
+                return engine.MouseY;
+
+            case BuiltinMethodKind.ISACTIVE:
+                return engine.IsWindowActive ? 1L : 0L;
+
+            case BuiltinMethodKind.MOVETEXTBOX:
+                engine.TextBoxBounds = ((int)w.GetInt(0), (int)w.GetInt(1), (int)w.GetInt(2));
+                return 1L;
+
+            case BuiltinMethodKind.RESUMETEXTBOX:
+                engine.TextBoxBounds = null;
+                return 1L;
+
+            case BuiltinMethodKind.SETTEXTBOX:
+                engine.TextBoxText = w.GetStr(0);
+                return 1L;
+
+            case BuiltinMethodKind.GETMEMORYUSAGE:
+                return GC.GetTotalMemory(forceFullCollection: false);
+
+            case BuiltinMethodKind.CLEARMEMORY:
+                return EvalClearMemory();
+
+            case BuiltinMethodKind.ISDEFINED:
+                return EvalIsDefined(engine, w.GetStr(0));
+
+            case BuiltinMethodKind.ENUMFUNCBEGINSWITH:
+                return EvalEnumFunctions(engine, vars, w, EnumMatchAction.BeginsWith);
+
+            case BuiltinMethodKind.ENUMFUNCENDSWITH:
+                return EvalEnumFunctions(engine, vars, w, EnumMatchAction.EndsWith);
+
+            case BuiltinMethodKind.ENUMFUNCWITH:
+                return EvalEnumFunctions(engine, vars, w, EnumMatchAction.Contains);
+
+            case BuiltinMethodKind.ENUMVARBEGINSWITH:
+                return EvalEnumVariables(vars, w, EnumMatchAction.BeginsWith);
+
+            case BuiltinMethodKind.ENUMVARENDSWITH:
+                return EvalEnumVariables(vars, w, EnumMatchAction.EndsWith);
+
+            case BuiltinMethodKind.ENUMVARWITH:
+                return EvalEnumVariables(vars, w, EnumMatchAction.Contains);
+
+            case BuiltinMethodKind.ENUMMACROBEGINSWITH:
+                return EvalEnumMacros(engine, vars, w, EnumMatchAction.BeginsWith);
+
+            case BuiltinMethodKind.ENUMMACROENDSWITH:
+                return EvalEnumMacros(engine, vars, w, EnumMatchAction.EndsWith);
+
+            case BuiltinMethodKind.ENUMMACROWITH:
+                return EvalEnumMacros(engine, vars, w, EnumMatchAction.Contains);
+
+            case BuiltinMethodKind.ENUMFILES:
+                return EvalEnumFiles(engine, vars, w);
+
+            case BuiltinMethodKind.FLOWINPUT:
+                engine.FlowInputDefaultInt = w.GetInt(0);
+                engine.FlowInputEnabled = !w.HasArg(1) || w.GetInt(1) != 0;
+                if (w.HasArg(2)) engine.FlowInputCanSkip = w.GetInt(2) != 0;
+                if (w.HasArg(3)) engine.FlowInputForceSkip = w.GetInt(3) != 0;
+                return 0L;
+
+            case BuiltinMethodKind.FLOWINPUTS:
+                engine.FlowInputStringEnabled = w.GetInt(0) != 0;
+                if (w.HasArg(1)) engine.FlowInputDefaultStr = w.GetStr(1);
+                return 0L;
+
+            case BuiltinMethodKind.EXISTMETH:
+                return engine.TryGetMethodFunction(w.GetStr(0), out FunctionDescriptor? methDesc) && methDesc is not null
+                    ? (methDesc.MethodReturnKind == VariableValueKind.Str ? 2L : 1L)
+                    : 0L;
+
+            case BuiltinMethodKind.GETMETH:
+                return EvalGetMethInt(engine, frame, w);
+
+            case BuiltinMethodKind.HOTKEY_STATE:
+                if (w.HasArg(1))
+                {
+                    engine.SetHotkeyState((int)w.GetInt(0), w.GetInt(1));
+                    return 0L;
+                }
+
+                return engine.GetHotkeyState((int)w.GetInt(0));
+
+            case BuiltinMethodKind.HOTKEY_STATE_INIT:
+                engine.InitHotkeyStates(w.HasArg(0) ? (int)w.GetInt(0) : 0);
+                return 0L;
+
             default:
                 return 0L;
         }
@@ -1358,6 +1576,67 @@ internal static class VmBuiltinExecutor
 
             case BuiltinMethodKind.MAP_TOXML:
                 return EvalMapStr(engine, MapSubOp.ToXml, w);
+
+            // Extended Built-in Methods Returning String
+            case BuiltinMethodKind.GETCONFIGS:
+                return engine.ResolveConfigStr(w.GetStr(0));
+
+            case BuiltinMethodKind.TOSTR:
+            {
+                long val = w.GetInt(0);
+                string fmt = w.HasArg(1) ? w.GetStr(1) : string.Empty;
+                return !string.IsNullOrEmpty(fmt)
+                    ? val.ToString(fmt, CultureInfo.InvariantCulture)
+                    : val.ToString(CultureInfo.InvariantCulture);
+            }
+
+            case BuiltinMethodKind.STRFORM:
+                return engine.ActiveDynamicEvaluator.EvaluateStrForm(engine, frame, w.GetStr(0));
+
+            case BuiltinMethodKind.GETVARS:
+                return engine.ActiveDynamicEvaluator.GetVariableStr(engine, frame, w.GetStr(0));
+
+            case BuiltinMethodKind.GETLINESTR:
+            {
+                string pat = w.GetStr(0);
+                if (string.IsNullOrEmpty(pat))
+                {
+                    throw new ArgumentException("GETLINESTR pattern cannot be empty.");
+                }
+
+                return engine.BuildLineString(pat);
+            }
+
+            case BuiltinMethodKind.HTML_GETPRINTEDSTR:
+                return engine.ConsoleBuffer.HtmlGetPrintedStr(w.HasArg(0) ? (int)w.GetInt(0) : 0);
+
+            case BuiltinMethodKind.HTML_POPPRINTINGSTR:
+                return engine.ConsoleBuffer.HtmlPopPrintingStr();
+
+            case BuiltinMethodKind.HTML_SUBSTRING:
+                return HtmlPrintEngine.Substring(w.GetStr(0), (int)w.GetInt(1));
+
+            case BuiltinMethodKind.GETDISPLAYLINE:
+                return engine.ConsoleBuffer.GetDisplayLineTopIndexed((int)w.GetInt(0));
+
+            case BuiltinMethodKind.MOUSEB:
+                return engine.HoveredButtonValue;
+
+            case BuiltinMethodKind.GETTEXTBOX:
+                return engine.TextBoxText;
+
+            case BuiltinMethodKind.LOADTEXT:
+            {
+                bool isIntNo = w.GetTag(0) != CallArgTag.Str;
+                long fileNo = isIntNo ? w.GetInt(0) : -1L;
+                string pathArg = isIntNo ? string.Empty : w.GetStr(0);
+                bool forceSavDir = w.HasArg(1) && w.GetInt(1) != 0;
+                bool forceUtf8 = w.HasArg(2) && w.GetInt(2) != 0;
+                return engine.LoadTextFile(isIntNo, fileNo, pathArg, forceSavDir, forceUtf8);
+            }
+
+            case BuiltinMethodKind.GETMETHS:
+                return EvalGetMethStr(engine, frame, w);
 
             default:
                 return string.Empty;
@@ -1913,6 +2192,102 @@ internal static class VmBuiltinExecutor
                 return engine.IssueScriptInput(InputRequestKind.StringValue, WaitInputFlags.AnyValue)
                     ? EngineStepStatus.WaitingInput
                     : null;
+
+            // Extended Console, HTML, Background Image, Tooltip, Persistence & Legacy Display Instructions
+            case BuiltinInstructionKind.DEBUGCLEAR:
+                engine.ClearDebugLog();
+                return null;
+
+            case BuiltinInstructionKind.HTML_PRINT_ISLAND_CLEAR:
+                engine.ConsoleBuffer.HtmlPrintIslandClear();
+                return null;
+
+            case BuiltinInstructionKind.HTML_TAGSPLIT:
+                ExecuteHtmlTagSplit(vars, w);
+                return null;
+
+            case BuiltinInstructionKind.PRINT_ABL:
+            case BuiltinInstructionKind.PRINT_TALENT:
+            case BuiltinInstructionKind.PRINT_MARK:
+            case BuiltinInstructionKind.PRINT_EXP:
+            case BuiltinInstructionKind.PRINT_PALAM:
+                ExecuteLegacyPrintCharaStat(engine, vars, kind, checked((int)w.GetInt(0)));
+                return null;
+
+            case BuiltinInstructionKind.PRINT_ITEM:
+                ExecutePrintItem(engine, vars);
+                return null;
+
+            case BuiltinInstructionKind.PRINT_SHOPITEM:
+                ExecutePrintShopItem(engine, vars);
+                return null;
+
+            case BuiltinInstructionKind.UPCHECK:
+                ExecuteUpCheck(engine, vars);
+                return null;
+
+            case BuiltinInstructionKind.CUPCHECK:
+                ExecuteCUpCheck(engine, vars, checked((int)w.GetInt(0)));
+                return null;
+
+            case BuiltinInstructionKind.SETBGIMAGE:
+                ExecuteSetBgImage(engine, w);
+                return null;
+
+            case BuiltinInstructionKind.REMOVEBGIMAGE:
+                if (w.HasArg(0))
+                {
+                    engine.ConsoleBuffer.RemoveBackgroundImage(w.GetStr(0));
+                }
+
+                return null;
+
+            case BuiltinInstructionKind.CLEARBGIMAGE:
+                engine.ConsoleBuffer.ClearBackgroundImages();
+                return null;
+
+            case BuiltinInstructionKind.SAVEVAR:
+                ExecuteSaveVar(engine, w);
+                return null;
+
+            case BuiltinInstructionKind.LOADVAR:
+                vars.Result = engine.LoadVarData(w.GetStr(0)) ? 1L : 0L;
+                return null;
+
+            case BuiltinInstructionKind.SAVECHARA:
+                ExecuteSaveChara(engine, w);
+                return null;
+
+            case BuiltinInstructionKind.LOADCHARA:
+                vars.Result = engine.LoadCharaData(w.GetStr(0)) ? 1L : 0L;
+                return null;
+
+            case BuiltinInstructionKind.TOOLTIP_SETCOLOR:
+            case BuiltinInstructionKind.TOOLTIP_SETDELAY:
+            case BuiltinInstructionKind.TOOLTIP_SETDURATION:
+            case BuiltinInstructionKind.TOOLTIP_SETFONT:
+            case BuiltinInstructionKind.TOOLTIP_SETFONTSIZE:
+            case BuiltinInstructionKind.TOOLTIP_CUSTOM:
+            case BuiltinInstructionKind.TOOLTIP_FORMAT:
+            case BuiltinInstructionKind.TOOLTIP_IMG:
+                ExecuteTooltipInstruction(engine, kind, w);
+                return null;
+
+            case BuiltinInstructionKind.CLEARTEXTBOX:
+                engine.TextBoxText = string.Empty;
+                return null;
+
+            case BuiltinInstructionKind.FORCEKANA:
+                engine.ForceKanaMode = (int)w.GetInt(0);
+                return null;
+
+            case BuiltinInstructionKind.SKIPLOG:
+                engine.SkipLogEnabled = w.GetInt(0) != 0;
+                return null;
+
+            case BuiltinInstructionKind.UPDATECHECK:
+                vars.Result = engine.ResolveConfigInt("ForbidUpdateCheck") != 0 ? 4L : 3L;
+                return null;
 
             default:
                 return null;
@@ -2524,4 +2899,7 @@ internal static class VmBuiltinExecutor
 
     private static long RgbaToRgb24(uint rgba) =>
         (rgba >> 8) & 0xFF_FFFF;
+
+    private static uint Rgb24ToRgba(long rgb24) =>
+        (((uint)rgb24 & 0x00FF_FFFFu) << 8) | 0xFFu;
 }

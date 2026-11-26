@@ -103,6 +103,14 @@ public static class BytecodeSerializer
             WriteVariableSlot(writer, slot);
         }
 
+        // DefinedMacros
+        ImmutableArray<string> macros = module.DefinedMacros.IsDefault ? [] : module.DefinedMacros;
+        writer.Write(macros.Length);
+        foreach (string macro in macros)
+        {
+            WriteUtf8String(writer, macro);
+        }
+
         // SourceMap
         WriteSourceMap(writer, module.SourceMap);
         writer.Flush();
@@ -231,6 +239,14 @@ public static class BytecodeSerializer
             staticVars.Add(ReadVariableSlot(reader));
         }
 
+        // DefinedMacros
+        int macroCount = reader.ReadInt32();
+        var definedMacros = ImmutableArray.CreateBuilder<string>(macroCount);
+        for (int i = 0; i < macroCount; i++)
+        {
+            definedMacros.Add(ReadUtf8String(reader));
+        }
+
         // SourceMap
         SourceMap sourceMap = ReadSourceMap(reader);
 
@@ -245,6 +261,7 @@ public static class BytecodeSerializer
             Functions = functions.MoveToImmutable(),
             EventGroups = eventGroups.MoveToImmutable(),
             StaticVariables = staticVars.MoveToImmutable(),
+            DefinedMacros = definedMacros.MoveToImmutable(),
             SourceMap = sourceMap,
         };
     }

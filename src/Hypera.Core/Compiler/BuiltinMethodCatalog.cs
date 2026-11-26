@@ -128,7 +128,7 @@ public static class BuiltinMethodCatalog
             M(BuiltinMethodKind.COLOR_FROMRGB, VariableValueKind.Int, Ov([I, I, I]), fold: true),
             M(BuiltinMethodKind.CHKVARDATA, VariableValueKind.Int, Ov([S])),
             M(BuiltinMethodKind.CHKCHARADATA, VariableValueKind.Int, Ov([S])),
-            M(BuiltinMethodKind.CHKGLOBALDATA, VariableValueKind.Int, Ov([I])),
+            M(BuiltinMethodKind.CHKGLOBALDATA, VariableValueKind.Int, Ov([I], opt: 0)),
             M(BuiltinMethodKind.FIND_VARDATA, VariableValueKind.Int, Ov([S], opt: 0)),
             M(BuiltinMethodKind.FIND_CHARADATA, VariableValueKind.Int, Ov([S], opt: 0)),
 

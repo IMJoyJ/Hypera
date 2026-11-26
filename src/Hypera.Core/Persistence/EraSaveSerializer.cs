@@ -97,8 +97,12 @@ public static class EraSaveSerializer
             using var sr = new StringReader(text);
             long code = ReadLineLong(sr);
             long version = ReadLineLong(sr);
-            string saveText = sr.ReadLine() ?? string.Empty;
-            return new EraSaveHeader(code, version, saveText, EraSaveFileType.Normal, CurrentBinaryVersion, EraSaveFormat.Text);
+            string saveText = UnescapeTextLine(sr.ReadLine() ?? string.Empty);
+            string? fourthLine = sr.ReadLine();
+            EraSaveFileType fileType = fourthLine is not null && IsEmueraStartMarker(fourthLine)
+                ? EraSaveFileType.Global
+                : EraSaveFileType.Normal;
+            return new EraSaveHeader(code, version, saveText, fileType, CurrentBinaryVersion, EraSaveFormat.Text);
         }
 
         using var ms = new MemoryStream(data.ToArray(), writable: false);

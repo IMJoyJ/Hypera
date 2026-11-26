@@ -201,6 +201,7 @@ public sealed class ErbProjectCompiler
         ImmutableArray<FunctionDescriptor> functions = [.. descriptorsById];
         ImmutableArray<EventFunctionGroup> eventGroups = symbols.BuildEventGroups();
         ImmutableArray<VariableSlotDescriptor> staticVars = [.. symbols.StaticVariables.Select(static v => v.ToDescriptor())];
+        ImmutableArray<string> definedMacros = [.. symbols.Macros.Keys];
 
         var module = new BytecodeModule
         {
@@ -218,6 +219,7 @@ public sealed class ErbProjectCompiler
             Functions = functions,
             EventGroups = eventGroups,
             StaticVariables = staticVars,
+            DefinedMacros = definedMacros,
             SourceMap = moduleBuilder.SourceMap.Build(),
         };
 

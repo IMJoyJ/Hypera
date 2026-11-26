@@ -28,7 +28,7 @@ internal sealed record PendingScriptInputMeta(
 /// Fully instance-isolated Hypera execution engine (zero static mutable game state).
 /// Multiple <see cref="EmueraEngine"/> instances can run concurrently in the same process.
 /// </summary>
-public sealed class EmueraEngine : IDisposable
+public sealed partial class EmueraEngine : IDisposable
 {
     private readonly List<CallFrame> _callStack = [];
     private readonly List<EventDispatchCursor> _eventStack = [];
@@ -219,6 +219,28 @@ public sealed class EmueraEngine : IDisposable
     public int CurrentFontStyle { get; internal set; }
     public string CurrentFontName { get; internal set; }
     public string CurrentAlignmentName { get; private set; } = "LEFT";
+
+    public bool IsMouseSkip { get; set; }
+    public bool IsMessageSkip { get; set; }
+    public int MouseX { get; set; }
+    public int MouseY { get; set; }
+    public string HoveredButtonValue { get; set; } = string.Empty;
+    public bool IsWindowActive { get; set; } = true;
+    public string TextBoxText { get; set; } = string.Empty;
+    public (int X, int Y, int Width)? TextBoxBounds { get; set; }
+    public int AnimeTimerIntervalMs { get; set; } = 100;
+    public long ElapsedAnimationMs { get; set; }
+    public bool BitmapCacheEnabledForNextLine { get; set; }
+    public int ForceKanaMode { get; set; }
+    public bool SkipLogEnabled { get; set; }
+    public bool FlowInputEnabled { get; set; }
+    public long FlowInputDefaultInt { get; set; }
+    public bool FlowInputCanSkip { get; set; }
+    public bool FlowInputForceSkip { get; set; }
+    public bool FlowInputStringEnabled { get; set; }
+    public string FlowInputDefaultStr { get; set; } = string.Empty;
+    public string LastOutputLog { get; private set; } = string.Empty;
+    public IReadOnlyDictionary<ConfigCode, object>? ConfigRawValues { get; private set; }
 
     internal List<CallFrame> InternalCallStack => _callStack;
     internal bool HasActiveFrames => _callStack.Count > 0;
@@ -1000,6 +1022,37 @@ public sealed class EmueraEngine : IDisposable
             activeButtons = matchingButtons;
         }
 
+        // FLOWINPUT / FLOWINPUTS auto-feed handling
+        if (kind is InputRequestKind.IntValue or InputRequestKind.OneInt && FlowInputEnabled)
+        {
+            if (FastVariables is not null)
+            {
+                FastVariables.Result = FlowInputDefaultInt;
+            }
+
+            if (targetReg.HasValue && _callStack.Count > 0 && targetReg.Value < _callStack[^1].IntRegisters.Length)
+            {
+                _callStack[^1].IntRegisters[targetReg.Value] = FlowInputDefaultInt;
+            }
+
+            return false;
+        }
+
+        if (kind is InputRequestKind.StringValue or InputRequestKind.OneString && FlowInputStringEnabled)
+        {
+            if (FastVariables is not null)
+            {
+                FastVariables.Results = FlowInputDefaultStr;
+            }
+
+            if (targetReg.HasValue && _callStack.Count > 0 && targetReg.Value < _callStack[^1].StrRegisters.Length)
+            {
+                _callStack[^1].StrRegisters[targetReg.Value] = FlowInputDefaultStr;
+            }
+
+            return false;
+        }
+
         _inputGeneration++;
         _pendingScriptInputMeta = new PendingScriptInputMeta(kind, flags, hasDef, defInt, defStr ?? string.Empty, targetReg);
         PendingInputRequest = new InputRequest(
@@ -1016,6 +1069,12 @@ public sealed class EmueraEngine : IDisposable
 
     private bool TryProcessScriptInput(InputResponse response, PendingScriptInputMeta meta)
     {
+        if (response.HitTest.LogicalX != 0 || response.HitTest.LogicalY != 0 || response.HitTest.MouseButton != 0 || response.HitTest.HasHitColor)
+        {
+            MouseX = response.HitTest.LogicalX;
+            MouseY = response.HitTest.LogicalY;
+        }
+
         if (FastVariables is null && Variables is null)
         {
             return true;
@@ -1299,7 +1358,15 @@ public sealed class EmueraEngine : IDisposable
     internal void PrintStyled(string text, PrintModifierFlags flags)
     {
         uint color = (flags & PrintModifierFlags.DefaultColor) != 0 ? Options.ForeColorRgba : CurrentForeColorRgba;
-        string projected = (flags & PrintModifierFlags.ForceKana) != 0 ? EastAsianStringOps.ToKatakana(text) : text;
+        string projected = (flags & PrintModifierFlags.ForceKana) != 0
+            ? ForceKanaMode switch
+            {
+                1 => EastAsianStringOps.ToKatakana(text),
+                2 => EastAsianStringOps.ToHiragana(text, widenHalfwidth: false),
+                3 => EastAsianStringOps.ToHalf(EastAsianStringOps.ToKatakana(text)),
+                _ => text,
+            }
+            : text;
 
         if ((flags & PrintModifierFlags.PlainText) == 0)
         {
@@ -1382,7 +1449,7 @@ public sealed class EmueraEngine : IDisposable
         SyncLineCount();
     }
 
-    internal void PrintDrawLine(string? customPattern = null)
+    internal string BuildLineString(string? customPattern = null)
     {
         string unit = string.IsNullOrEmpty(customPattern) ? (FastVariables?.ReplaceConfig.DrawLineString ?? "-") : customPattern;
         int cols = Math.Max(1, Viewport.LogicalWidth / Math.Max(1, Options.FontSize / 2));
@@ -1393,8 +1460,14 @@ public sealed class EmueraEngine : IDisposable
             sb.Append(unit);
         }
 
-        _displayOperations.Add(new DisplayOperation(DisplayOperationKind.DrawLineRule, default, sb.ToString(), CurrentForeColorRgba, CurrentFontName, Options.FontSize));
-        ConsoleBuffer.PrintLine(sb.ToString());
+        return sb.ToString();
+    }
+
+    internal void PrintDrawLine(string? customPattern = null)
+    {
+        string line = BuildLineString(customPattern);
+        _displayOperations.Add(new DisplayOperation(DisplayOperationKind.DrawLineRule, default, line, CurrentForeColorRgba, CurrentFontName, Options.FontSize));
+        ConsoleBuffer.PrintLine(line);
         SyncLineCount();
     }
 
@@ -1622,61 +1695,7 @@ public sealed class EmueraEngine : IDisposable
             CharacterStore chars = vars.Characters;
             for (int c = 0; c < chars.Count; c++)
             {
-                var charaData = new EraCharacterSaveData
-                {
-                    No = chars.NoSlotId >= 0 ? chars.GetInt0D(c, chars.NoSlotId) : 0L,
-                    IsAssi = chars.IsAssiSlotId >= 0 ? chars.GetInt0D(c, chars.IsAssiSlotId) : 0L,
-                    Name = chars.NameSlotId >= 0 ? chars.GetStr0D(c, chars.NameSlotId) : string.Empty,
-                    CallName = chars.CallNameSlotId >= 0 ? chars.GetStr0D(c, chars.CallNameSlotId) : string.Empty,
-                    NickName = chars.NickNameSlotId >= 0 ? chars.GetStr0D(c, chars.NickNameSlotId) : string.Empty,
-                    MasterName = chars.MasterNameSlotId >= 0 ? chars.GetStr0D(c, chars.MasterNameSlotId) : string.Empty,
-                };
-
-                foreach (CharacterSlotSchema schema in chars.IntSlotSchemas)
-                {
-                    if (!schema.IsSavedata ||
-                        schema.GlobalSlotId == chars.NoSlotId ||
-                        schema.GlobalSlotId == chars.IsAssiSlotId)
-                    {
-                        continue;
-                    }
-
-                    ReadOnlySpan<long> raw = chars.GetIntSpan(c, schema.GlobalSlotId);
-                    EraSaveValue val = PackIntSaveValue(raw, schema.SubRank, schema.Dim0, schema.Dim1, schema.Dim2);
-                    if (schema.IsUserDefined)
-                    {
-                        charaData.UserVariables[schema.Name] = val;
-                    }
-                    else
-                    {
-                        charaData.BuiltinVariables[schema.Name] = val;
-                    }
-                }
-
-                foreach (CharacterSlotSchema schema in chars.StrSlotSchemas)
-                {
-                    if (!schema.IsSavedata ||
-                        schema.GlobalSlotId == chars.NameSlotId ||
-                        schema.GlobalSlotId == chars.CallNameSlotId ||
-                        schema.GlobalSlotId == chars.NickNameSlotId ||
-                        schema.GlobalSlotId == chars.MasterNameSlotId)
-                    {
-                        continue;
-                    }
-
-                    ReadOnlySpan<string> raw = chars.GetStrSpan(c, schema.GlobalSlotId);
-                    EraSaveValue val = PackStrSaveValue(raw, schema.SubRank, schema.Dim0, schema.Dim1, schema.Dim2);
-                    if (schema.IsUserDefined)
-                    {
-                        charaData.UserVariables[schema.Name] = val;
-                    }
-                    else
-                    {
-                        charaData.BuiltinVariables[schema.Name] = val;
-                    }
-                }
-
-                snap.Characters.Add(charaData);
+                snap.Characters.Add(BuildCharacterSaveData(chars, c));
             }
         }
 

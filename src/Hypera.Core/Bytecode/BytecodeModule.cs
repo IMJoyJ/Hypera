@@ -20,7 +20,7 @@ public readonly record struct BytecodeModuleHeader(
     uint StaticVariableCount)
 {
     public const uint ExpectedMagic = 0x43424548u; // "HEBC" in little-endian ASCII
-    public const ushort CurrentVersion = 2;
+    public const ushort CurrentVersion = 3;
     public const int SizeInBytes = 28;
 
     public bool IsValid => Magic == ExpectedMagic && Version == CurrentVersion;
@@ -168,6 +168,7 @@ public sealed class BytecodeModule
     public ImmutableArray<FunctionDescriptor> Functions { get; init; } = [];
     public ImmutableArray<EventFunctionGroup> EventGroups { get; init; } = [];
     public ImmutableArray<VariableSlotDescriptor> StaticVariables { get; init; } = [];
+    public ImmutableArray<string> DefinedMacros { get; init; } = [];
     public SourceMap SourceMap { get; init; } = SourceMap.Empty;
 
     public static BytecodeModule Empty { get; } = new()
