@@ -233,6 +233,16 @@ public sealed class VariableStore : IVariableStore
         BytecodeModule? module = null,
         CharacterStore? characterStore = null,
         long? randomSeed = null)
+        : this(module, characterStore, randomSeed, slotProgressCallback: null, cancellationToken: default)
+    {
+    }
+
+    internal VariableStore(
+        BytecodeModule? module,
+        CharacterStore? characterStore,
+        long? randomSeed,
+        Action<int, int>? slotProgressCallback,
+        CancellationToken cancellationToken)
     {
         _compilerOptions = module?.CompilerOptions ?? CompilerOptions.Default;
         _replaceConfig = module?.ReplaceConfig ?? ReplaceConfiguration.Default;
@@ -252,7 +262,7 @@ public sealed class VariableStore : IVariableStore
         Xmls = new XmlStore();
         Maps = new MapStore();
 
-        InitializeSlots(module);
+        InitializeSlots(module, slotProgressCallback, cancellationToken);
         ApplyDefaultSystemValues();
     }
 
@@ -1398,16 +1408,32 @@ public sealed class VariableStore : IVariableStore
     // Initialization & Internal Helpers
     // -------------------------------------------------------------------------
 
-    private void InitializeSlots(BytecodeModule? module)
+    private void InitializeSlots(
+        BytecodeModule? module,
+        Action<int, int>? slotProgressCallback,
+        CancellationToken cancellationToken)
     {
         // 1. Register explicit static/chara/function-static slots from BytecodeModule first, preserving exact SlotIds
         if (module is not null)
         {
-            foreach (VariableSlotDescriptor desc in module.StaticVariables)
+            int totalStatic = module.StaticVariables.Length;
+            int reportStep = Math.Max(1, totalStatic / 24);
+            for (int i = 0; i < totalStatic; i++)
             {
-                RegisterDescriptorSlot(desc);
+                if ((i & 31) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                RegisterDescriptorSlot(module.StaticVariables[i]);
+                if (slotProgressCallback is not null && ((i + 1) % reportStep == 0 || i + 1 == totalStatic))
+                {
+                    slotProgressCallback(i + 1, totalStatic);
+                }
             }
         }
+
+        cancellationToken.ThrowIfCancellationRequested();
 
         // 2. Ensure all 161 named built-in variables exist even when module is Empty or pruned
         int nextAutoSlotId = 0;

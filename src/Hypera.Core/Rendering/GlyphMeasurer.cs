@@ -99,7 +99,7 @@ public sealed class GlyphMeasurer : IDisposable
             return MeasureCrispTileRunWidth(text, skFont, hbData);
         }
 
-        return MeasureStandardRunWidth(text, skFont, hbData);
+        return MeasureStandardRunWidth(text, skFont, hbData, style);
     }
 
     public float MeasureTextWidth(
@@ -255,7 +255,7 @@ public sealed class GlyphMeasurer : IDisposable
         }
         else
         {
-            totalAdvance = DrawStandardRun(canvas, text, startX, baselineY, skFont, hbData, paint);
+            totalAdvance = DrawStandardRun(canvas, text, startX, baselineY, skFont, hbData, style, paint);
         }
 
         if ((style & (FontStyleFlags.Underline | FontStyleFlags.Strikeout)) != 0 && totalAdvance > 0f)
@@ -298,11 +298,16 @@ public sealed class GlyphMeasurer : IDisposable
         return total;
     }
 
-    private float MeasureStandardRunWidth(ReadOnlySpan<char> text, SKFont skFont, HarfBuzzTypefaceData? hbData)
+    private float MeasureStandardRunWidth(
+        ReadOnlySpan<char> text,
+        SKFont skFont,
+        HarfBuzzTypefaceData? hbData,
+        FontStyleFlags style)
     {
         float? fullWidthAdvance = null;
         float total = 0f;
 
+        SKTypeface? activeFallback = null;
         int runStart = 0;
         int i = 0;
         while (i < text.Length)
@@ -313,21 +318,55 @@ public sealed class GlyphMeasurer : IDisposable
             {
                 if (cpStart > runStart)
                 {
-                    total += MeasureShapedSliceWidth(text[runStart..cpStart], skFont, hbData);
+                    total += MeasureRunSlice(text[runStart..cpStart], skFont, hbData, activeFallback, style);
                 }
 
                 fullWidthAdvance ??= ComputeFullWidthAdvance(skFont, hbData);
                 total += fullWidthAdvance.Value;
+                activeFallback = null;
                 runStart = i;
+                continue;
+            }
+
+            SKTypeface? neededFallback = codePoint >= 0x20 && skFont.GetGlyph(codePoint) == 0
+                ? _fontRegistry.ResolveCharacterFallback(codePoint, style)
+                : null;
+
+            if (!ReferenceEquals(neededFallback, activeFallback))
+            {
+                if (cpStart > runStart)
+                {
+                    total += MeasureRunSlice(text[runStart..cpStart], skFont, hbData, activeFallback, style);
+                }
+
+                activeFallback = neededFallback;
+                runStart = cpStart;
             }
         }
 
         if (runStart < text.Length)
         {
-            total += MeasureShapedSliceWidth(text[runStart..], skFont, hbData);
+            total += MeasureRunSlice(text[runStart..], skFont, hbData, activeFallback, style);
         }
 
         return total;
+    }
+
+    private float MeasureRunSlice(
+        ReadOnlySpan<char> slice,
+        SKFont primaryFont,
+        HarfBuzzTypefaceData? primaryHb,
+        SKTypeface? fallbackTypeface,
+        FontStyleFlags style)
+    {
+        if (fallbackTypeface is null)
+        {
+            return MeasureShapedSliceWidth(slice, primaryFont, primaryHb);
+        }
+
+        using SKFont fbFont = CreateFallbackFont(fallbackTypeface, primaryFont, style);
+        HarfBuzzTypefaceData? fbHb = GetOrCreateHarfBuzz(fallbackTypeface);
+        return MeasureShapedSliceWidth(slice, fbFont, fbHb);
     }
 
     private static float MeasureShapedSliceWidth(ReadOnlySpan<char> slice, SKFont skFont, HarfBuzzTypefaceData? hbData)
@@ -429,12 +468,14 @@ public sealed class GlyphMeasurer : IDisposable
         float baselineY,
         SKFont skFont,
         HarfBuzzTypefaceData? hbData,
+        FontStyleFlags style,
         SKPaint paint)
     {
         ReadOnlySpan<char> span = text.AsSpan();
         float? fullWidthAdvance = null;
         float cursorX = startX;
 
+        SKTypeface? activeFallback = null;
         int runStart = 0;
         int i = 0;
         while (i < span.Length)
@@ -445,22 +486,76 @@ public sealed class GlyphMeasurer : IDisposable
             {
                 if (cpStart > runStart)
                 {
-                    cursorX += DrawShapedSlice(canvas, span[runStart..cpStart], cursorX, baselineY, skFont, hbData, paint);
+                    cursorX += DrawRunSlice(canvas, span[runStart..cpStart], cursorX, baselineY, skFont, hbData, activeFallback, style, paint);
                 }
 
                 fullWidthAdvance ??= ComputeFullWidthAdvance(skFont, hbData);
-                DrawSingleBoxSymbol(canvas, codePoint, cursorX, baselineY, fullWidthAdvance.Value, skFont, paint);
+                DrawSingleBoxSymbol(canvas, codePoint, cursorX, baselineY, fullWidthAdvance.Value, skFont, style, paint);
                 cursorX += fullWidthAdvance.Value;
+                activeFallback = null;
                 runStart = i;
+                continue;
+            }
+
+            SKTypeface? neededFallback = codePoint >= 0x20 && skFont.GetGlyph(codePoint) == 0
+                ? _fontRegistry.ResolveCharacterFallback(codePoint, style)
+                : null;
+
+            if (!ReferenceEquals(neededFallback, activeFallback))
+            {
+                if (cpStart > runStart)
+                {
+                    cursorX += DrawRunSlice(canvas, span[runStart..cpStart], cursorX, baselineY, skFont, hbData, activeFallback, style, paint);
+                }
+
+                activeFallback = neededFallback;
+                runStart = cpStart;
             }
         }
 
         if (runStart < span.Length)
         {
-            cursorX += DrawShapedSlice(canvas, span[runStart..], cursorX, baselineY, skFont, hbData, paint);
+            cursorX += DrawRunSlice(canvas, span[runStart..], cursorX, baselineY, skFont, hbData, activeFallback, style, paint);
         }
 
         return cursorX - startX;
+    }
+
+    private float DrawRunSlice(
+        SKCanvas canvas,
+        ReadOnlySpan<char> slice,
+        float startX,
+        float baselineY,
+        SKFont primaryFont,
+        HarfBuzzTypefaceData? primaryHb,
+        SKTypeface? fallbackTypeface,
+        FontStyleFlags style,
+        SKPaint paint)
+    {
+        if (fallbackTypeface is null)
+        {
+            return DrawShapedSlice(canvas, slice, startX, baselineY, primaryFont, primaryHb, paint);
+        }
+
+        using SKFont fbFont = CreateFallbackFont(fallbackTypeface, primaryFont, style);
+        HarfBuzzTypefaceData? fbHb = GetOrCreateHarfBuzz(fallbackTypeface);
+        return DrawShapedSlice(canvas, slice, startX, baselineY, fbFont, fbHb, paint);
+    }
+
+    private static SKFont CreateFallbackFont(SKTypeface fallbackTypeface, SKFont templateFont, FontStyleFlags style)
+    {
+        bool wantBold = (style & FontStyleFlags.Bold) != 0;
+        bool wantItalic = (style & FontStyleFlags.Italic) != 0;
+        return new SKFont(fallbackTypeface, templateFont.Size)
+        {
+            Edging = templateFont.Edging,
+            Subpixel = templateFont.Subpixel,
+            Hinting = templateFont.Hinting,
+            LinearMetrics = templateFont.LinearMetrics,
+            ForceAutoHinting = templateFont.ForceAutoHinting,
+            Embolden = wantBold && !fallbackTypeface.IsBold,
+            SkewX = wantItalic && !fallbackTypeface.IsItalic ? -0.25f : 0f,
+        };
     }
 
     private static float DrawShapedSlice(
@@ -522,43 +617,67 @@ public sealed class GlyphMeasurer : IDisposable
         return MeasureShapedSliceWidth(slice, skFont, hbData);
     }
 
-    private static void DrawSingleBoxSymbol(
+    private void DrawSingleBoxSymbol(
         SKCanvas canvas,
         int codePoint,
         float x,
         float baselineY,
         float targetAdvance,
         SKFont skFont,
+        FontStyleFlags style,
         SKPaint paint)
     {
         ushort gid = skFont.GetGlyph(codePoint);
         if (gid != 0)
         {
-            Span<ushort> glyphs = [gid];
-            Span<float> widths = [0f];
-            skFont.GetGlyphWidths(glyphs, widths, Span<SKRect>.Empty);
-            float offset = widths[0] > 0f && widths[0] < targetAdvance
-                ? (targetAdvance - widths[0]) * 0.5f
-                : 0f;
-
-            using var builder = new SKTextBlobBuilder();
-            SKPositionedRunBuffer run = builder.AllocatePositionedRun(skFont, 1);
-            Span<ushort> singleGlyph = [gid];
-            Span<SKPoint> singlePos = [new SKPoint(x + offset, baselineY)];
-            run.SetGlyphs(singleGlyph);
-            run.SetPositions(singlePos);
-            using SKTextBlob? blob = builder.Build();
-            if (blob is not null)
-            {
-                canvas.DrawText(blob, 0f, 0f, paint);
-            }
-
+            DrawCenteredSingleGlyph(canvas, gid, x, baselineY, targetAdvance, skFont, paint);
             return;
         }
 
-        // Fallback to default system font if the selected font lacks the box-drawing glyph.
+        // Resolve a system fallback font that contains the box-drawing/geometric glyph (e.g. ☆ U+2606).
+        SKTypeface? fallbackTypeface = _fontRegistry.ResolveCharacterFallback(codePoint, style);
+        if (fallbackTypeface is not null)
+        {
+            using SKFont fbFont = CreateFallbackFont(fallbackTypeface, skFont, style);
+            ushort fbGid = fbFont.GetGlyph(codePoint);
+            if (fbGid != 0)
+            {
+                DrawCenteredSingleGlyph(canvas, fbGid, x, baselineY, targetAdvance, fbFont, paint);
+                return;
+            }
+        }
+
         string text = char.ConvertFromUtf32(codePoint);
         canvas.DrawText(text, x, baselineY, SKTextAlign.Left, skFont, paint);
+    }
+
+    private static void DrawCenteredSingleGlyph(
+        SKCanvas canvas,
+        ushort gid,
+        float x,
+        float baselineY,
+        float targetAdvance,
+        SKFont skFont,
+        SKPaint paint)
+    {
+        Span<ushort> glyphs = [gid];
+        Span<float> widths = [0f];
+        skFont.GetGlyphWidths(glyphs, widths, Span<SKRect>.Empty);
+        float offset = widths[0] > 0f && widths[0] < targetAdvance
+            ? (targetAdvance - widths[0]) * 0.5f
+            : 0f;
+
+        using var builder = new SKTextBlobBuilder();
+        SKPositionedRunBuffer run = builder.AllocatePositionedRun(skFont, 1);
+        Span<ushort> singleGlyph = [gid];
+        Span<SKPoint> singlePos = [new SKPoint(x + offset, baselineY)];
+        run.SetGlyphs(singleGlyph);
+        run.SetPositions(singlePos);
+        using SKTextBlob? blob = builder.Build();
+        if (blob is not null)
+        {
+            canvas.DrawText(blob, 0f, 0f, paint);
+        }
     }
 
     private static void DrawDecorations(

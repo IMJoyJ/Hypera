@@ -65,7 +65,8 @@ public sealed record ConsoleScene(
     long ActiveButtonGeneration,
     int? HoveredCbgButtonValue = null,
     HtmlButtonContext? HoveredButton = null,
-    long ElapsedAnimationMs = 0);
+    long ElapsedAnimationMs = 0,
+    string? DefaultFontFamily = null);
 
 /// <summary>
 /// Authoritative instance-scoped virtual console buffer tracking logical &amp; wrapped physical lines,
@@ -121,6 +122,7 @@ public sealed class VirtualConsoleBuffer
         CurrentBackColorRgba = backColorRgba;
         FocusColorRgba = focusColorRgba;
         _maxLogLines = Math.Max(1, maxLogLines);
+        _tooltip = new TooltipState(FontFamily: defaultFontFamily);
     }
 
     public LogicalViewport Viewport { get; set; }
@@ -166,7 +168,7 @@ public sealed class VirtualConsoleBuffer
     public TooltipState Tooltip
     {
         get => _tooltip;
-        set => _tooltip = value ?? new TooltipState();
+        set => _tooltip = value ?? new TooltipState(FontFamily: DefaultFontFamily);
     }
 
     /// <summary>
@@ -528,7 +530,8 @@ public sealed class VirtualConsoleBuffer
             ActiveButtonGeneration: _buttonGeneration,
             HoveredCbgButtonValue: hoveredCbgButtonValue,
             HoveredButton: hoveredButton,
-            ElapsedAnimationMs: elapsedAnimationMs);
+            ElapsedAnimationMs: elapsedAnimationMs,
+            DefaultFontFamily: DefaultFontFamily);
     }
 
     private void CommitHtmlLine(string html, bool noWrapOverride)

@@ -48,6 +48,7 @@ public class HyperaSkiaControl : SKControl
     private long _timeoutDeadlineTimestamp;
     private long _lastAnimationRedrawMs;
     private bool _autoSubmitEngineInput = true;
+    private bool _focusOnMouseDown = true;
     private bool _isTicking;
     private bool _faultRaised;
     private bool _completionRaised;
@@ -117,6 +118,28 @@ public class HyperaSkiaControl : SKControl
     {
         get => _autoSubmitEngineInput;
         set => _autoSubmitEngineInput = value;
+    }
+
+    /// <summary>
+    /// When false, mouse clicks on the viewport do not steal keyboard focus from an external input TextBox
+    /// (matching classic Emuera's always-focused input box behavior).
+    /// </summary>
+    [Browsable(false)]
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool FocusOnMouseDown
+    {
+        get => _focusOnMouseDown;
+        set
+        {
+            if (_focusOnMouseDown == value)
+            {
+                return;
+            }
+
+            _focusOnMouseDown = value;
+            SetStyle(ControlStyles.Selectable, value);
+            TabStop = value;
+        }
     }
 
     [Browsable(false)]
@@ -464,7 +487,11 @@ public class HyperaSkiaControl : SKControl
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
-        Focus();
+        if (_focusOnMouseDown)
+        {
+            Focus();
+        }
+
         LogicalPoint pt = MapScreenToLogical(e.X, e.Y, out bool inside);
         LogicalPointerDown?.Invoke(this, new LogicalPointerEventArgs(pt, inside, e.Button));
 

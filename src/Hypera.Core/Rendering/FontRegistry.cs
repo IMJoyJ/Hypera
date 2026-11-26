@@ -24,11 +24,16 @@ public enum FontStyleFlags : byte
 /// </summary>
 public sealed class FontRegistry : IDisposable
 {
+    private static readonly string[] s_defaultFallbackLanguages = ["ja", "zh"];
+
     private readonly record struct StyleCacheKey(string FamilyName, bool Bold, bool Italic);
+    private readonly record struct CharFallbackKey(int CodePoint, bool Bold, bool Italic);
 
     private readonly Dictionary<string, List<SKTypeface>> _customFamilies = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _customTileFamilies = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<StyleCacheKey, SKTypeface> _systemTypefaces = [];
+    private readonly Dictionary<CharFallbackKey, SKTypeface?> _fallbackTypefaces = [];
+    private readonly Dictionary<StyleCacheKey, SKTypeface> _fallbackOwnedByStyle = [];
     private readonly List<SKTypeface> _ownedTypefaces = [];
     private bool _disposed;
 
@@ -436,6 +441,94 @@ public sealed class FontRegistry : IDisposable
     }
 
     /// <summary>
+    /// Resolves a cached system fallback <see cref="SKTypeface"/> that contains a glyph for
+    /// <paramref name="codePoint"/> when the primary typeface lacks it (e.g. non-ASCII Kana/Kanji
+    /// or Unicode symbols rendered with a Latin-only default font). Deduplicates native handles.
+    /// </summary>
+    public SKTypeface? ResolveCharacterFallback(int codePoint, FontStyleFlags style = FontStyleFlags.Regular)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (codePoint < 0x20)
+        {
+            return null;
+        }
+
+        bool wantBold = (style & FontStyleFlags.Bold) != 0;
+        bool wantItalic = (style & FontStyleFlags.Italic) != 0;
+        var cacheKey = new CharFallbackKey(codePoint, wantBold, wantItalic);
+        if (_fallbackTypefaces.TryGetValue(cacheKey, out SKTypeface? cached))
+        {
+            return cached;
+        }
+
+        var fontStyle = new SKFontStyle(
+            wantBold ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal,
+            SKFontStyleWidth.Normal,
+            wantItalic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
+
+        SKTypeface? matched = SKFontManager.Default.MatchCharacter(null, fontStyle, s_defaultFallbackLanguages, codePoint)
+                              ?? SKFontManager.Default.MatchCharacter(null, fontStyle, null, codePoint);
+        if (matched is null)
+        {
+            _fallbackTypefaces[cacheKey] = null;
+            return null;
+        }
+
+        bool hasGlyph;
+        using (var probe = new SKFont(matched, 16f))
+        {
+            hasGlyph = probe.GetGlyph(codePoint) != 0;
+        }
+
+        if (!hasGlyph)
+        {
+            if (!ReferenceEquals(matched, SKTypeface.Default))
+            {
+                matched.Dispose();
+            }
+
+            _fallbackTypefaces[cacheKey] = null;
+            return null;
+        }
+
+        SKTypeface resolved = matched;
+        if (!ReferenceEquals(matched, SKTypeface.Default))
+        {
+            var styleKey = new StyleCacheKey((matched.FamilyName ?? string.Empty).ToUpperInvariant(), matched.IsBold, matched.IsItalic);
+            if (_fallbackOwnedByStyle.TryGetValue(styleKey, out SKTypeface? existing))
+            {
+                bool existingHasGlyph;
+                using (var probeExisting = new SKFont(existing, 16f))
+                {
+                    existingHasGlyph = probeExisting.GetGlyph(codePoint) != 0;
+                }
+
+                if (existingHasGlyph)
+                {
+                    if (!ReferenceEquals(matched, existing))
+                    {
+                        matched.Dispose();
+                    }
+
+                    resolved = existing;
+                }
+                else
+                {
+                    _ownedTypefaces.Add(matched);
+                }
+            }
+            else
+            {
+                _fallbackOwnedByStyle[styleKey] = matched;
+                _ownedTypefaces.Add(matched);
+            }
+        }
+
+        _fallbackTypefaces[cacheKey] = resolved;
+        return resolved;
+    }
+
+    /// <summary>
     /// Creates an <see cref="SKFont"/> configured for either zero-seam crisp tile rendering or smooth anti-aliased typography.
     /// </summary>
     public SKFont CreateFont(
@@ -525,5 +618,7 @@ public sealed class FontRegistry : IDisposable
         _customFamilies.Clear();
         _customTileFamilies.Clear();
         _systemTypefaces.Clear();
+        _fallbackTypefaces.Clear();
+        _fallbackOwnedByStyle.Clear();
     }
 }

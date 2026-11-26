@@ -7,6 +7,7 @@ using Hypera.Persistence;
 using Hypera.Rendering;
 using Hypera.Runtime;
 using Hypera.VirtualFs;
+using SkiaSharp;
 using Xunit;
 
 namespace Hypera.Tests.Hosts;
@@ -878,6 +879,135 @@ public sealed class StandaloneHostTests
         {
             if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
         }
+    }
+
+    [Fact]
+    public void TooltipAndGlyphFallback_DefaultFontAndMissingGlyphFallback_RenderNonAsciiWithoutTofu()
+    {
+        using var fonts = new FontRegistry();
+        using var measurer = new GlyphMeasurer(fonts);
+        using var compositor = new SkiaFrameCompositor(fonts, measurer);
+
+        var viewport = new LogicalViewport(640, 240, 18, 19);
+        var console = new VirtualConsoleBuffer(viewport, measurer, defaultFontFamily: "MS Gothic");
+
+        // 1. Default tooltip inherits the console's configured CJK-capable font family (never null Segoe UI)
+        Assert.Equal("MS Gothic", console.Tooltip.FontFamily);
+
+        // 2. Per-glyph fallback resolves real non-zero glyphs for Kana, Kanji, and ☆ even if primary font is Latin-only
+        int[] sampleCodePoints = ['ア', 'ド', 'ラ', '魔', 0x2606 /* ☆ */];
+        foreach (int cp in sampleCodePoints)
+        {
+            SKTypeface? fb = fonts.ResolveCharacterFallback(cp);
+            Assert.NotNull(fb);
+            using var fbFont = new SKFont(fb!, 16f);
+            Assert.NotEqual((ushort)0, fbFont.GetGlyph(cp));
+        }
+
+        // Deduplication: repeated lookups return the exact same cached SKTypeface instance
+        SKTypeface? kana1 = fonts.ResolveCharacterFallback('ア');
+        SKTypeface? kana2 = fonts.ResolveCharacterFallback('ド');
+        Assert.NotNull(kana1);
+        Assert.Same(kana1, kana2);
+
+        // 3. Tooltip rendering works cleanly both with DefaultFontFamily fallback AND when Tooltip.FontFamily is Latin-only
+        const string tooltipText = "E.R.ARG☆ S-アドラ";
+        console.Tooltip = console.Tooltip with
+        {
+            ActiveText = tooltipText,
+            AnchorX = 20f,
+            AnchorY = 20f,
+            FontFamily = "Segoe UI", // deliberately Latin-only to exercise missing-glyph fallback
+            FontSize = 14,
+        };
+
+        ConsoleScene scene = console.CaptureScene();
+        Assert.Equal("MS Gothic", scene.DefaultFontFamily);
+        Assert.True(measurer.MeasureTextWidth(tooltipText, 14f, "Segoe UI") > 60f);
+
+        using var bitmap = new SKBitmap(640, 240, SKColorType.Bgra8888, SKAlphaType.Premul);
+        using (var canvas = new SKCanvas(bitmap))
+        {
+            compositor.RenderScene(canvas, 640, 240, scene);
+        }
+
+        // Verify dark text pixels were drawn inside the cream tooltip box (anchor +12,+18 => x=32, y=38)
+        int creamPixels = 0;
+        int inkPixels = 0;
+        for (int y = 40; y < 60; y++)
+        {
+            for (int x = 34; x < 180; x++)
+            {
+                SKColor px = bitmap.GetPixel(x, y);
+                if (px.Red > 240 && px.Green > 240 && px.Blue > 200) creamPixels++;
+                else if (px.Red < 80 && px.Green < 80 && px.Blue < 80) inkPixels++;
+            }
+        }
+
+        Assert.True(creamPixels > 200, $"Expected tooltip background fill pixels, found {creamPixels}.");
+        Assert.True(inkPixels > 80, $"Expected rendered non-ASCII tooltip glyph ink pixels, found {inkPixels}.");
+    }
+
+    [Fact]
+    public void HyperaGameHost_LoadFromDirectory_ReportsMonotonicProgressAndHonorsCancellation()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_progress_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                #DIM BIG_TEST_ARR, 128
+                @SYSTEM_TITLE
+                BIG_TEST_ARR:0 = 42
+                QUIT
+                """);
+
+            var reports = new List<GameLoadProgress>();
+            var syncProgress = new SynchronousProgress<GameLoadProgress>(reports.Add);
+
+            using (HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions
+                {
+                    AutoStartSystemFlow = true,
+                    Progress = syncProgress,
+                }))
+            {
+                Assert.Equal(EngineStepStatus.Completed, host.Engine.Step());
+            }
+
+            Assert.True(reports.Count >= 6, $"Expected multiple loading stage checkpoints, got {reports.Count}.");
+            Assert.True(reports[0].Percent > 0);
+            Assert.Equal(100, reports[^1].Percent);
+            for (int i = 1; i < reports.Count; i++)
+            {
+                Assert.True(
+                    reports[i].Percent >= reports[i - 1].Percent,
+                    $"Progress regressed from {reports[i - 1].Percent}% to {reports[i].Percent}%.");
+            }
+
+            using var canceled = new CancellationTokenSource();
+            canceled.Cancel();
+            Assert.Throws<OperationCanceledException>(() =>
+                HyperaGameHost.LoadFromDirectory(
+                    workDir,
+                    new HyperaGameLoadOptions
+                    {
+                        CancellationToken = canceled.Token,
+                    }));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    private sealed class SynchronousProgress<T>(Action<T> handler) : IProgress<T>
+    {
+        public void Report(T value) => handler(value);
     }
 
     private static string LocateProjectBinDirectory(string projectName, string probeFile)

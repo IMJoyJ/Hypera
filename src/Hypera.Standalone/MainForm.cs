@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
@@ -23,6 +24,13 @@ public sealed class MainForm : Form
     private readonly Panel _viewportHostPanel;
     private readonly HyperaSkiaControl _skiaView;
     private readonly VScrollBar _scrollBar;
+    private readonly Panel _loadingOverlayPanel;
+    private readonly Label _loadingTitleLabel;
+    private readonly Label _loadingStageLabel;
+    private readonly SmoothProgressBar _loadingProgressBar;
+    private readonly Label _loadingDetailLabel;
+    private readonly System.Windows.Forms.Timer _loadingAnimTimer;
+    private readonly Stopwatch _loadingStopwatch = new();
     private readonly Panel _inputBarPanel;
     private readonly TextBox _inputTextBox;
     private readonly Label _statusLabel;
@@ -31,6 +39,12 @@ public sealed class MainForm : Form
     private StandaloneGameSession? _session;
     private DebugConsoleForm? _debugConsoleForm;
     private Icon? _customWindowIcon;
+    private CancellationTokenSource? _loadCts;
+    private int _loadGeneration;
+    private bool _isLoading;
+    private bool _isMenuOpen;
+    private int _currentLoadPercent;
+    private string? _currentLoadDetail;
     private int _historyCursor = -1;
     private bool _syncingScrollBar;
     private bool _syncingTextBox;
@@ -138,8 +152,14 @@ public sealed class MainForm : Form
         helpMenu.DropDownItems.Add(aboutItem);
 
         _menuStrip.Items.AddRange([fileMenu, editMenu, viewMenu, debugMenu, helpMenu]);
+        _menuStrip.MenuActivate += (_, _) => _isMenuOpen = true;
+        _menuStrip.MenuDeactivate += (_, _) =>
+        {
+            _isMenuOpen = false;
+            BeginInvoke(FocusInputTextBox);
+        };
 
-        // 2. Center Viewport Panel: Skia canvas + right-edge scrollback bar
+        // 2. Center Viewport Panel: Skia canvas + right-edge scrollback bar + startup loading overlay
         _viewportHostPanel = new Panel
         {
             Dock = DockStyle.Fill,
@@ -154,13 +174,23 @@ public sealed class MainForm : Form
             LargeChange = 10,
             SmallChange = 1,
             Enabled = false,
+            TabStop = false,
         };
         _scrollBar.ValueChanged += OnScrollBarValueChanged;
+        _scrollBar.MouseUp += (_, _) => BeginInvoke(FocusInputTextBox);
+        _scrollBar.Scroll += (_, e) =>
+        {
+            if (e.Type == ScrollEventType.EndScroll)
+            {
+                BeginInvoke(FocusInputTextBox);
+            }
+        };
 
         _skiaView = new HyperaSkiaControl
         {
             Dock = DockStyle.Fill,
             AutoSubmitEngineInput = true,
+            FocusOnMouseDown = false,
             BackColor = Color.Black,
         };
         _skiaView.ScrollbackChanged += (_, _) => SyncScrollBarFromView();
@@ -168,9 +198,99 @@ public sealed class MainForm : Form
         _skiaView.EngineFaulted += OnEngineFaulted;
         _skiaView.EngineRestartRequested += (_, _) => BeginInvoke(RestartCurrentTarget);
         _skiaView.EngineCompleted += (_, _) => BeginInvoke(Close);
+        _skiaView.LogicalPointerUp += (_, _) => FocusInputTextBox();
+
+        // Dark-themed loading overlay displayed immediately while game bytecode/variables load asynchronously
+        _loadingOverlayPanel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Color.FromArgb(10, 12, 16),
+            Visible = false,
+        };
+
+        var loadingCenterGrid = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 3,
+            BackColor = Color.Transparent,
+        };
+        loadingCenterGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        loadingCenterGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 460f));
+        loadingCenterGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        loadingCenterGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+        loadingCenterGrid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        loadingCenterGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+
+        var loadingCard = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(24, 20, 24, 20),
+            BackColor = Color.FromArgb(18, 21, 28),
+        };
+        loadingCard.Paint += (_, pe) =>
+        {
+            using var borderPen = new Pen(Color.FromArgb(46, 54, 70), 1f);
+            pe.Graphics.DrawRectangle(borderPen, 0, 0, loadingCard.Width - 1, loadingCard.Height - 1);
+        };
+
+        _loadingTitleLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            ForeColor = Color.FromArgb(238, 242, 248),
+            BackColor = Color.Transparent,
+            Font = new Font("Segoe UI", 12.5f, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 8),
+            Text = "Loading Hypera...",
+        };
+
+        _loadingStageLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            ForeColor = Color.FromArgb(174, 186, 204),
+            BackColor = Color.Transparent,
+            Font = new Font("Segoe UI", 9.5f, FontStyle.Regular),
+            Margin = new Padding(0, 0, 0, 10),
+            Text = "Preparing runtime...",
+        };
+
+        _loadingProgressBar = new SmoothProgressBar
+        {
+            Dock = DockStyle.Fill,
+            Height = 14,
+            Margin = new Padding(0, 0, 0, 8),
+        };
+
+        _loadingDetailLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            ForeColor = Color.FromArgb(128, 142, 164),
+            BackColor = Color.Transparent,
+            Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
+            Margin = new Padding(0),
+            Text = "0%  •  0.0s",
+        };
+
+        loadingCard.Controls.Add(_loadingTitleLabel, 0, 0);
+        loadingCard.Controls.Add(_loadingStageLabel, 0, 1);
+        loadingCard.Controls.Add(_loadingProgressBar, 0, 2);
+        loadingCard.Controls.Add(_loadingDetailLabel, 0, 3);
+        loadingCenterGrid.Controls.Add(loadingCard, 1, 1);
+        _loadingOverlayPanel.Controls.Add(loadingCenterGrid);
+
+        _loadingAnimTimer = new System.Windows.Forms.Timer { Interval = 33 };
+        _loadingAnimTimer.Tick += OnLoadingAnimTick;
 
         _viewportHostPanel.Controls.Add(_skiaView);
         _viewportHostPanel.Controls.Add(_scrollBar);
+        _viewportHostPanel.Controls.Add(_loadingOverlayPanel);
+        _loadingOverlayPanel.BringToFront();
 
         // 3. Bottom Emuera Input Bar
         _inputBarPanel = new Panel
@@ -180,6 +300,7 @@ public sealed class MainForm : Form
             Padding = new Padding(4, 3, 4, 3),
             BackColor = Color.FromArgb(18, 18, 22),
         };
+        _inputBarPanel.MouseUp += (_, _) => FocusInputTextBox();
 
         _statusLabel = new Label
         {
@@ -192,6 +313,7 @@ public sealed class MainForm : Form
             Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
             Text = "Ready",
         };
+        _statusLabel.MouseUp += (_, _) => FocusInputTextBox();
 
         _inputTextBox = new TextBox
         {
@@ -205,6 +327,7 @@ public sealed class MainForm : Form
         _inputTextBox.KeyDown += OnInputTextBoxKeyDown;
         _inputTextBox.KeyPress += OnInputTextBoxKeyPress;
         _inputTextBox.TextChanged += OnInputTextBoxTextChanged;
+        _inputTextBox.MouseWheel += OnInputTextBoxMouseWheel;
 
         _inputBarPanel.Controls.Add(_inputTextBox);
         _inputBarPanel.Controls.Add(_statusLabel);
@@ -218,7 +341,15 @@ public sealed class MainForm : Form
 
         Load += OnFormLoad;
         Shown += OnFormShown;
-        Activated += (_, _) => { if (_session is not null) _session.Engine.IsWindowActive = true; };
+        Activated += (_, _) =>
+        {
+            if (_session is not null)
+            {
+                _session.Engine.IsWindowActive = true;
+            }
+
+            BeginInvoke(FocusInputTextBox);
+        };
         Deactivate += (_, _) => { if (_session is not null) _session.Engine.IsWindowActive = false; };
         KeyDown += OnGlobalKeyDown;
         KeyUp += OnGlobalKeyUp;
@@ -231,12 +362,14 @@ public sealed class MainForm : Form
     {
         if (_initialOptions.Target.Kind != StandaloneTargetKind.None)
         {
-            LoadTarget(_initialOptions.Target, _initialOptions.IsDebugMode);
+            // Display the loading screen immediately so the window appears on screen without waiting for load I/O
+            ShowLoadingOverlay(_initialOptions.Target);
+            _inputTextBox.Enabled = false;
+            _statusLabel.Text = "Loading...";
         }
         else
         {
             _statusLabel.Text = "No game loaded (Ctrl+O)";
-            PromptOpenInitialGame();
         }
     }
 
@@ -244,6 +377,15 @@ public sealed class MainForm : Form
     {
         UpdateInputBarHeight();
         EnsureClientInsideWorkingArea();
+
+        if (_initialOptions.Target.Kind != StandaloneTargetKind.None)
+        {
+            _ = LoadTargetAsync(_initialOptions.Target, _initialOptions.IsDebugMode);
+        }
+        else
+        {
+            PromptOpenInitialGame();
+        }
     }
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)
@@ -268,12 +410,105 @@ public sealed class MainForm : Form
                 ofd.FileName,
                 explicitSaveDir: null,
                 useOverlay: _initialOptions.UseOverlay);
-            LoadTarget(target, _initialOptions.IsDebugMode);
+            _ = LoadTargetAsync(target, _initialOptions.IsDebugMode);
         }
     }
 
-    private void LoadTarget(StandaloneLaunchTarget target, bool isDebugMode)
+    private void ShowLoadingOverlay(StandaloneLaunchTarget target)
     {
+        string displayName = Path.GetFileName(target.Path);
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            displayName = target.Path;
+        }
+
+        _currentLoadPercent = 0;
+        _currentLoadDetail = displayName;
+        _loadingTitleLabel.Text = $"Loading {displayName}";
+        _loadingStageLabel.Text = "Opening game package...";
+        _loadingProgressBar.Value = 0;
+        _loadingProgressBar.IsAnimating = true;
+        _loadingStopwatch.Restart();
+        RefreshLoadingDetailText();
+
+        Text = $"{displayName} - Loading...";
+        _loadingOverlayPanel.Visible = true;
+        _loadingOverlayPanel.BringToFront();
+        _loadingAnimTimer.Start();
+    }
+
+    private void HideLoadingOverlay()
+    {
+        _loadingAnimTimer.Stop();
+        _loadingStopwatch.Stop();
+        _loadingProgressBar.IsAnimating = false;
+        _loadingOverlayPanel.Visible = false;
+    }
+
+    private void UpdateLoadingProgress(GameLoadProgress report)
+    {
+        _currentLoadPercent = Math.Max(_currentLoadPercent, Math.Clamp(report.Percent, 0, 100));
+        _currentLoadDetail = report.Detail;
+        _loadingStageLabel.Text = report.Stage;
+        _loadingProgressBar.Value = _currentLoadPercent;
+        _statusLabel.Text = $"Loading {_currentLoadPercent}%";
+        RefreshLoadingDetailText();
+    }
+
+    private void OnLoadingAnimTick(object? sender, EventArgs e)
+    {
+        if (!_loadingOverlayPanel.Visible)
+        {
+            return;
+        }
+
+        _loadingProgressBar.AdvanceShimmer();
+        RefreshLoadingDetailText();
+    }
+
+    private void RefreshLoadingDetailText()
+    {
+        string elapsed = string.Create(CultureInfo.InvariantCulture, $"{_loadingStopwatch.Elapsed.TotalSeconds:0.0}s");
+        _loadingDetailLabel.Text = string.IsNullOrWhiteSpace(_currentLoadDetail)
+            ? $"{_currentLoadPercent}%  •  {elapsed}"
+            : $"{_currentLoadPercent}%  •  {_currentLoadDetail}  •  {elapsed}";
+    }
+
+    private void FocusInputTextBox()
+    {
+        if (IsDisposed || !Visible || _isLoading || _isMenuOpen || !_inputTextBox.Enabled || !_inputTextBox.Visible)
+        {
+            return;
+        }
+
+        if (ActiveForm != this)
+        {
+            return;
+        }
+
+        if (!_inputTextBox.Focused)
+        {
+            _inputTextBox.Focus();
+        }
+    }
+
+    private async Task LoadTargetAsync(StandaloneLaunchTarget target, bool isDebugMode)
+    {
+        int loadGeneration = ++_loadGeneration;
+
+        CancellationTokenSource? previousCts = _loadCts;
+        _loadCts = null;
+        if (previousCts is not null)
+        {
+            try { previousCts.Cancel(); } catch { }
+            previousCts.Dispose();
+        }
+
+        var cts = new CancellationTokenSource();
+        _loadCts = cts;
+        CancellationToken ct = cts.Token;
+
+        _isLoading = true;
         _skiaView.StopLoop();
         _skiaView.Engine = null;
 
@@ -281,43 +516,84 @@ public sealed class MainForm : Form
         _session = null;
         previous?.Dispose();
 
-        _statusLabel.Text = "Loading...";
-        Cursor = Cursors.WaitCursor;
-        Application.DoEvents();
+        _inputTextBox.Enabled = false;
+        _statusLabel.Text = "Loading 0%";
+        ShowLoadingOverlay(target);
+
+        var progress = new Progress<GameLoadProgress>(report =>
+        {
+            if (loadGeneration == _loadGeneration && !IsDisposed)
+            {
+                UpdateLoadingProgress(report);
+            }
+        });
 
         try
         {
-            StandaloneGameSession session = StandaloneGameSession.Load(
-                target,
-                isDebugMode: isDebugMode,
-                enableHardwareAudio: true);
+            StandaloneGameSession session = await Task.Run(
+                () => StandaloneGameSession.Load(
+                    target,
+                    isDebugMode: isDebugMode,
+                    enableHardwareAudio: true,
+                    progress: progress,
+                    cancellationToken: ct),
+                ct);
 
+            if (ct.IsCancellationRequested || loadGeneration != _loadGeneration || IsDisposed)
+            {
+                session.Dispose();
+                return;
+            }
+
+            _loadingProgressBar.Value = 100;
             _session = session;
             _debugConsoleForm?.AttachSession(session);
             ApplySessionWindowSettings(session);
 
+            HideLoadingOverlay();
+            _isLoading = false;
+            _inputTextBox.Enabled = true;
+
             _skiaView.Engine = session.Engine;
             _skiaView.StartLoop();
             _inputTextBox.Clear();
-            _inputTextBox.Focus();
             OnEngineContentUpdated();
+            FocusInputTextBox();
+        }
+        catch (OperationCanceledException)
+        {
+            if (loadGeneration == _loadGeneration && !IsDisposed)
+            {
+                HideLoadingOverlay();
+                _isLoading = false;
+                _inputTextBox.Enabled = true;
+                _statusLabel.Text = "Canceled";
+            }
         }
         catch (EmueraCompileException compileEx)
         {
-            string report = StandaloneGameSession.FormatCompileDiagnostics(compileEx);
-            _statusLabel.Text = "Compilation failed";
-            using var dlg = new DiagnosticsDialog("Hypera Compiler Diagnostics", report);
-            dlg.ShowDialog(this);
+            if (loadGeneration == _loadGeneration && !IsDisposed)
+            {
+                HideLoadingOverlay();
+                _isLoading = false;
+                _inputTextBox.Enabled = true;
+                string report = StandaloneGameSession.FormatCompileDiagnostics(compileEx);
+                _statusLabel.Text = "Compilation failed";
+                using var dlg = new DiagnosticsDialog("Hypera Compiler Diagnostics", report);
+                dlg.ShowDialog(this);
+            }
         }
         catch (Exception ex)
         {
-            _statusLabel.Text = "Load failed";
-            using var dlg = new DiagnosticsDialog("Failed to Load Game", ex.ToString());
-            dlg.ShowDialog(this);
-        }
-        finally
-        {
-            Cursor = Cursors.Default;
+            if (loadGeneration == _loadGeneration && !IsDisposed)
+            {
+                HideLoadingOverlay();
+                _isLoading = false;
+                _inputTextBox.Enabled = true;
+                _statusLabel.Text = "Load failed";
+                using var dlg = new DiagnosticsDialog("Failed to Load Game", ex.ToString());
+                dlg.ShowDialog(this);
+            }
         }
     }
 
@@ -515,7 +791,7 @@ public sealed class MainForm : Form
             return;
         }
 
-        LoadTarget(_session.Target, _initialOptions.IsDebugMode);
+        _ = LoadTargetAsync(_session.Target, _initialOptions.IsDebugMode);
     }
 
     private void OnEngineContentUpdated()
@@ -641,6 +917,26 @@ public sealed class MainForm : Form
         }
 
         _session.Engine.TextBoxText = _inputTextBox.Text;
+    }
+
+    private void OnInputTextBoxMouseWheel(object? sender, MouseEventArgs e)
+    {
+        if (_session is null || _isLoading)
+        {
+            return;
+        }
+
+        int linesPerNotch = Math.Max(1, _session.Engine.Options.ScrollHeight);
+        int deltaLines = (e.Delta / 120) * linesPerNotch;
+        if (deltaLines != 0)
+        {
+            _skiaView.ScrollBy(deltaLines);
+        }
+
+        if (e is HandledMouseEventArgs handled)
+        {
+            handled.Handled = true;
+        }
     }
 
     private void OnInputTextBoxKeyDown(object? sender, KeyEventArgs e)
@@ -808,7 +1104,7 @@ public sealed class MainForm : Form
                 fbd.SelectedPath,
                 explicitSaveDir: null,
                 useOverlay: _initialOptions.UseOverlay);
-            LoadTarget(target, _initialOptions.IsDebugMode);
+            _ = LoadTargetAsync(target, _initialOptions.IsDebugMode);
         }
     }
 
@@ -961,7 +1257,7 @@ public sealed class MainForm : Form
                     paths[0],
                     explicitSaveDir: null,
                     useOverlay: _initialOptions.UseOverlay);
-                LoadTarget(target, _initialOptions.IsDebugMode);
+                _ = LoadTargetAsync(target, _initialOptions.IsDebugMode);
             }
             catch (Exception ex)
             {
@@ -972,6 +1268,18 @@ public sealed class MainForm : Form
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
+        _loadGeneration++;
+        CancellationTokenSource? cts = _loadCts;
+        _loadCts = null;
+        if (cts is not null)
+        {
+            try { cts.Cancel(); } catch { }
+            cts.Dispose();
+        }
+
+        _loadingAnimTimer.Stop();
+        _loadingAnimTimer.Dispose();
+
         _skiaView.StopLoop();
         _skiaView.Engine = null;
         if (_debugConsoleForm is not null && !_debugConsoleForm.IsDisposed)
@@ -985,5 +1293,122 @@ public sealed class MainForm : Form
         _session = null;
         _customWindowIcon?.Dispose();
         _customWindowIcon = null;
+    }
+
+    /// <summary>
+    /// Flicker-free dark-mode progress bar with immediate zero-lag updates and a subtle activity shimmer.
+    /// </summary>
+    private sealed class SmoothProgressBar : Control
+    {
+        private int _value;
+        private bool _isAnimating;
+        private float _shimmerPhase;
+
+        public SmoothProgressBar()
+        {
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.UserPaint |
+                ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.ResizeRedraw,
+                true);
+            SetStyle(ControlStyles.Selectable, false);
+            TabStop = false;
+        }
+
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public int Value
+        {
+            get => _value;
+            set
+            {
+                int clamped = Math.Clamp(value, 0, 100);
+                if (_value != clamped)
+                {
+                    _value = clamped;
+                    Invalidate();
+                }
+            }
+        }
+
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsAnimating
+        {
+            get => _isAnimating;
+            set
+            {
+                if (_isAnimating != value)
+                {
+                    _isAnimating = value;
+                    _shimmerPhase = 0f;
+                    Invalidate();
+                }
+            }
+        }
+
+        public void AdvanceShimmer()
+        {
+            if (!_isAnimating)
+            {
+                return;
+            }
+
+            _shimmerPhase += 0.032f;
+            if (_shimmerPhase > 1.35f)
+            {
+                _shimmerPhase = -0.35f;
+            }
+
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            int w = ClientSize.Width;
+            int h = ClientSize.Height;
+            if (w <= 2 || h <= 2)
+            {
+                return;
+            }
+
+            using (var trackBrush = new SolidBrush(Color.FromArgb(26, 30, 40)))
+            {
+                g.FillRectangle(trackBrush, 0, 0, w, h);
+            }
+
+            int innerW = w - 2;
+            int innerH = h - 2;
+            int fillW = (int)Math.Round(innerW * (_value / 100.0));
+            if (fillW > 0)
+            {
+                var fillRect = new Rectangle(1, 1, fillW, innerH);
+                using var fillBrush = new System.Drawing.Drawing2D.LinearGradientBrush(
+                    new Rectangle(1, 1, Math.Max(1, innerW), Math.Max(1, innerH)),
+                    Color.FromArgb(46, 114, 232),
+                    Color.FromArgb(92, 168, 255),
+                    0f);
+                g.FillRectangle(fillBrush, fillRect);
+            }
+
+            if (_isAnimating && _value < 100)
+            {
+                int bandW = Math.Max(48, innerW / 4);
+                int bandX = 1 + (int)Math.Round(_shimmerPhase * innerW) - (bandW / 2);
+                Rectangle clip = new(1, 1, innerW, innerH);
+                g.SetClip(clip);
+                using var shimmerBrush = new System.Drawing.Drawing2D.LinearGradientBrush(
+                    new Rectangle(bandX, 1, bandW, innerH),
+                    Color.FromArgb(0, 148, 206, 255),
+                    Color.FromArgb(72, 196, 230, 255),
+                    0f);
+                shimmerBrush.SetSigmaBellShape(0.5f, 1f);
+                g.FillRectangle(shimmerBrush, bandX, 1, bandW, innerH);
+                g.ResetClip();
+            }
+
+            using var borderPen = new Pen(Color.FromArgb(52, 62, 80), 1f);
+            g.DrawRectangle(borderPen, 0, 0, w - 1, h - 1);
+        }
     }
 }

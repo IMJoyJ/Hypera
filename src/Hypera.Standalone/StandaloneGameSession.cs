@@ -54,13 +54,19 @@ public sealed class StandaloneGameSession : IDisposable
     public static StandaloneGameSession Load(
         StandaloneLaunchTarget target,
         bool isDebugMode,
-        bool enableHardwareAudio)
+        bool enableHardwareAudio,
+        IProgress<GameLoadProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(target);
         if (target.Kind == StandaloneTargetKind.None)
         {
             throw new InvalidOperationException("No game target was specified or discovered.");
         }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        string targetName = Path.GetFileName(target.Path);
+        progress?.Report(new GameLoadProgress(2, "Opening game package...", string.IsNullOrEmpty(targetName) ? target.Path : targetName));
 
         var sw = Stopwatch.StartNew();
         var owned = new List<IDisposable>();
@@ -85,6 +91,7 @@ public sealed class StandaloneGameSession : IDisposable
                     }
                     else if (trailer.PayloadKind == BundlePayloadKind.Heb)
                     {
+                        progress?.Report(new GameLoadProgress(15, "Loading embedded bytecode...", targetName));
                         using Stream subStream = SingleFileBundleCodec.OpenPayloadStream(target.Path, trailer);
                         preloadedModule = BytecodeSerializer.Deserialize(subStream);
                         string dir = Path.GetDirectoryName(target.Path) ?? target.SaveDirectory;
@@ -114,6 +121,7 @@ public sealed class StandaloneGameSession : IDisposable
 
                 case StandaloneTargetKind.HebBytecode:
                 {
+                    progress?.Report(new GameLoadProgress(15, "Loading precompiled bytecode...", targetName));
                     using (var fs = new FileStream(target.Path, FileMode.Open, FileAccess.Read, FileShare.Read))
                     {
                         preloadedModule = BytecodeSerializer.Deserialize(fs);
@@ -135,6 +143,7 @@ public sealed class StandaloneGameSession : IDisposable
             }
 
             owned.Add(vfs);
+            cancellationToken.ThrowIfCancellationRequested();
 
             var audioMixer = new CrossPlatformAudioMixer(vfs, sampleRate: 48_000);
             owned.Add(audioMixer);
@@ -146,6 +155,8 @@ public sealed class StandaloneGameSession : IDisposable
                 UsePrebuiltBytecode = true,
                 AutoStartSystemFlow = true,
                 IsDebugMode = isDebugMode,
+                Progress = progress,
+                CancellationToken = cancellationToken,
             };
 
             HyperaGameHost host = HyperaGameHost.LoadFromVfs(
@@ -154,6 +165,7 @@ public sealed class StandaloneGameSession : IDisposable
                 options: loadOptions,
                 preloadedModule: preloadedModule);
             owned.Add(host);
+            cancellationToken.ThrowIfCancellationRequested();
 
             // Always capture DEBUGPRINT* entries for the standalone Debug Console even when emuera.config sets UseDebugCommand=NO
             host.Engine.AlwaysCaptureDebugPrint = true;

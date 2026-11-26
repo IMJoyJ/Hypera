@@ -279,7 +279,7 @@ public sealed class SkiaFrameCompositor : IDisposable
         // 5. Tooltip (always on top)
         if (!string.IsNullOrEmpty(scene.Tooltip.ActiveText))
         {
-            DrawTooltip(canvas, scene.Tooltip, scene.Viewport);
+            DrawTooltip(canvas, scene.Tooltip, scene.Viewport, scene.DefaultFontFamily);
         }
 
         canvas.Restore();
@@ -564,18 +564,23 @@ public sealed class SkiaFrameCompositor : IDisposable
         }
     }
 
-    private void DrawTooltip(SKCanvas canvas, TooltipState tooltip, LogicalViewport viewport)
+    private void DrawTooltip(SKCanvas canvas, TooltipState tooltip, LogicalViewport viewport, string? defaultFontFamily)
     {
         string text = tooltip.ActiveText!;
         string[] lines = text.Replace("\r\n", "\n").Split('\n');
         int fontSize = Math.Max(8, tooltip.FontSize);
+        string? fontFamily = !string.IsNullOrWhiteSpace(tooltip.FontFamily)
+            ? tooltip.FontFamily
+            : !string.IsNullOrWhiteSpace(defaultFontFamily)
+                ? defaultFontFamily
+                : null;
         float pad = 4f;
         float lineH = fontSize + 2f;
 
         float maxW = 0f;
         foreach (string line in lines)
         {
-            maxW = MathF.Max(maxW, _glyphMeasurer.MeasureTextWidth(line, fontSize, tooltip.FontFamily));
+            maxW = MathF.Max(maxW, _glyphMeasurer.MeasureTextWidth(line, fontSize, fontFamily));
         }
 
         float boxW = maxW + (pad * 2f);
@@ -602,7 +607,7 @@ public sealed class SkiaFrameCompositor : IDisposable
         float ty = y + pad;
         foreach (string line in lines)
         {
-            _glyphMeasurer.DrawText(canvas, line, x + pad, ty, fontSize, tooltip.FontFamily, FontStyleFlags.Regular, textColor);
+            _glyphMeasurer.DrawText(canvas, line, x + pad, ty, fontSize, fontFamily, FontStyleFlags.Regular, textColor);
             ty += lineH;
         }
     }
