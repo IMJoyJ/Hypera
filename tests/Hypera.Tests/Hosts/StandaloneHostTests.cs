@@ -944,11 +944,12 @@ public sealed class StandaloneHostTests
             Assert.DoesNotContain(scene1.VisibleLines, static l => l.PlainText.Contains("Progress 50%", StringComparison.Ordinal));
 
             // Suffix bracket buttons ("移動[400]", "外出する[460]") and PRINTC ("オプション[810]") must cover full label!
+            // Matches Emuera.NET ButtonStringCreator: suffix-mode buttons on a shared line include their leading padding.
             List<ConsoleRenderPart> line0Btns = scene1.VisibleLines[0].Parts.Where(static p => p.Button is { IsButton: true }).ToList();
             Assert.Equal(2, line0Btns.Count);
-            Assert.Equal("移動[400]", line0Btns[0].Text);
+            Assert.Equal("移動[400]", line0Btns[0].Text.Trim());
             Assert.Equal(400L, line0Btns[0].Button!.IntValue);
-            Assert.Equal("外出する[460]", line0Btns[1].Text);
+            Assert.Equal("外出する[460]", line0Btns[1].Text.Trim());
             Assert.Equal(460L, line0Btns[1].Button!.IntValue);
 
             List<ConsoleRenderPart> line1Btns = scene1.VisibleLines[1].Parts.Where(static p => p.Button is { IsButton: true }).ToList();
@@ -963,6 +964,107 @@ public sealed class StandaloneHostTests
             ConsoleRenderPart pendingBtn2 = scene2.VisibleLines[2].Parts.Single(static p => p.Button is { IsButton: true });
             Assert.True(ReferenceEquals(pendingBtn1.Button, pendingBtn2.Button),
                 "Pending line HtmlButtonContext should keep reference identity across repaints so hover never drops.");
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void PrintStringBuffer_FullLineAutoButtonAcrossMultiplePrintFormsStylesAndMixedHtml()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_emuera_btn_creator_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                ; Line 0: eraOCG2 card list pattern (multiple PRINTFORM calls + SETCOLOR -> single full-line button 0)
+                PRINTFORM %"山札",6,RIGHT%
+                PRINTFORM [{0,4}] 
+                SETCOLOR 0xFFCC66
+                PRINTFORM Live☆Twin キスキル
+                SETCOLOR 0xFF4444
+                PRINTFORM  / (★ 2) / (攻:   500/守:     0)
+                RESETCOLOR
+                PRINTL
+                ; Line 1: eraOCG2 abbreviated mode (PRINTFORM run flushed before HTML_PRINT ...,1 explicit button)
+                PRINTFORM %"山札",6,RIGHT%
+                PRINTFORM [{5,4}] 
+                HTML_PRINT "<button value='5' title='CardTooltip'>Live☆Twin リィラ</button>", 1
+                PRINTL
+                ; Line 2: Mixed mode with 2+ spaces separating buttons
+                PRINTFORML Label [10] First  Label [20] Second
+                ; Line 3: Nested/unmatched brackets stay plain text (exact Emuera ButtonStringCreator.lex rule)
+                PRINTFORML Broken [[30]] and ][40]
+                ; Line 4: Unflushed pending line with [99] before BINPUT must still register button 99
+                PRINTFORM Pending [99] Choice
+                BINPUT
+                A:0 = RESULT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+
+            Assert.Equal(EngineStepStatus.WaitingInput, host.Engine.Step());
+            ConsoleScene scene = host.Engine.ConsoleBuffer.CaptureScene();
+            float[] lineTops = ConsoleHitTester.ComputeVisibleLineTops(scene);
+
+            // Line 0: EVERY styled part on the entire row shares ONE HtmlButtonContext with IntValue == 0!
+            ConsoleLine row0 = scene.VisibleLines[0];
+            Assert.True(row0.Parts.Count >= 3, $"Expected multiple styled parts on row 0, got {row0.Parts.Count}");
+            HtmlButtonContext? sharedBtn = row0.Parts[0].Button;
+            Assert.NotNull(sharedBtn);
+            Assert.True(sharedBtn!.IsButton);
+            Assert.Equal(0L, sharedBtn.IntValue);
+            foreach (ConsoleRenderPart part in row0.Parts)
+            {
+                Assert.True(ReferenceEquals(sharedBtn, part.Button),
+                    $"Part '{part.Text}' should share the exact same full-line HtmlButtonContext.");
+            }
+
+            // Hit-testing far right on the ATK/DEF text hits button 0!
+            ConsoleRenderPart lastPart = row0.Parts[^1];
+            ConsoleHitTestResult hitRight = ConsoleHitTester.HitTestLogicalPoint(
+                scene,
+                lastPart.X + (lastPart.Width * 0.5f),
+                lineTops[0] + (lastPart.Height * 0.5f),
+                host.Engine.Graphics,
+                host.Engine.Sprites);
+            Assert.True(hitRight.HasActiveButton);
+            Assert.Equal(0L, hitRight.ActiveButton!.IntValue);
+            Assert.True(ReferenceEquals(sharedBtn, hitRight.ActiveButton));
+
+            // Line 1: Prefix run ("  山札[   5] ") flushed as button 5, followed by HTML button 5 with CardTooltip!
+            ConsoleLine row1 = scene.VisibleLines[1];
+            List<ConsoleRenderPart> row1Btns = row1.Parts.Where(static p => p.Button is { IsButton: true }).ToList();
+            Assert.Equal(2, row1Btns.Count);
+            Assert.Equal(5L, row1Btns[0].Button!.IntValue);
+            Assert.Contains("山札", row1Btns[0].Text, StringComparison.Ordinal);
+            Assert.Equal(5L, row1Btns[1].Button!.IntValue);
+            Assert.Equal("CardTooltip", row1Btns[1].Button!.Title);
+
+            // Line 2: Mixed mode splits on 2+ spaces into two separate buttons 10 and 20
+            ConsoleLine row2 = scene.VisibleLines[2];
+            List<ConsoleRenderPart> row2Btns = row2.Parts.Where(static p => p.Button is { IsButton: true }).ToList();
+            Assert.Equal(2, row2Btns.Count);
+            Assert.Equal(10L, row2Btns[0].Button!.IntValue);
+            Assert.Equal(20L, row2Btns[1].Button!.IntValue);
+
+            // Line 3: Nested/unmatched brackets produce zero buttons
+            ConsoleLine row3 = scene.VisibleLines[3];
+            Assert.DoesNotContain(row3.Parts, static p => p.Button is { IsButton: true });
+
+            // Line 4: Pending unflushed "[99]" button is accepted by BINPUT!
+            host.Engine.SubmitInput(new InputResponse(host.Engine.PendingInputRequest!.GenerationId, IntValue: 99));
+            Assert.Equal(EngineStepStatus.Completed, host.Engine.Step());
+            Assert.Equal(99L, host.Engine.FastVariables!.GetInt("A", 0));
         }
         finally
         {

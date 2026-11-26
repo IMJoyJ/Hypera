@@ -80,8 +80,16 @@ public sealed class VirtualConsoleBuffer
     private readonly List<CbgLayer> _cbgLayers = [];
     private readonly List<HtmlIslandLayer> _islandLayers = [];
     private readonly StringBuilder _pendingHtmlBuffer = new();
+    private readonly List<PendingStyledRun> _pendingStyledRuns = [];
     private readonly GlyphMeasurer _measurer;
     private readonly SpriteRegistry? _sprites;
+
+    private readonly record struct PendingStyledRun(
+        string Text,
+        string FontFamily,
+        uint ForeColorRgba,
+        uint FocusColorRgba,
+        FontStyleFlags FontStyle);
 
     private long _nextLogicalLineId = 1;
     private long _buttonGeneration = 1;
@@ -142,8 +150,9 @@ public sealed class VirtualConsoleBuffer
     public long ButtonGeneration => _buttonGeneration;
     public IReadOnlyList<ConsoleLine> PhysicalLines => _physicalLines;
     public int PhysicalLineCount => _physicalLines.Count;
-    public bool HasPendingLine => _pendingHtmlBuffer.Length > 0;
+    public bool HasPendingLine => _pendingHtmlBuffer.Length > 0 || _pendingStyledRuns.Count > 0;
     public bool LastOutputWasInPlaceReplacement { get; private set; }
+    public Action<string, long>? AutoButtonDetected { get; set; }
     internal string LastCommittedPlainText => _physicalLines.Count > 0 ? _physicalLines[^1].PlainText : string.Empty;
     public int ScrollOffsetLines
     {
@@ -161,7 +170,7 @@ public sealed class VirtualConsoleBuffer
                 Viewport.LineHeight,
                 SamplingMode);
             int visibleCapacity = Math.Max(1, Viewport.LogicalHeight / effLineH);
-            int total = _physicalLines.Count + (_pendingHtmlBuffer.Length > 0 ? 1 : 0);
+            int total = _physicalLines.Count + (HasPendingLine ? 1 : 0);
             return Math.Max(0, total - visibleCapacity);
         }
     }
@@ -187,8 +196,63 @@ public sealed class VirtualConsoleBuffer
             return;
         }
 
+        int nl = text.IndexOf('\n');
+        if (nl >= 0)
+        {
+            int start = 0;
+            while (nl >= 0)
+            {
+                if (nl > start)
+                {
+                    AppendPendingRun(text[start..nl], useDefaultColor);
+                }
+
+                NewLine();
+                start = nl + 1;
+                nl = start < text.Length ? text.IndexOf('\n', start) : -1;
+            }
+
+            if (start < text.Length)
+            {
+                AppendPendingRun(text[start..], useDefaultColor);
+            }
+
+            return;
+        }
+
+        AppendPendingRun(text, useDefaultColor);
+    }
+
+    /// <summary>
+    /// Appends plain text that never participates in automatic <c>[N]</c> bracket-button recognition
+    /// (mirrors Emuera's <c>PrintStringBuffer.AppendPlainText</c> for <c>PRINTPLAIN</c> / <c>DRAWLINE</c>).
+    /// </summary>
+    public void PrintPlain(string text, bool useDefaultColor = false)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        FlushPendingRunsToHtml();
         string escaped = HtmlPrintEngine.Escape(text);
         AppendStyledPendingFragment(escaped, useDefaultColor ? DefaultForeColorRgba : CurrentForeColorRgba);
+    }
+
+    /// <summary>
+    /// Appends an isolated auto-button cell (mirrors Emuera's <c>PrintStringBuffer.Append(..., force_button: true)</c>
+    /// used by <c>PRINTC</c> / <c>PRINTLC</c>), flushing buffered runs before and after so adjacent cells stay separate.
+    /// </summary>
+    public void PrintAutoButtonCell(string text, bool useDefaultColor = false)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        FlushPendingRunsToHtml();
+        AppendPendingRun(text, useDefaultColor);
+        FlushPendingRunsToHtml();
     }
 
     public void PrintLine(string text = "", bool useDefaultColor = false)
@@ -203,6 +267,7 @@ public sealed class VirtualConsoleBuffer
 
     public void PrintButton(string caption, string value, string? title = null, bool useDefaultColor = false)
     {
+        FlushPendingRunsToHtml();
         string escapedVal = HtmlPrintEngine.Escape(value);
         string escapedCap = HtmlPrintEngine.Escape(caption);
         string titleAttr = title is not null ? $" title='{HtmlPrintEngine.Escape(title)}'" : string.Empty;
@@ -210,8 +275,17 @@ public sealed class VirtualConsoleBuffer
         AppendStyledPendingFragment(fragment, useDefaultColor ? DefaultForeColorRgba : CurrentForeColorRgba);
     }
 
+    public void FlushPendingAutoButtons()
+    {
+        if (_pendingStyledRuns.Count > 0)
+        {
+            FlushPendingRunsToHtml();
+        }
+    }
+
     public void NewLine()
     {
+        FlushPendingRunsToHtml();
         string html = _pendingHtmlBuffer.ToString();
         _pendingHtmlBuffer.Clear();
         InvalidatePendingCache();
@@ -220,7 +294,7 @@ public sealed class VirtualConsoleBuffer
 
     /// <summary>
     /// Implements HTML_PRINT: when <paramref name="noNewLine"/> is true (<c>HTML_PRINT str, 1</c>),
-    /// appends <paramref name="html"/> to the pending line buffer without committing a newline;
+    /// flushes any buffered auto-button text run first and appends <paramref name="html"/> to the pending line buffer;
     /// otherwise flushes any pending partial line and commits an HTML logical line.
     /// </summary>
     public void HtmlPrint(string html, bool noWrap = false, bool noNewLine = false)
@@ -229,6 +303,7 @@ public sealed class VirtualConsoleBuffer
         {
             if (!string.IsNullOrEmpty(html))
             {
+                FlushPendingRunsToHtml();
                 _pendingHtmlBuffer.Append(html);
                 InvalidatePendingCache();
             }
@@ -236,7 +311,7 @@ public sealed class VirtualConsoleBuffer
             return;
         }
 
-        if (_pendingHtmlBuffer.Length > 0)
+        if (HasPendingLine)
         {
             NewLine();
         }
@@ -249,6 +324,7 @@ public sealed class VirtualConsoleBuffer
     /// </summary>
     public string HtmlPopPrintingStr()
     {
+        FlushPendingRunsToHtml();
         string pending = _pendingHtmlBuffer.ToString();
         _pendingHtmlBuffer.Clear();
         InvalidatePendingCache();
@@ -304,15 +380,26 @@ public sealed class VirtualConsoleBuffer
 
     public IReadOnlyList<string> GetAllPlainTextLines()
     {
-        var list = new List<string>(_physicalLines.Count + (_pendingHtmlBuffer.Length > 0 ? 1 : 0));
+        var list = new List<string>(_physicalLines.Count + (HasPendingLine ? 1 : 0));
         for (int i = 0; i < _physicalLines.Count; i++)
         {
             list.Add(_physicalLines[i].PlainText);
         }
 
-        if (_pendingHtmlBuffer.Length > 0)
+        if (HasPendingLine)
         {
-            list.Add(HtmlPrintEngine.ToPlainText(_pendingHtmlBuffer.ToString()));
+            var sb = new StringBuilder();
+            if (_pendingHtmlBuffer.Length > 0)
+            {
+                sb.Append(HtmlPrintEngine.ToPlainText(_pendingHtmlBuffer.ToString()));
+            }
+
+            for (int i = 0; i < _pendingStyledRuns.Count; i++)
+            {
+                sb.Append(_pendingStyledRuns[i].Text);
+            }
+
+            list.Add(sb.ToString());
         }
 
         return list;
@@ -331,6 +418,7 @@ public sealed class VirtualConsoleBuffer
 
         // Discard unflushed pending buffer if clearing.
         _pendingHtmlBuffer.Clear();
+        _pendingStyledRuns.Clear();
         InvalidatePendingCache();
 
         int remainingLogicalToDelete = logicalLineCount;
@@ -386,6 +474,7 @@ public sealed class VirtualConsoleBuffer
     {
         _physicalLines.Clear();
         _pendingHtmlBuffer.Clear();
+        _pendingStyledRuns.Clear();
         InvalidatePendingCache();
         _logicalLineCount = 0;
         _totalPhysicalLineNo = 0;
@@ -566,6 +655,189 @@ public sealed class VirtualConsoleBuffer
         TrimLogIfNeeded();
     }
 
+    private void AppendPendingRun(string text, bool useDefaultColor)
+    {
+        uint color = useDefaultColor ? DefaultForeColorRgba : CurrentForeColorRgba;
+        string font = CurrentFontFamily;
+        uint focus = FocusColorRgba;
+        FontStyleFlags style = FontStyle;
+
+        if (_pendingStyledRuns.Count > 0)
+        {
+            PendingStyledRun last = _pendingStyledRuns[^1];
+            if (last.ForeColorRgba == color &&
+                last.FocusColorRgba == focus &&
+                last.FontStyle == style &&
+                string.Equals(last.FontFamily, font, StringComparison.Ordinal))
+            {
+                _pendingStyledRuns[^1] = last with { Text = last.Text + text };
+                InvalidatePendingCache();
+                return;
+            }
+        }
+
+        _pendingStyledRuns.Add(new PendingStyledRun(text, font, color, focus, style));
+        InvalidatePendingCache();
+    }
+
+    private void FlushPendingRunsToHtml()
+    {
+        if (_pendingStyledRuns.Count == 0)
+        {
+            return;
+        }
+
+        RenderRunsToHtmlBuffer(_pendingStyledRuns, _pendingHtmlBuffer, AutoButtonDetected);
+        _pendingStyledRuns.Clear();
+        InvalidatePendingCache();
+    }
+
+    private static void RenderRunsToHtmlBuffer(
+        List<PendingStyledRun> runs,
+        StringBuilder target,
+        Action<string, long>? onAutoButton)
+    {
+        if (runs.Count == 0)
+        {
+            return;
+        }
+
+        string combined;
+        if (runs.Count == 1)
+        {
+            combined = runs[0].Text;
+        }
+        else
+        {
+            int totalLen = 0;
+            for (int i = 0; i < runs.Count; i++)
+            {
+                totalLen += runs[i].Text.Length;
+            }
+
+            var sb = new StringBuilder(totalLen);
+            for (int i = 0; i < runs.Count; i++)
+            {
+                sb.Append(runs[i].Text);
+            }
+
+            combined = sb.ToString();
+        }
+
+        List<ButtonPrimitive> primitives = ButtonStringCreator.SplitButton(combined);
+        if (primitives.Count == 1)
+        {
+            ButtonPrimitive only = primitives[0];
+            if (only.CanSelect)
+            {
+                target.Append("<button value='").Append(only.Input).Append("'>");
+                for (int i = 0; i < runs.Count; i++)
+                {
+                    AppendStyledRunHtml(target, runs[i], runs[i].Text);
+                }
+
+                target.Append("</button>");
+                onAutoButton?.Invoke(only.Text, only.Input);
+            }
+            else
+            {
+                for (int i = 0; i < runs.Count; i++)
+                {
+                    AppendStyledRunHtml(target, runs[i], runs[i].Text);
+                }
+            }
+
+            return;
+        }
+
+        // Multiple segments (exact replica of Emuera PrintStringBuffer.createButtons slicing across styled runs)
+        int runIdx = 0;
+        int runCharOffset = 0;
+        for (int p = 0; p < primitives.Count; p++)
+        {
+            ButtonPrimitive prim = primitives[p];
+            int remaining = prim.Text.Length;
+            if (remaining <= 0)
+            {
+                continue;
+            }
+
+            if (prim.CanSelect)
+            {
+                target.Append("<button value='").Append(prim.Input).Append("'>");
+            }
+
+            while (remaining > 0 && runIdx < runs.Count)
+            {
+                PendingStyledRun run = runs[runIdx];
+                int avail = run.Text.Length - runCharOffset;
+                if (avail <= 0)
+                {
+                    runIdx++;
+                    runCharOffset = 0;
+                    continue;
+                }
+
+                int take = Math.Min(remaining, avail);
+                string slice = (runCharOffset == 0 && take == run.Text.Length)
+                    ? run.Text
+                    : run.Text.Substring(runCharOffset, take);
+                AppendStyledRunHtml(target, run, slice);
+
+                remaining -= take;
+                runCharOffset += take;
+                if (runCharOffset >= run.Text.Length)
+                {
+                    runIdx++;
+                    runCharOffset = 0;
+                }
+            }
+
+            if (prim.CanSelect)
+            {
+                target.Append("</button>");
+                onAutoButton?.Invoke(prim.Text, prim.Input);
+            }
+        }
+    }
+
+    private static void AppendStyledRunHtml(StringBuilder target, PendingStyledRun run, string rawText)
+    {
+        if (string.IsNullOrEmpty(rawText))
+        {
+            return;
+        }
+
+        string colorHex = RenderingColor.ToHtmlHex(run.ForeColorRgba);
+        string focusHex = RenderingColor.ToHtmlHex(run.FocusColorRgba);
+        string escaped = HtmlPrintEngine.Escape(rawText);
+
+        bool bold = (run.FontStyle & FontStyleFlags.Bold) != 0;
+        bool italic = (run.FontStyle & FontStyleFlags.Italic) != 0;
+        bool underline = (run.FontStyle & FontStyleFlags.Underline) != 0;
+        bool strikeout = (run.FontStyle & FontStyleFlags.Strikeout) != 0;
+
+        if (strikeout) target.Append("<s>");
+        if (underline) target.Append("<u>");
+        if (italic) target.Append("<i>");
+        if (bold) target.Append("<b>");
+
+        target.Append("<font");
+        if (!string.IsNullOrEmpty(run.FontFamily))
+        {
+            target.Append(" face='").Append(HtmlPrintEngine.Escape(run.FontFamily)).Append('\'');
+        }
+
+        target.Append(" color='").Append(colorHex).Append("' bcolor='").Append(focusHex).Append("'>");
+        target.Append(escaped);
+        target.Append("</font>");
+
+        if (bold) target.Append("</b>");
+        if (italic) target.Append("</i>");
+        if (underline) target.Append("</u>");
+        if (strikeout) target.Append("</s>");
+    }
+
     private void AppendStyledPendingFragment(string innerHtml, uint colorRgba)
     {
         string colorHex = RenderingColor.ToHtmlHex(colorRgba);
@@ -586,7 +858,7 @@ public sealed class VirtualConsoleBuffer
 
     private ConsoleLine? GetOrBuildPendingLine()
     {
-        if (_pendingHtmlBuffer.Length == 0)
+        if (!HasPendingLine)
         {
             return null;
         }
@@ -601,8 +873,21 @@ public sealed class VirtualConsoleBuffer
             return _cachedPendingLine;
         }
 
+        string pendingHtml;
+        if (_pendingStyledRuns.Count == 0)
+        {
+            pendingHtml = _pendingHtmlBuffer.ToString();
+        }
+        else
+        {
+            var preview = new StringBuilder(_pendingHtmlBuffer.Length + 64);
+            preview.Append(_pendingHtmlBuffer);
+            RenderRunsToHtmlBuffer(_pendingStyledRuns, preview, onAutoButton: null);
+            pendingHtml = preview.ToString();
+        }
+
         IReadOnlyList<ConsoleLine> parsedPending = HtmlPrintEngine.ParseToLines(
-            _pendingHtmlBuffer.ToString(),
+            pendingHtml,
             logicalLineId: _nextLogicalLineId,
             maxWidth: Viewport.LogicalWidth,
             buttonGeneration: _buttonGeneration,

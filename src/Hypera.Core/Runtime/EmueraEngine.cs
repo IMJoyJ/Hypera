@@ -141,6 +141,7 @@ public sealed partial class EmueraEngine : IDisposable
             Options.BackColorRgba,
             Options.FocusColorRgba,
             Options.MaxLog);
+        ConsoleBuffer.AutoButtonDetected = (caption, intValue) => RegisterButtonDescriptor(caption, isInt: true, intValue);
         SystemFlow = new SystemFlowController(this);
 
         _functionsByName = module.GetEngineFunctionNameMap();
@@ -1413,8 +1414,11 @@ public sealed partial class EmueraEngine : IDisposable
         ConsoleBuffer.AdvanceButtonGeneration();
     }
 
-    private IReadOnlyList<ButtonDescriptor> SnapshotActiveButtonsForGeneration() =>
-        _currentCycleButtons.Count == 0 ? [] : [.. _currentCycleButtons];
+    private IReadOnlyList<ButtonDescriptor> SnapshotActiveButtonsForGeneration()
+    {
+        ConsoleBuffer.FlushPendingAutoButtons();
+        return _currentCycleButtons.Count == 0 ? [] : [.. _currentCycleButtons];
+    }
 
     // -------------------------------------------------------------------------
     // Console Output & Save/Load Helpers
@@ -1460,11 +1464,11 @@ public sealed partial class EmueraEngine : IDisposable
 
         if (isPlainText)
         {
-            ConsoleBuffer.Print(projected, useDefaultColor: useDefaultColor);
+            ConsoleBuffer.PrintPlain(projected, useDefaultColor: useDefaultColor);
         }
         else
         {
-            PrintWithAutoDetectedBracketButtons(projected, useDefaultColor);
+            ConsoleBuffer.Print(projected, useDefaultColor: useDefaultColor);
         }
 
         if ((flags & PrintModifierFlags.NewLine) != 0)
@@ -1478,92 +1482,50 @@ public sealed partial class EmueraEngine : IDisposable
         int widthCols = Math.Max(1, Options.PrintCLength);
         int textBytes = EastAsianStringOps.GetStrlenS(text, Options.LanguageCodePage);
         int pad = Math.Max(0, widthCols - textBytes);
-
-        // Emuera PRINTC / PRINTLC turns the entire cell caption into a single button when it contains [N],
-        // keeping only the column alignment padding outside the clickable span.
+        bool useDefaultColor = (flags & PrintModifierFlags.DefaultColor) != 0;
         bool isPlainText = (flags & PrintModifierFlags.PlainText) != 0;
-        if (!isPlainText && TryExtractSingleBracketInt(text, out long btnVal))
+        string projected = (flags & PrintModifierFlags.ForceKana) != 0
+            ? ForceKanaMode switch
+            {
+                1 => EastAsianStringOps.ToKatakana(text),
+                2 => EastAsianStringOps.ToHiragana(text, widenHalfwidth: false),
+                3 => EastAsianStringOps.ToHalf(EastAsianStringOps.ToKatakana(text)),
+                _ => text,
+            }
+            : text;
+
+        if (isPlainText)
         {
-            bool useDefaultColor = (flags & PrintModifierFlags.DefaultColor) != 0;
-            string projected = (flags & PrintModifierFlags.ForceKana) != 0
-                ? ForceKanaMode switch
-                {
-                    1 => EastAsianStringOps.ToKatakana(text),
-                    2 => EastAsianStringOps.ToHiragana(text, widenHalfwidth: false),
-                    3 => EastAsianStringOps.ToHalf(EastAsianStringOps.ToKatakana(text)),
-                    _ => text,
-                }
-                : text;
-
-            if (rightAlign && pad > 0)
-            {
-                PrintStyled(new string(' ', pad), flags | PrintModifierFlags.PlainText);
-            }
-
-            RegisterButtonDescriptor(projected, isInt: true, btnVal);
-            RecordDisplayOperation(new DisplayOperation(
-                DisplayOperationKind.PrintButtonSpan,
-                default,
-                projected,
-                useDefaultColor ? Options.ForeColorRgba : CurrentForeColorRgba,
-                CurrentFontName,
-                Options.FontSize,
-                ButtonGeneration: _buttonGeneration,
-                ButtonIntValue: btnVal));
-            ConsoleBuffer.CurrentFontFamily = CurrentFontName;
-            ConsoleBuffer.FontStyle = (FontStyleFlags)(CurrentFontStyle & 0xF);
-            ConsoleBuffer.PrintButton(projected, btnVal.ToString(CultureInfo.InvariantCulture), useDefaultColor: useDefaultColor);
-
-            if (!rightAlign && pad > 0)
-            {
-                PrintStyled(new string(' ', pad), flags | PrintModifierFlags.PlainText);
-            }
-
-            if ((flags & PrintModifierFlags.NewLine) != 0)
-            {
-                PrintNewLine();
-            }
-
+            string padded = rightAlign ? new string(' ', pad) + projected : projected + new string(' ', pad);
+            PrintStyled(padded, flags);
             return;
         }
 
-        string padded = rightAlign ? new string(' ', pad) + text : text + new string(' ', pad);
-        PrintStyled(padded, flags);
-    }
-
-    private static bool TryExtractSingleBracketInt(string text, out long value)
-    {
-        value = 0L;
-        if (string.IsNullOrWhiteSpace(text))
+        ConsoleBuffer.CurrentFontFamily = CurrentFontName;
+        ConsoleBuffer.FontStyle = (FontStyleFlags)(CurrentFontStyle & 0xF);
+        if (rightAlign && pad > 0)
         {
-            return false;
+            ConsoleBuffer.PrintPlain(new string(' ', pad), useDefaultColor: useDefaultColor);
         }
 
-        int found = 0;
-        int open = text.IndexOf('[');
-        while (open >= 0)
+        RecordDisplayOperation(new DisplayOperation(
+            DisplayOperationKind.PrintTextSpan,
+            default,
+            projected,
+            useDefaultColor ? Options.ForeColorRgba : CurrentForeColorRgba,
+            CurrentFontName,
+            Options.FontSize));
+        ConsoleBuffer.PrintAutoButtonCell(projected, useDefaultColor: useDefaultColor);
+
+        if (!rightAlign && pad > 0)
         {
-            int close = text.IndexOf(']', open + 1);
-            if (close < 0)
-            {
-                break;
-            }
-
-            ReadOnlySpan<char> inner = text.AsSpan(open + 1, close - open - 1).Trim();
-            if (!inner.IsEmpty && long.TryParse(inner, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long parsed))
-            {
-                value = parsed;
-                found++;
-                if (found > 1)
-                {
-                    return false;
-                }
-            }
-
-            open = text.IndexOf('[', close + 1);
+            ConsoleBuffer.PrintPlain(new string(' ', pad), useDefaultColor: useDefaultColor);
         }
 
-        return found == 1;
+        if ((flags & PrintModifierFlags.NewLine) != 0)
+        {
+            PrintNewLine();
+        }
     }
 
     internal void PrintButtonSpan(string label, bool isInt, long intVal, string? strVal)
@@ -1655,7 +1617,8 @@ public sealed partial class EmueraEngine : IDisposable
     {
         string line = BuildLineString(customPattern);
         RecordDisplayOperation(new DisplayOperation(DisplayOperationKind.DrawLineRule, default, line, CurrentForeColorRgba, CurrentFontName, Options.FontSize));
-        ConsoleBuffer.PrintLine(line);
+        ConsoleBuffer.PrintPlain(line);
+        ConsoleBuffer.NewLine();
         SyncLineCount();
     }
 
@@ -2530,116 +2493,6 @@ public sealed partial class EmueraEngine : IDisposable
                 break;
             }
         }
-    }
-
-    private void PrintWithAutoDetectedBracketButtons(string text, bool useDefaultColor)
-    {
-        if (string.IsNullOrEmpty(text))
-        {
-            return;
-        }
-
-        // Emuera automatically turns both prefix "[123] Choice" and suffix "Choice[123]" patterns
-        // in non-plain PRINT lines into clickable integer buttons.
-        List<(int Open, int Close, long Value)>? tokens = null;
-        int open = text.IndexOf('[');
-        while (open >= 0)
-        {
-            int close = text.IndexOf(']', open + 1);
-            if (close < 0)
-            {
-                break;
-            }
-
-            ReadOnlySpan<char> inner = text.AsSpan(open + 1, close - open - 1).Trim();
-            if (!inner.IsEmpty && long.TryParse(inner, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long btnVal))
-            {
-                tokens ??= [];
-                tokens.Add((open, close, btnVal));
-            }
-
-            open = text.IndexOf('[', close + 1);
-        }
-
-        if (tokens is null)
-        {
-            ConsoleBuffer.Print(text, useDefaultColor: useDefaultColor);
-            return;
-        }
-
-        // Resolve exact (Start, End, Value) button spans right-to-left so suffix labels ("移動[400]"),
-        // prefix labels ("[0] 最初からはじめる"), and back-to-back prefix labels ("[9999] - 戻る[9998] - 更新")
-        // all receive their exact clickable caption without bleeding into adjacent buttons.
-        var spans = new (int Start, int End, long Value)[tokens.Count];
-        int nextBtnStart = text.Length;
-        for (int i = tokens.Count - 1; i >= 0; i--)
-        {
-            (int tokOpen, int tokClose, long val) = tokens[i];
-            int afterStart = tokClose + 1;
-            bool hasTrailingLabel = HasNonWhitespace(text, afterStart, nextBtnStart);
-            int prevLimit = i > 0 ? tokens[i - 1].Close + 1 : 0;
-            bool hasImmediatePrefix = tokOpen > prevLimit && !char.IsWhiteSpace(text[tokOpen - 1]);
-
-            int btnStart;
-            int btnEnd;
-            if (hasImmediatePrefix && !hasTrailingLabel)
-            {
-                // Suffix-bracket button: e.g. "                移動[400]" -> caption "移動[400]"
-                btnStart = tokOpen;
-                while (btnStart > prevLimit && !char.IsWhiteSpace(text[btnStart - 1]))
-                {
-                    btnStart--;
-                }
-
-                btnEnd = tokClose + 1;
-            }
-            else
-            {
-                // Prefix-bracket button: e.g. "[0] Start Game" -> caption "[0] Start Game"
-                btnStart = tokOpen;
-                btnEnd = nextBtnStart;
-                while (btnEnd > tokClose + 1 && char.IsWhiteSpace(text[btnEnd - 1]))
-                {
-                    btnEnd--;
-                }
-            }
-
-            spans[i] = (btnStart, btnEnd, val);
-            nextBtnStart = btnStart;
-        }
-
-        int cursor = 0;
-        for (int i = 0; i < spans.Length; i++)
-        {
-            (int start, int end, long val) = spans[i];
-            if (start > cursor)
-            {
-                ConsoleBuffer.Print(text[cursor..start], useDefaultColor: useDefaultColor);
-            }
-
-            string caption = text[start..end];
-            RegisterButtonDescriptor(caption, isInt: true, val);
-            ConsoleBuffer.PrintButton(caption, val.ToString(CultureInfo.InvariantCulture), useDefaultColor: useDefaultColor);
-            cursor = end;
-        }
-
-        if (cursor < text.Length)
-        {
-            ConsoleBuffer.Print(text[cursor..], useDefaultColor: useDefaultColor);
-        }
-    }
-
-    private static bool HasNonWhitespace(string text, int start, int end)
-    {
-        for (int i = start; i < end; i++)
-        {
-            if (!char.IsWhiteSpace(text[i]))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private void ExtractHtmlButtons(string html)
