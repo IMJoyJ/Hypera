@@ -206,6 +206,16 @@ public static class SingleFileBundleCodec
             outStream.Write(trailer);
         }
 
+        if (!OperatingSystem.IsWindows())
+        {
+            UnixFileMode hostMode = File.GetUnixFileMode(hostTemplatePath);
+            UnixFileMode execMode = hostMode
+                | UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+            File.SetUnixFileMode(outputExecutablePath, execMode);
+        }
+
         return new BundleTrailer(payloadOffset, payloadLength, kind);
     }
 

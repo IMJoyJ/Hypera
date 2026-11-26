@@ -80,6 +80,9 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Install Linux CJK fonts for typography tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-ipafont-gothic fontconfig && fc-cache -f
+
       - name: Run full Linux test suite
         run: |
           dotnet test tests/Hypera.Tests/Hypera.Tests.csproj -c Release

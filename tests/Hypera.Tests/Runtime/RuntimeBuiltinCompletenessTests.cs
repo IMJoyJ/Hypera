@@ -96,8 +96,12 @@ public sealed class RuntimeBuiltinCompletenessTests
 
         string lineDash = GetStr(vars, "STR", 5);
         string lineEq = GetStr(vars, "STR", 6);
-        Assert.True(lineDash.Length >= 80 && lineDash.All(c => c == '-'));
-        Assert.True(lineEq.Length >= 80 && lineEq.All(c => c == '='));
+        Assert.True(lineDash.Length >= 40 && lineDash.All(c => c == '-'));
+        Assert.True(lineEq.Length >= 40 && lineEq.Length % 2 == 0 && lineEq.All(c => c == '='));
+        Assert.True(engine.Glyphs.MeasureTextWidth(lineDash, 16f, "TestMono") <= 960.5f);
+        Assert.True(engine.Glyphs.MeasureTextWidth(lineDash + "-", 16f, "TestMono") > 960f);
+        Assert.True(engine.Glyphs.MeasureTextWidth(lineEq, 16f, "TestMono") <= 960.5f);
+        Assert.True(engine.Glyphs.MeasureTextWidth(lineEq + "==", 16f, "TestMono") > 960f);
     }
 
     [Fact]

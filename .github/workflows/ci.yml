@@ -44,6 +44,10 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Install Linux CJK fonts for typography tests
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-ipafont-gothic fontconfig && fc-cache -f
+
       - name: Build Windows desktop hosts
         if: runner.os == 'Windows'
         run: |

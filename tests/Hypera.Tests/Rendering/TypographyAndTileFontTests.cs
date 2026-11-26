@@ -189,11 +189,30 @@ public sealed class TypographyAndTileFontTests
         ConsoleLine row4 = buffer.PhysicalLines[1];
         Assert.True(row3.IsLogicalLine);
         Assert.True(row4.IsLogicalLine);
-        Assert.Equal(row3.ContentWidth, row4.ContentWidth, precision: 2);
+        if (registry.HasFont("MS Gothic"))
+        {
+            Assert.Equal(row3.ContentWidth, row4.ContentWidth, precision: 2);
+        }
 
         ConsoleRenderPart row3Pipe = Assert.Single(row3.Parts, static p => p.Text == "|");
         ConsoleRenderPart row4Pipe = Assert.Single(row4.Parts, static p => p.Text == "|");
         Assert.Equal(row3Pipe.X, row4Pipe.X, precision: 2);
+
+        // Font-independent exact equivalence: identical row with vs without trailing tabs after spaces
+        buffer.PrintPlain(new string(' ', 40));
+        buffer.PrintPlain("|COL_A|");
+        buffer.HtmlPrint("<button value='200'>[200] ExactWidthCheck</button>", noNewLine: true);
+        buffer.NewLine();
+
+        buffer.Print(new string(' ', 40) + "\t\t");
+        buffer.PrintPlain("|COL_A|");
+        buffer.HtmlPrint("<button value='200'>[200] ExactWidthCheck</button>", noNewLine: true);
+        buffer.NewLine();
+
+        ConsoleLine exactNoTab = buffer.PhysicalLines[^2];
+        ConsoleLine exactWithTab = buffer.PhysicalLines[^1];
+        Assert.Equal(exactNoTab.ContentWidth, exactWithTab.ContentWidth, precision: 2);
+        Assert.Equal(exactNoTab.Parts[^1].X, exactWithTab.Parts[^1].X, precision: 2);
 
         // Under legacy GRAPHICS mode, tabs expand to 8 spaces each
         buffer.ExpandTabs = true;
