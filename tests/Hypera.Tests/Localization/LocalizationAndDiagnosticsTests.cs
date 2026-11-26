@@ -161,8 +161,22 @@ public sealed class LocalizationAndDiagnosticsTests
                 """;
             File.WriteAllText(Path.Combine(tempDir, "ko.json"), koJson);
 
-            // Wait for FileSystemWatcher (or fall back to explicit reload if OS delayed watcher)
-            if (!reloadSignal.Wait(TimeSpan.FromSeconds(2)))
+            // Wait for FileSystemWatcher to finish loading ko.json (handle Linux inotify Created+Changed split)
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+            while (!localizer.HasLocale("ko") && DateTime.UtcNow < deadline)
+            {
+                reloadSignal.Reset();
+                if (!localizer.HasLocale("ko"))
+                {
+                    TimeSpan remaining = deadline - DateTime.UtcNow;
+                    if (remaining > TimeSpan.Zero)
+                    {
+                        reloadSignal.Wait(remaining);
+                    }
+                }
+            }
+
+            if (!localizer.HasLocale("ko"))
             {
                 localizer.ReloadExternalDirectory();
             }

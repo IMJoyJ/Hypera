@@ -522,13 +522,23 @@ public sealed class HyperaLocalizer : IDisposable
 
     private static string? TryReadFileWithRetry(string path)
     {
-        for (int attempt = 0; attempt < 3; attempt++)
+        string? lastContent = null;
+        for (int attempt = 0; attempt < 5; attempt++)
         {
             try
             {
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                 using var reader = new StreamReader(fs);
-                return reader.ReadToEnd();
+                lastContent = reader.ReadToEnd();
+                if (!string.IsNullOrWhiteSpace(lastContent))
+                {
+                    return lastContent;
+                }
+
+                if (attempt < 4)
+                {
+                    Thread.Sleep(25);
+                }
             }
             catch (IOException)
             {
@@ -540,7 +550,7 @@ public sealed class HyperaLocalizer : IDisposable
             }
         }
 
-        return null;
+        return lastContent;
     }
 
     private sealed record LocalePack(LocaleInfo Info, Dictionary<string, string> Entries);
