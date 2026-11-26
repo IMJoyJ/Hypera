@@ -159,11 +159,12 @@ public sealed class GlyphMeasurer : IDisposable
     /// <summary>
     /// Returns true if the code point is an East-Asian box-drawing or geometric symbol
     /// that must align to full-width U+3000 advance in standard Era text fonts.
+    /// Note: U+2014 (EM DASH '—') is intentionally excluded because MS Gothic renders it at its native
+    /// half-width (8px at 16px) seamlessly matching classic Emuera TextRenderer layouts.
     /// </summary>
     public static bool IsBoxDrawingOrGeometricSymbol(int codePoint) =>
         (codePoint >= 0x2500 && codePoint <= 0x257F) ||
         (codePoint >= 0x25A0 && codePoint <= 0x25FF) ||
-        codePoint == 0x2014 ||
         codePoint == 0x2015 ||
         codePoint == 0x2225 ||
         (codePoint >= 0x2605 && codePoint <= 0x2606);

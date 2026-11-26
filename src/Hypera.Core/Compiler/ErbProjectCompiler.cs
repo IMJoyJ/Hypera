@@ -1434,8 +1434,32 @@ public sealed class ErbProjectCompiler
                     return;
                 }
 
-                ReadOnlySpan<char> argSpan = TrimSpaces(rawAfterKw);
-                int leadArgSkip = rawAfterKw.Length - TrimLeadingSpaces(rawAfterKw).Length;
+                ReadOnlySpan<char> argSpan;
+                int leadArgSkip;
+                if (PreservesLiteralArgumentWhitespace(spec))
+                {
+                    // Classic Emuera literal-argument rule (PRINT*, PRINTFORM*, PRINTPLAIN*, STRLEN*,
+                    // CUSTOMDRAWLINE, DRAWLINEFORM, REUSELASTLINE, PUTFORM, DEBUGPRINT*, etc.):
+                    // strip ONLY the single separator character immediately following the instruction keyword,
+                    // preserving all remaining leading/trailing spaces (including full-width U+3000).
+                    if (!rawAfterKw.IsEmpty &&
+                        (rawAfterKw[0] == ' ' || rawAfterKw[0] == '\t' || (_options.SystemAllowFullSpace && rawAfterKw[0] == '\u3000')))
+                    {
+                        argSpan = rawAfterKw[1..];
+                        leadArgSkip = 1;
+                    }
+                    else
+                    {
+                        argSpan = rawAfterKw;
+                        leadArgSkip = 0;
+                    }
+                }
+                else
+                {
+                    argSpan = TrimSpaces(rawAfterKw);
+                    leadArgSkip = rawAfterKw.Length - TrimLeadingSpaces(rawAfterKw).Length;
+                }
+
                 int argCol1Based = rawAfterKw.IsEmpty ? col1Based + kw.Length : col1Based + kw.Length + leadArgSkip;
                 CompileInstruction(spec, line, argSpan, argCol1Based, lineSpan, ref index);
                 return;
@@ -5986,6 +6010,11 @@ public sealed class ErbProjectCompiler
     // =========================================================================
     // Low-Allocation Span Helpers
     // =========================================================================
+
+    private static bool PreservesLiteralArgumentWhitespace(BuiltinInstructionSpec spec) =>
+        (spec.ArgPattern is InstructionArgumentPattern.RawStringNullable or InstructionArgumentPattern.FormStringNullable
+            && spec.Kind != BuiltinInstructionKind.RETURNFORM)
+        || spec.Kind is BuiltinInstructionKind.CUSTOMDRAWLINE or BuiltinInstructionKind.DRAWLINEFORM;
 
     private static ReadOnlySpan<char> TrimLeadingSpaces(ReadOnlySpan<char> span)
     {

@@ -46,6 +46,7 @@ public class HyperaSkiaControl : SKControl
     private long _trackedGenerationId = -1;
     private long _lastObservedFlushSeq = -1;
     private long _timeoutDeadlineTimestamp;
+    private bool _hasTimeoutDeadline;
     private long _awaitResumeTimestamp;
     private long _lastAnimationRedrawMs;
     private long _lastPaintElapsedMs;
@@ -90,6 +91,7 @@ public class HyperaSkiaControl : SKControl
             _trackedGenerationId = -1;
             _lastObservedFlushSeq = _engine?.RedrawFlushSequence ?? -1;
             _timeoutDeadlineTimestamp = 0;
+            _hasTimeoutDeadline = false;
             _awaitResumeTimestamp = 0;
             _lastPaintElapsedMs = 0;
             _faultRaised = false;
@@ -222,7 +224,7 @@ public class HyperaSkiaControl : SKControl
     {
         get
         {
-            if (_timeoutDeadlineTimestamp <= 0)
+            if (!_hasTimeoutDeadline)
             {
                 return null;
             }
@@ -659,6 +661,7 @@ public class HyperaSkiaControl : SKControl
                         if (canAutoSkip)
                         {
                             _timeoutDeadlineTimestamp = 0;
+                            _hasTimeoutDeadline = false;
                             _trackedGenerationId = -1;
                             engine.SubmitInput(new InputResponse(
                                 pendingReq.GenerationId,
@@ -666,10 +669,11 @@ public class HyperaSkiaControl : SKControl
                             stepped = true;
                         }
                         else if (_trackedGenerationId == pendingReq.GenerationId &&
-                                 _timeoutDeadlineTimestamp > 0 &&
+                                 _hasTimeoutDeadline &&
                                  Stopwatch.GetTimestamp() >= _timeoutDeadlineTimestamp)
                         {
                             _timeoutDeadlineTimestamp = 0;
+                            _hasTimeoutDeadline = false;
                             _trackedGenerationId = -1;
                             engine.SubmitInput(new InputResponse(pendingReq.GenerationId, IsTimeout: true));
                             stepped = true;
@@ -724,7 +728,6 @@ public class HyperaSkiaControl : SKControl
             {
                 _scrollbackOffset = 0;
                 engine.ConsoleBuffer.ScrollOffsetLines = 0;
-                ClearHoverState();
 
                 bool flushRequested = engine.RedrawFlushSequence != _lastObservedFlushSeq;
                 bool redrawAllowed = engine.CurrentRedrawMode != 0 ||
@@ -732,6 +735,7 @@ public class HyperaSkiaControl : SKControl
                                      engine.Status is EngineStepStatus.WaitingInput or EngineStepStatus.Faulted or EngineStepStatus.Completed;
                 if (redrawAllowed)
                 {
+                    ClearHoverState();
                     _lastObservedFlushSeq = engine.RedrawFlushSequence;
                     _frozenRedrawScene = null;
                     needsRepaint = true;
@@ -754,16 +758,26 @@ public class HyperaSkiaControl : SKControl
                 if (_trackedGenerationId != req.GenerationId)
                 {
                     _trackedGenerationId = req.GenerationId;
-                    _timeoutDeadlineTimestamp = req.TimeoutMilliseconds is > 0
-                        ? Stopwatch.GetTimestamp() + (long)(req.TimeoutMilliseconds.Value * (Stopwatch.Frequency / 1000.0))
-                        : 0;
+                    if (req.TimeoutMilliseconds.HasValue)
+                    {
+                        _hasTimeoutDeadline = true;
+                        long delayMs = Math.Max(0L, req.TimeoutMilliseconds.Value);
+                        _timeoutDeadlineTimestamp = Stopwatch.GetTimestamp() +
+                            (long)(delayMs * (Stopwatch.Frequency / 1000.0));
+                    }
+                    else
+                    {
+                        _hasTimeoutDeadline = false;
+                        _timeoutDeadlineTimestamp = 0;
+                    }
+
                     _frozenRedrawScene = null;
                     _lastObservedFlushSeq = engine.RedrawFlushSequence;
                     _pendingHoverRefresh = true;
                     contentChanged = true;
                     needsRepaint = true;
                 }
-                else if (req.TimeoutMilliseconds is > 0 && elapsedMs - _lastAnimationRedrawMs >= 100)
+                else if (_hasTimeoutDeadline && elapsedMs - _lastAnimationRedrawMs >= 100)
                 {
                     // Refresh status countdown while timed wait / TINPUT is active.
                     contentChanged = true;
@@ -772,6 +786,7 @@ public class HyperaSkiaControl : SKControl
             else
             {
                 _trackedGenerationId = -1;
+                _hasTimeoutDeadline = false;
                 _timeoutDeadlineTimestamp = 0;
             }
 

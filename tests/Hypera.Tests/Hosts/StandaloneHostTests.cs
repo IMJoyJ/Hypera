@@ -1162,6 +1162,64 @@ public sealed class StandaloneHostTests
         }
     }
 
+    [Fact]
+    public void PrintLiteralWhitespace_EmDashNativeWidth_AndAwaitResetOnBudgetYield_PreserveEmueraSemantics()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_print_ws_await_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                ; 1. PRINT / PRINTFORM / PRINTPLAIN must strip ONLY the single separator space,
+                ;    preserving leading U+3000, extra ASCII spaces, and trailing U+3000/spaces!
+                PRINTFORM 　｜
+                PRINTFORM  TURN
+                PRINTFORM  
+                PRINT 　
+                PRINT [801] 墓地除外確認　
+                PRINTL
+                ; 2. Explicit AWAIT 100 sets LastAwaitMilliseconds = 100, and subsequent budget Yielded steps MUST reset it to 0!
+                AWAIT 100
+                LOCAL = 0
+                FOR LOCAL, 0, 50000
+                    A:0 += 1
+                NEXT
+                INPUT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+            EmueraEngine engine = host.Engine;
+
+            // Step 1: hits AWAIT 100
+            Assert.Equal(EngineStepStatus.Yielded, engine.Step(100_000));
+            Assert.Equal(100L, engine.LastAwaitMilliseconds);
+
+            // Verify exact preserved leading/trailing spaces on line 0!
+            Assert.True(engine.ConsoleBuffer.PhysicalLineCount >= 1);
+            Assert.Equal("　｜ TURN 　[801] 墓地除外確認　", engine.ConsoleBuffer.PhysicalLines[0].PlainText);
+
+            // Step 2: budget-limited yield inside the FOR loop MUST reset LastAwaitMilliseconds back to 0!
+            Assert.Equal(EngineStepStatus.Yielded, engine.Step(1_000));
+            Assert.Equal(0L, engine.LastAwaitMilliseconds);
+
+            // Verify U+2014 is NOT forced into box-drawing full-width override (allows MS Gothic native 8px width)
+            Assert.False(GlyphMeasurer.IsBoxDrawingOrGeometricSymbol(0x2014));
+            Assert.True(GlyphMeasurer.IsBoxDrawingOrGeometricSymbol(0x2500));
+            Assert.True(GlyphMeasurer.IsBoxDrawingOrGeometricSymbol(0x2015));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
     private static string LocateProjectBinDirectory(string projectName, string probeFile)
     {
         string testsBin = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);

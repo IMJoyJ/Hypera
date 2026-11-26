@@ -296,6 +296,7 @@ public sealed partial class EmueraEngine : IDisposable
         }
 
         int budget = maxInstructions > 0 ? maxInstructions : Options.DefaultStepInstructionBudget;
+        LastAwaitMilliseconds = 0L;
         Status = EngineStepStatus.Running;
 
         try
