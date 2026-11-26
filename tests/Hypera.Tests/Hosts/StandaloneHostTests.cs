@@ -1010,6 +1010,57 @@ public sealed class StandaloneHostTests
         public void Report(T value) => handler(value);
     }
 
+    [Fact]
+    public void WindowStatePreferenceStore_DefaultsToMaximized_PersistsRoundTrip_AndRecoversFromCorruptJson()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_winpref_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workDir);
+
+        try
+        {
+            string prefPath = WindowStatePreferenceStore.ResolveFilePath(workDir);
+            Assert.Equal(Path.Combine(workDir, WindowStatePreferenceStore.DefaultFileName), prefPath);
+
+            // 1. Default when file does not exist => maximized startup
+            WindowStatePreference initial = WindowStatePreferenceStore.Load(prefPath);
+            Assert.True(initial.IsMaximized);
+            Assert.False(initial.HasNormalSize);
+
+            // 2. Persist restored windowed state & normal bounds
+            var windowed = new WindowStatePreference(
+                IsMaximized: false,
+                NormalX: 120,
+                NormalY: 80,
+                NormalWidth: 1280,
+                NormalHeight: 800);
+            Assert.True(WindowStatePreferenceStore.TrySave(prefPath, windowed));
+
+            WindowStatePreference reloadedWindowed = WindowStatePreferenceStore.Load(prefPath);
+            Assert.False(reloadedWindowed.IsMaximized);
+            Assert.True(reloadedWindowed.HasNormalSize);
+            Assert.True(reloadedWindowed.HasNormalPosition);
+            Assert.Equal(120, reloadedWindowed.NormalX);
+            Assert.Equal(80, reloadedWindowed.NormalY);
+            Assert.Equal(1280, reloadedWindowed.NormalWidth);
+            Assert.Equal(800, reloadedWindowed.NormalHeight);
+
+            // 3. Persist maximized state while keeping remembered normal bounds
+            Assert.True(WindowStatePreferenceStore.TrySave(prefPath, reloadedWindowed with { IsMaximized = true }));
+            WindowStatePreference reloadedMax = WindowStatePreferenceStore.Load(prefPath);
+            Assert.True(reloadedMax.IsMaximized);
+            Assert.Equal(1280, reloadedMax.NormalWidth);
+
+            // 4. Corrupt JSON safely falls back to default maximized startup
+            File.WriteAllText(prefPath, "{ invalid json !!!");
+            WindowStatePreference recovered = WindowStatePreferenceStore.Load(prefPath);
+            Assert.True(recovered.IsMaximized);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
     private static string LocateProjectBinDirectory(string projectName, string probeFile)
     {
         string testsBin = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.Windows.Forms;
+using Hypera.Configuration;
 using Hypera.Data;
 using Hypera.Diagnostics;
 using Hypera.Rendering;
@@ -53,10 +54,22 @@ public sealed class MainForm : Form
     private FormWindowState _savedWindowState;
     private Rectangle _savedBounds;
     private bool _menuWasVisibleBeforeFullscreen;
+    private string _windowPrefPath;
+    private WindowStatePreference _windowPref;
+    private bool _desiredMaximized;
+    private bool _hasPersistedNormalBounds;
+    private bool _isWindowShown;
+    private bool _isApplyingWindowSettings;
 
     public MainForm(StandaloneLaunchOptions initialOptions)
     {
         _initialOptions = initialOptions;
+        _windowPrefPath = WindowStatePreferenceStore.ResolveFilePath(
+            initialOptions.Target.SaveDirectory,
+            AppContext.BaseDirectory);
+        _windowPref = WindowStatePreferenceStore.Load(_windowPrefPath);
+        _desiredMaximized = _windowPref.IsMaximized;
+        _hasPersistedNormalBounds = _windowPref.HasNormalSize;
 
         Text = "Hypera Standalone";
         AutoScaleMode = AutoScaleMode.None;
@@ -67,6 +80,7 @@ public sealed class MainForm : Form
         AllowDrop = true;
         MinimumSize = new Size(480, 360);
         Size = new Size(1024, 768);
+        ApplyInitialWindowPreference();
 
         // 1. Top MenuStrip (classic Emuera menu layout)
         _menuStrip = new MenuStrip
@@ -119,7 +133,7 @@ public sealed class MainForm : Form
         {
             ShortcutKeys = Keys.Control | Keys.End,
         };
-        var resetSizeItem = new ToolStripMenuItem("Fit Window to Logical Viewport (1:1)", null, (_, _) => FitWindowToLogicalViewport());
+        var resetSizeItem = new ToolStripMenuItem("Fit Window to Logical Viewport (1:1)", null, (_, _) => FitWindowToLogicalViewport(persistPreference: true));
         _fullscreenMenuItem = new ToolStripMenuItem("&Fullscreen", null, (_, _) => ToggleFullscreen())
         {
             ShortcutKeys = Keys.F11,
@@ -355,7 +369,44 @@ public sealed class MainForm : Form
         KeyUp += OnGlobalKeyUp;
         DragEnter += OnFormDragEnter;
         DragDrop += OnFormDragDrop;
+        Resize += OnFormResize;
+        Move += OnFormMove;
+        ResizeEnd += OnFormResizeEnd;
         FormClosing += OnFormClosing;
+    }
+
+    private void ApplyInitialWindowPreference()
+    {
+        _isApplyingWindowSettings = true;
+        try
+        {
+            if (_windowPref.HasNormalSize)
+            {
+                int w = Math.Max(MinimumSize.Width, _windowPref.NormalWidth!.Value);
+                int h = Math.Max(MinimumSize.Height, _windowPref.NormalHeight!.Value);
+                Size = new Size(w, h);
+            }
+
+            if (_windowPref.HasNormalPosition)
+            {
+                int x = _windowPref.NormalX!.Value;
+                int y = _windowPref.NormalY!.Value;
+                Rectangle wa = Screen.FromPoint(new Point(x, y)).WorkingArea;
+                int clampedX = Math.Clamp(x, wa.Left, Math.Max(wa.Left, wa.Right - Width));
+                int clampedY = Math.Clamp(y, wa.Top, Math.Max(wa.Top, wa.Bottom - Height));
+                StartPosition = FormStartPosition.Manual;
+                Location = new Point(clampedX, clampedY);
+            }
+
+            if (_desiredMaximized)
+            {
+                WindowState = FormWindowState.Maximized;
+            }
+        }
+        finally
+        {
+            _isApplyingWindowSettings = false;
+        }
     }
 
     private void OnFormLoad(object? sender, EventArgs e)
@@ -375,6 +426,7 @@ public sealed class MainForm : Form
 
     private void OnFormShown(object? sender, EventArgs e)
     {
+        _isWindowShown = true;
         UpdateInputBarHeight();
         EnsureClientInsideWorkingArea();
 
@@ -386,6 +438,76 @@ public sealed class MainForm : Form
         {
             PromptOpenInitialGame();
         }
+    }
+
+    private void OnFormResize(object? sender, EventArgs e)
+    {
+        if (!_isWindowShown || _isApplyingWindowSettings || _isFullscreen || WindowState == FormWindowState.Minimized)
+        {
+            return;
+        }
+
+        bool isNowMaximized = WindowState == FormWindowState.Maximized;
+        if (isNowMaximized != _desiredMaximized)
+        {
+            _desiredMaximized = isNowMaximized;
+            if (!isNowMaximized)
+            {
+                EnsureClientInsideWorkingArea();
+                CaptureNormalBounds();
+            }
+
+            PersistWindowPreference();
+        }
+        else if (!isNowMaximized)
+        {
+            CaptureNormalBounds();
+        }
+    }
+
+    private void OnFormMove(object? sender, EventArgs e)
+    {
+        if (_isWindowShown && !_isApplyingWindowSettings && !_isFullscreen && WindowState == FormWindowState.Normal)
+        {
+            CaptureNormalBounds();
+        }
+    }
+
+    private void OnFormResizeEnd(object? sender, EventArgs e)
+    {
+        if (_isWindowShown && !_isApplyingWindowSettings && !_isFullscreen && WindowState == FormWindowState.Normal)
+        {
+            CaptureNormalBounds();
+            PersistWindowPreference();
+        }
+    }
+
+    private void CaptureNormalBounds()
+    {
+        if (WindowState != FormWindowState.Normal || _isFullscreen)
+        {
+            return;
+        }
+
+        Rectangle b = Bounds;
+        if (b.Width >= MinimumSize.Width && b.Height >= MinimumSize.Height)
+        {
+            _windowPref = _windowPref with
+            {
+                NormalX = b.X,
+                NormalY = b.Y,
+                NormalWidth = b.Width,
+                NormalHeight = b.Height,
+            };
+            _hasPersistedNormalBounds = true;
+        }
+    }
+
+    private void PersistWindowPreference(bool? explicitMaximized = null)
+    {
+        bool saveMaximized = explicitMaximized ?? _desiredMaximized;
+        _windowPref = _windowPref with { IsMaximized = saveMaximized };
+        WindowStatePreferenceStore.TrySave(_windowPrefPath, _windowPref);
     }
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)
@@ -642,30 +764,72 @@ public sealed class MainForm : Form
 
         UpdateInputBarHeight();
 
+        _windowPrefPath = WindowStatePreferenceStore.ResolveFilePath(
+            session.Target.SaveDirectory,
+            AppContext.BaseDirectory);
+
         if (!_isFullscreen)
         {
-            bool setPos = session.GetConfigBool(ConfigCode.SetWindowPos, false);
-            int posX = session.GetConfigInt(ConfigCode.WindowPosX, 0);
-            int posY = session.GetConfigInt(ConfigCode.WindowPosY, 0);
-            Rectangle targetWorkArea = setPos
-                ? Screen.FromPoint(new Point(posX, posY)).WorkingArea
-                : Screen.FromControl(this).WorkingArea;
-
-            FitWindowToLogicalViewport(targetWorkArea);
-
-            if (setPos)
+            _isApplyingWindowSettings = true;
+            try
             {
-                int clampedX = Math.Clamp(posX, targetWorkArea.Left, Math.Max(targetWorkArea.Left, targetWorkArea.Right - Width));
-                int clampedY = Math.Clamp(posY, targetWorkArea.Top, Math.Max(targetWorkArea.Top, targetWorkArea.Bottom - Height));
-                StartPosition = FormStartPosition.Manual;
-                Location = new Point(clampedX, clampedY);
+                bool setPos = session.GetConfigBool(ConfigCode.SetWindowPos, false);
+                int posX = session.GetConfigInt(ConfigCode.WindowPosX, 0);
+                int posY = session.GetConfigInt(ConfigCode.WindowPosY, 0);
+                Rectangle targetWorkArea = setPos
+                    ? Screen.FromPoint(new Point(posX, posY)).WorkingArea
+                    : Screen.FromControl(this).WorkingArea;
+
+                if (!sizable)
+                {
+                    if (WindowState == FormWindowState.Maximized)
+                    {
+                        WindowState = FormWindowState.Normal;
+                    }
+
+                    FitWindowToLogicalViewport(targetWorkArea);
+                    if (setPos)
+                    {
+                        int clampedX = Math.Clamp(posX, targetWorkArea.Left, Math.Max(targetWorkArea.Left, targetWorkArea.Right - Width));
+                        int clampedY = Math.Clamp(posY, targetWorkArea.Top, Math.Max(targetWorkArea.Top, targetWorkArea.Bottom - Height));
+                        StartPosition = FormStartPosition.Manual;
+                        Location = new Point(clampedX, clampedY);
+                    }
+
+                    EnsureClientInsideWorkingArea(targetWorkArea);
+                }
+                else if (_desiredMaximized)
+                {
+                    if (WindowState != FormWindowState.Maximized)
+                    {
+                        WindowState = FormWindowState.Maximized;
+                    }
+                }
+                else
+                {
+                    if (WindowState == FormWindowState.Maximized)
+                    {
+                        WindowState = FormWindowState.Normal;
+                    }
+
+                    if (!_hasPersistedNormalBounds)
+                    {
+                        FitWindowToLogicalViewport(targetWorkArea);
+                        if (setPos)
+                        {
+                            int clampedX = Math.Clamp(posX, targetWorkArea.Left, Math.Max(targetWorkArea.Left, targetWorkArea.Right - Width));
+                            int clampedY = Math.Clamp(posY, targetWorkArea.Top, Math.Max(targetWorkArea.Top, targetWorkArea.Bottom - Height));
+                            StartPosition = FormStartPosition.Manual;
+                            Location = new Point(clampedX, clampedY);
+                        }
+                    }
+
+                    EnsureClientInsideWorkingArea(targetWorkArea);
+                }
             }
-
-            EnsureClientInsideWorkingArea(targetWorkArea);
-
-            if (session.GetConfigBool(ConfigCode.WindowMaximixed, false))
+            finally
             {
-                WindowState = FormWindowState.Maximized;
+                _isApplyingWindowSettings = false;
             }
         }
 
@@ -682,33 +846,49 @@ public sealed class MainForm : Form
         }
     }
 
-    private void FitWindowToLogicalViewport(Rectangle? explicitWorkArea = null)
+    private void FitWindowToLogicalViewport(Rectangle? explicitWorkArea = null, bool persistPreference = false)
     {
         if (_session is null || _isFullscreen)
         {
             return;
         }
 
-        if (WindowState == FormWindowState.Maximized)
+        bool previousGuard = _isApplyingWindowSettings;
+        _isApplyingWindowSettings = true;
+        try
         {
-            WindowState = FormWindowState.Normal;
+            if (WindowState == FormWindowState.Maximized)
+            {
+                WindowState = FormWindowState.Normal;
+            }
+
+            UpdateInputBarHeight();
+
+            LogicalViewport vp = _session.Engine.Viewport;
+            int extraWidth = _scrollBar.Width;
+            int extraHeight = (_menuStrip.Visible ? _menuStrip.Height : 0) + _inputBarPanel.Height;
+            int desiredClientW = vp.LogicalWidth + extraWidth;
+            int desiredClientH = vp.LogicalHeight + extraHeight;
+
+            Size frameDelta = Size - ClientSize;
+            Rectangle workArea = explicitWorkArea ?? Screen.FromControl(this).WorkingArea;
+
+            int targetW = Math.Min(desiredClientW + frameDelta.Width, workArea.Width);
+            int targetH = Math.Min(desiredClientH + frameDelta.Height, workArea.Height);
+            Size = new Size(Math.Max(MinimumSize.Width, targetW), Math.Max(MinimumSize.Height, targetH));
+            EnsureClientInsideWorkingArea(workArea);
+        }
+        finally
+        {
+            _isApplyingWindowSettings = previousGuard;
         }
 
-        UpdateInputBarHeight();
-
-        LogicalViewport vp = _session.Engine.Viewport;
-        int extraWidth = _scrollBar.Width;
-        int extraHeight = (_menuStrip.Visible ? _menuStrip.Height : 0) + _inputBarPanel.Height;
-        int desiredClientW = vp.LogicalWidth + extraWidth;
-        int desiredClientH = vp.LogicalHeight + extraHeight;
-
-        Size frameDelta = Size - ClientSize;
-        Rectangle workArea = explicitWorkArea ?? Screen.FromControl(this).WorkingArea;
-
-        int targetW = Math.Min(desiredClientW + frameDelta.Width, workArea.Width);
-        int targetH = Math.Min(desiredClientH + frameDelta.Height, workArea.Height);
-        Size = new Size(Math.Max(MinimumSize.Width, targetW), Math.Max(MinimumSize.Height, targetH));
-        EnsureClientInsideWorkingArea(workArea);
+        if (persistPreference)
+        {
+            _desiredMaximized = false;
+            CaptureNormalBounds();
+            PersistWindowPreference(explicitMaximized: false);
+        }
     }
 
     /// <summary>
@@ -1161,30 +1341,38 @@ public sealed class MainForm : Form
 
     private void ToggleFullscreen()
     {
-        if (!_isFullscreen)
+        _isApplyingWindowSettings = true;
+        try
         {
-            _savedBorderStyle = FormBorderStyle;
-            _savedWindowState = WindowState;
-            _savedBounds = Bounds;
-            _menuWasVisibleBeforeFullscreen = _menuStrip.Visible;
-
-            _menuStrip.Visible = false;
-            FormBorderStyle = FormBorderStyle.None;
-            WindowState = FormWindowState.Maximized;
-            _isFullscreen = true;
-            _fullscreenMenuItem.Checked = true;
-        }
-        else
-        {
-            _isFullscreen = false;
-            _fullscreenMenuItem.Checked = false;
-            _menuStrip.Visible = _menuWasVisibleBeforeFullscreen;
-            FormBorderStyle = _savedBorderStyle;
-            WindowState = _savedWindowState;
-            if (_savedWindowState == FormWindowState.Normal)
+            if (!_isFullscreen)
             {
-                Bounds = _savedBounds;
+                _savedBorderStyle = FormBorderStyle;
+                _savedWindowState = WindowState;
+                _savedBounds = Bounds;
+                _menuWasVisibleBeforeFullscreen = _menuStrip.Visible;
+
+                _menuStrip.Visible = false;
+                FormBorderStyle = FormBorderStyle.None;
+                WindowState = FormWindowState.Maximized;
+                _isFullscreen = true;
+                _fullscreenMenuItem.Checked = true;
             }
+            else
+            {
+                _isFullscreen = false;
+                _fullscreenMenuItem.Checked = false;
+                _menuStrip.Visible = _menuWasVisibleBeforeFullscreen;
+                FormBorderStyle = _savedBorderStyle;
+                WindowState = _savedWindowState;
+                if (_savedWindowState == FormWindowState.Normal)
+                {
+                    Bounds = _savedBounds;
+                }
+            }
+        }
+        finally
+        {
+            _isApplyingWindowSettings = false;
         }
     }
 
@@ -1268,6 +1456,18 @@ public sealed class MainForm : Form
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
+        bool finalMaximized = _isFullscreen
+            ? _savedWindowState == FormWindowState.Maximized
+            : WindowState == FormWindowState.Minimized
+                ? _desiredMaximized
+                : WindowState == FormWindowState.Maximized;
+        if (!_isFullscreen && WindowState == FormWindowState.Normal)
+        {
+            CaptureNormalBounds();
+        }
+
+        PersistWindowPreference(explicitMaximized: finalMaximized);
+
         _loadGeneration++;
         CancellationTokenSource? cts = _loadCts;
         _loadCts = null;
