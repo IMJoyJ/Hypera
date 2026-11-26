@@ -364,7 +364,17 @@ public sealed partial class EmueraEngine : IDisposable
     public void AppendDisplayOperation(DisplayOperation operation)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        RecordDisplayOperation(operation);
+    }
+
+    private void RecordDisplayOperation(DisplayOperation operation)
+    {
         _displayOperations.Add(operation);
+        int cap = Math.Max(8192, Options.MaxLog * 4);
+        if (_displayOperations.Count >= cap * 2)
+        {
+            _displayOperations.RemoveRange(0, cap);
+        }
     }
 
     public DisplaySnapshot CaptureSnapshot()
@@ -945,6 +955,11 @@ public sealed partial class EmueraEngine : IDisposable
     {
         var kind = (InputRequestKind)(insn.Aux & 0xFF);
         var flags = (WaitInputFlags)(insn.Aux & 0xFF00);
+        if (IsSkipDisplay && kind == InputRequestKind.AnyKey && (flags & WaitInputFlags.CanSkipWithMessageSkip) != 0)
+        {
+            return false;
+        }
+
         bool hasDef = (flags & WaitInputFlags.HasDefault) != 0;
         bool hasTimeout = (flags & WaitInputFlags.HasTimeout) != 0;
         bool hasTimeoutMsg = (flags & WaitInputFlags.HasTimeoutMessage) != 0;
@@ -964,8 +979,10 @@ public sealed partial class EmueraEngine : IDisposable
         return IssueScriptInput(kind, flags, hasDef, defInt, defStr, timeoutMs, timeoutMsg, targetReg);
     }
 
-    internal bool IssueAnyKeyWait() =>
-        IssueScriptInput(InputRequestKind.AnyKey, WaitInputFlags.None);
+    internal bool IssueAnyKeyWait(bool canSkipWithMessageSkip = true) =>
+        IssueScriptInput(
+            InputRequestKind.AnyKey,
+            canSkipWithMessageSkip ? WaitInputFlags.CanSkipWithMessageSkip : WaitInputFlags.None);
 
     internal bool IssueTimedWait(long durationMs, bool forceNoSkip)
     {
@@ -974,7 +991,9 @@ public sealed partial class EmueraEngine : IDisposable
             return false;
         }
 
-        return IssueScriptInput(InputRequestKind.TimedWait, WaitInputFlags.HasTimeout, timeoutMs: Math.Max(0L, durationMs));
+        WaitInputFlags flags = WaitInputFlags.HasTimeout |
+                               (forceNoSkip ? WaitInputFlags.None : WaitInputFlags.CanSkipWithMessageSkip);
+        return IssueScriptInput(InputRequestKind.TimedWait, flags, timeoutMs: Math.Max(0L, durationMs));
     }
 
     internal void IssueSystemInputRequest(InputRequestKind kind)
@@ -1075,7 +1094,8 @@ public sealed partial class EmueraEngine : IDisposable
             TimeoutMilliseconds: timeoutMs,
             TimeoutMessage: timeoutMsg,
             AllowMouseHitTest: Options.UseMouse && (flags & WaitInputFlags.DisableMouseHitTest) == 0,
-            ActiveButtons: activeButtons);
+            ActiveButtons: activeButtons,
+            CanSkipWithMessageSkip: (flags & WaitInputFlags.CanSkipWithMessageSkip) != 0);
         Status = EngineStepStatus.WaitingInput;
         NotifyRedrawFlush();
         EmitSnapshotInternal();
@@ -1386,7 +1406,7 @@ public sealed partial class EmueraEngine : IDisposable
         bool useDefaultColor = (flags & PrintModifierFlags.DefaultColor) != 0;
         bool isPlainText = (flags & PrintModifierFlags.PlainText) != 0;
 
-        _displayOperations.Add(new DisplayOperation(
+        RecordDisplayOperation(new DisplayOperation(
             DisplayOperationKind.PrintTextSpan,
             default,
             projected,
@@ -1439,7 +1459,7 @@ public sealed partial class EmueraEngine : IDisposable
             }
 
             RegisterButtonDescriptor(projected, isInt: true, btnVal);
-            _displayOperations.Add(new DisplayOperation(
+            RecordDisplayOperation(new DisplayOperation(
                 DisplayOperationKind.PrintButtonSpan,
                 default,
                 projected,
@@ -1507,7 +1527,7 @@ public sealed partial class EmueraEngine : IDisposable
     internal void PrintButtonSpan(string label, bool isInt, long intVal, string? strVal)
     {
         RegisterButtonDescriptor(label, isInt, intVal, strVal);
-        _displayOperations.Add(new DisplayOperation(
+        RecordDisplayOperation(new DisplayOperation(
             DisplayOperationKind.PrintButtonSpan,
             default,
             label,
@@ -1549,7 +1569,7 @@ public sealed partial class EmueraEngine : IDisposable
 
     internal void PrintNewLine()
     {
-        _displayOperations.Add(new DisplayOperation(DisplayOperationKind.NewLine, default));
+        RecordDisplayOperation(new DisplayOperation(DisplayOperationKind.NewLine, default));
         ConsoleBuffer.NewLine();
         SyncLineCount();
     }
@@ -1592,7 +1612,7 @@ public sealed partial class EmueraEngine : IDisposable
     internal void PrintDrawLine(string? customPattern = null)
     {
         string line = BuildLineString(customPattern);
-        _displayOperations.Add(new DisplayOperation(DisplayOperationKind.DrawLineRule, default, line, CurrentForeColorRgba, CurrentFontName, Options.FontSize));
+        RecordDisplayOperation(new DisplayOperation(DisplayOperationKind.DrawLineRule, default, line, CurrentForeColorRgba, CurrentFontName, Options.FontSize));
         ConsoleBuffer.PrintLine(line);
         SyncLineCount();
     }
@@ -1618,26 +1638,30 @@ public sealed partial class EmueraEngine : IDisposable
     {
         ConsoleBuffer.CurrentFontFamily = CurrentFontName;
         ConsoleBuffer.FontStyle = (FontStyleFlags)(CurrentFontStyle & 0xF);
+        string plainText;
         if (isIsland)
         {
             ConsoleBuffer.HtmlPrintIsland(html);
+            plainText = HtmlPrintEngine.ToPlainText(html);
         }
         else if (noNewLine)
         {
             ConsoleBuffer.HtmlPrint(html, noWrap: false, noNewLine: true);
+            plainText = HtmlPrintEngine.ToPlainText(html);
         }
         else
         {
             ConsoleBuffer.HtmlPrint(html, noWrap: false, noNewLine: false);
             SyncLineCount();
+            plainText = ConsoleBuffer.LastCommittedPlainText;
         }
 
         // Also register any <button value='...'> elements parsed from HTML into current button generation!
         ExtractHtmlButtons(html);
-        _displayOperations.Add(new DisplayOperation(DisplayOperationKind.PrintTextSpan, default, HtmlPrintEngine.ToPlainText(html), CurrentForeColorRgba, CurrentFontName, Options.FontSize));
+        RecordDisplayOperation(new DisplayOperation(DisplayOperationKind.PrintTextSpan, default, plainText, CurrentForeColorRgba, CurrentFontName, Options.FontSize));
         if (!noNewLine && !isIsland)
         {
-            _displayOperations.Add(new DisplayOperation(DisplayOperationKind.NewLine, default));
+            RecordDisplayOperation(new DisplayOperation(DisplayOperationKind.NewLine, default));
         }
     }
 

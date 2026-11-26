@@ -37,7 +37,8 @@ public sealed record InputRequest(
     long? TimeoutMilliseconds = null,
     string? TimeoutMessage = null,
     bool AllowMouseHitTest = true,
-    IReadOnlyList<ButtonDescriptor>? ActiveButtons = null);
+    IReadOnlyList<ButtonDescriptor>? ActiveButtons = null,
+    bool CanSkipWithMessageSkip = false);
 
 /// <summary>
 /// Captures CBG button-map and HTML srcm color-pick hit-test slots written to RESULT:3, RESULT:4, and RESULT:6.

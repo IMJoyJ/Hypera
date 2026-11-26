@@ -1061,6 +1061,107 @@ public sealed class StandaloneHostTests
         }
     }
 
+    [Fact]
+    public void MessageSkipFlags_DistinguishSkippableWaitsFromForceWaitAndInteractiveInput_AndGlyphCachePreservesMetrics()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_skip_glyph_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                PRINTFORMW Line 1 (skippable)
+                WAIT
+                TWAIT 500, 0
+                FORCEWAIT
+                TWAIT 500, 1
+                FOR LOCAL, 0, 50
+                    PRINTFORMW Batch line {LOCAL}
+                NEXT
+                INPUT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+            EmueraEngine engine = host.Engine;
+
+            // 1. PRINTFORMW -> skippable AnyKey
+            Assert.Equal(EngineStepStatus.WaitingInput, engine.Step());
+            Assert.Equal(InputRequestKind.AnyKey, engine.PendingInputRequest!.Kind);
+            Assert.True(engine.PendingInputRequest.CanSkipWithMessageSkip);
+            engine.SubmitInput(new InputResponse(engine.PendingInputRequest.GenerationId));
+
+            // 2. WAIT -> skippable AnyKey
+            Assert.Equal(EngineStepStatus.WaitingInput, engine.Step());
+            Assert.Equal(InputRequestKind.AnyKey, engine.PendingInputRequest!.Kind);
+            Assert.True(engine.PendingInputRequest.CanSkipWithMessageSkip);
+            engine.SubmitInput(new InputResponse(engine.PendingInputRequest.GenerationId));
+
+            // 3. TWAIT 500, 0 -> skippable TimedWait
+            Assert.Equal(EngineStepStatus.WaitingInput, engine.Step());
+            Assert.Equal(InputRequestKind.TimedWait, engine.PendingInputRequest!.Kind);
+            Assert.True(engine.PendingInputRequest.CanSkipWithMessageSkip);
+            engine.SubmitInput(new InputResponse(engine.PendingInputRequest.GenerationId, IsTimeout: true));
+
+            // 4. FORCEWAIT -> UNSKIPPABLE AnyKey
+            Assert.Equal(EngineStepStatus.WaitingInput, engine.Step());
+            Assert.Equal(InputRequestKind.AnyKey, engine.PendingInputRequest!.Kind);
+            Assert.False(engine.PendingInputRequest.CanSkipWithMessageSkip);
+            engine.SubmitInput(new InputResponse(engine.PendingInputRequest.GenerationId));
+
+            // 5. TWAIT 500, 1 -> UNSKIPPABLE TimedWait
+            Assert.Equal(EngineStepStatus.WaitingInput, engine.Step());
+            Assert.Equal(InputRequestKind.TimedWait, engine.PendingInputRequest!.Kind);
+            Assert.False(engine.PendingInputRequest.CanSkipWithMessageSkip);
+            engine.SubmitInput(new InputResponse(engine.PendingInputRequest.GenerationId, IsTimeout: true));
+
+            // 6. Burst of 50 PRINTFORMW skipped in a tight loop stops cleanly at INPUT (CanSkipWithMessageSkip == false)
+            int skipped = 0;
+            while (true)
+            {
+                engine.Step();
+                if (engine.Status == EngineStepStatus.WaitingInput &&
+                    engine.PendingInputRequest is { CanSkipWithMessageSkip: true } req)
+                {
+                    engine.SubmitInput(new InputResponse(req.GenerationId));
+                    skipped++;
+                    continue;
+                }
+
+                break;
+            }
+
+            Assert.Equal(50, skipped);
+            Assert.Equal(EngineStepStatus.WaitingInput, engine.Status);
+            Assert.Equal(InputRequestKind.IntValue, engine.PendingInputRequest!.Kind);
+            Assert.False(engine.PendingInputRequest.CanSkipWithMessageSkip);
+
+            // 7. Verify cached GlyphMeasurer widths and repeated DrawText calls stay deterministic & pixel-consistent
+            string sample = "【テスト】カード名 ★☆ ━━━━━━━━ 123";
+            float w1 = engine.Glyphs.MeasureTextWidth(sample, 16f, "ＭＳ ゴシック");
+            float w2 = engine.Glyphs.MeasureTextWidth(sample, 16f, "ＭＳ ゴシック");
+            float wSpan = engine.Glyphs.MeasureTextWidth(sample.AsSpan(), 16f, "ＭＳ ゴシック");
+            Assert.True(w1 > 0f);
+            Assert.Equal(w1, w2, precision: 3);
+            Assert.Equal(w1, wSpan, precision: 3);
+
+            using var surface = SkiaSharp.SKSurface.Create(new SkiaSharp.SKImageInfo(640, 64, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Premul));
+            float d1 = engine.Glyphs.DrawText(surface.Canvas, sample, 4f, 8f, 16f, "ＭＳ ゴシック", FontStyleFlags.Underline, SkiaSharp.SKColors.White);
+            float d2 = engine.Glyphs.DrawText(surface.Canvas, sample, 4f, 32f, 16f, "ＭＳ ゴシック", FontStyleFlags.Underline, SkiaSharp.SKColors.Yellow);
+            Assert.Equal(w1, d1, precision: 2);
+            Assert.Equal(d1, d2, precision: 3);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
     private static string LocateProjectBinDirectory(string projectName, string probeFile)
     {
         string testsBin = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);

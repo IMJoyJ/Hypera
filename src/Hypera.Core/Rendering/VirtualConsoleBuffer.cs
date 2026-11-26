@@ -144,6 +144,7 @@ public sealed class VirtualConsoleBuffer
     public int PhysicalLineCount => _physicalLines.Count;
     public bool HasPendingLine => _pendingHtmlBuffer.Length > 0;
     public bool LastOutputWasInPlaceReplacement { get; private set; }
+    internal string LastCommittedPlainText => _physicalLines.Count > 0 ? _physicalLines[^1].PlainText : string.Empty;
     public int ScrollOffsetLines
     {
         get => _scrollOffsetLines;

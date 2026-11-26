@@ -61,6 +61,8 @@ public sealed class MainForm : Form
     private bool _hasPersistedNormalBounds;
     private bool _isWindowShown;
     private bool _isApplyingWindowSettings;
+    private int _lastScrollMax = -1;
+    private int _lastScrollCurrent = -1;
 
     public MainForm(StandaloneLaunchOptions initialOptions)
     {
@@ -344,7 +346,14 @@ public sealed class MainForm : Form
 
             BeginInvoke(FocusInputTextBox);
         };
-        Deactivate += (_, _) => { if (_session is not null) _session.Engine.IsWindowActive = false; };
+        Deactivate += (_, _) =>
+        {
+            if (_session is not null)
+            {
+                _session.Engine.IsWindowActive = false;
+                _session.Engine.IsMouseSkip = false;
+            }
+        };
         KeyDown += OnGlobalKeyDown;
         KeyUp += OnGlobalKeyUp;
         DragEnter += OnFormDragEnter;
@@ -1101,6 +1110,13 @@ public sealed class MainForm : Form
     {
         int maxScroll = _skiaView.MaxScrollbackOffset;
         int currentScroll = Math.Clamp(_skiaView.ScrollbackOffset, 0, maxScroll);
+        if (maxScroll == _lastScrollMax && currentScroll == _lastScrollCurrent)
+        {
+            return;
+        }
+
+        _lastScrollMax = maxScroll;
+        _lastScrollCurrent = currentScroll;
 
         _syncingScrollBar = true;
         try

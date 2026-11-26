@@ -153,9 +153,10 @@ public sealed class SkiaFrameCompositor : IDisposable
         canvas.Scale(box.Scale, box.Scale);
         canvas.ClipRect(new SKRect(0, 0, scene.Viewport.LogicalWidth, scene.Viewport.LogicalHeight));
 
-        // 1. Background solid color
-        using (var bgPaint = new SKPaint { Color = RenderingColor.FromRgba(scene.BackgroundColorRgba), Style = SKPaintStyle.Fill })
+        // 1. Background solid color (skip redundant full-viewport fill when already cleared to opaque black)
+        if (scene.BackgroundColorRgba != 0x000000FFu)
         {
+            using var bgPaint = new SKPaint { Color = RenderingColor.FromRgba(scene.BackgroundColorRgba), Style = SKPaintStyle.Fill };
             canvas.DrawRect(0, 0, scene.Viewport.LogicalWidth, scene.Viewport.LogicalHeight, bgPaint);
         }
 

@@ -46,7 +46,9 @@ public class HyperaSkiaControl : SKControl
     private long _trackedGenerationId = -1;
     private long _lastObservedFlushSeq = -1;
     private long _timeoutDeadlineTimestamp;
+    private long _awaitResumeTimestamp;
     private long _lastAnimationRedrawMs;
+    private long _lastPaintElapsedMs;
     private bool _autoSubmitEngineInput = true;
     private bool _focusOnMouseDown = true;
     private bool _isTicking;
@@ -88,6 +90,8 @@ public class HyperaSkiaControl : SKControl
             _trackedGenerationId = -1;
             _lastObservedFlushSeq = _engine?.RedrawFlushSequence ?? -1;
             _timeoutDeadlineTimestamp = 0;
+            _awaitResumeTimestamp = 0;
+            _lastPaintElapsedMs = 0;
             _faultRaised = false;
             _completionRaised = false;
             _pendingHoverRefresh = false;
@@ -288,10 +292,14 @@ public class HyperaSkiaControl : SKControl
         {
             ClearHoverState();
             ScrollToBottom();
+            PumpEngineSlice(fromUserInput: true);
+        }
+        else
+        {
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
         }
 
-        Invalidate();
-        ContentUpdated?.Invoke(this, EventArgs.Empty);
         return accepted;
     }
 
@@ -312,8 +320,7 @@ public class HyperaSkiaControl : SKControl
             SubmitResponseForKind(engine, req, single);
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            PumpEngineSlice(fromUserInput: true);
             return true;
         }
 
@@ -322,8 +329,7 @@ public class HyperaSkiaControl : SKControl
             engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: keyChar, StringValue: keyChar.ToString()));
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            PumpEngineSlice(fromUserInput: true);
             return true;
         }
 
@@ -345,8 +351,7 @@ public class HyperaSkiaControl : SKControl
             engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: (int)keyCode, StringValue: keyCode.ToString()));
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            PumpEngineSlice(fromUserInput: true);
             return true;
         }
 
@@ -355,8 +360,7 @@ public class HyperaSkiaControl : SKControl
             engine.SubmitInput(new InputResponse(req.GenerationId, StringValue: keyCode.ToString()));
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            PumpEngineSlice(fromUserInput: true);
             return true;
         }
 
@@ -386,7 +390,9 @@ public class HyperaSkiaControl : SKControl
 
         if (_engine is { } engine)
         {
-            engine.ElapsedAnimationMs = _animationStopwatch.ElapsedMilliseconds;
+            long elapsedMs = _animationStopwatch.ElapsedMilliseconds;
+            engine.ElapsedAnimationMs = elapsedMs;
+            _lastPaintElapsedMs = elapsedMs;
             bool isRedrawFrozen = _frozenRedrawScene is not null &&
                                   engine.CurrentRedrawMode == 0 &&
                                   engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded &&
@@ -497,14 +503,23 @@ public class HyperaSkiaControl : SKControl
 
         if (_engine is { } engine)
         {
-            if (e.Button == MouseButtons.Right)
+            bool rightDown = e.Button == MouseButtons.Right;
+            if (rightDown)
             {
                 engine.IsMouseSkip = true;
             }
 
-            if (_autoSubmitEngineInput && inside)
+            if (_autoSubmitEngineInput)
             {
-                TrySubmitPointerToEngine(engine, pt, e.Button);
+                if (!TrySubmitPointerToEngine(engine, pt, inside, e.Button) && rightDown)
+                {
+                    // Right-click held while running/awaiting: immediately accelerate current slice without waiting for next timer tick.
+                    PumpEngineSlice(fromUserInput: true);
+                }
+            }
+            else if (rightDown)
+            {
+                PumpEngineSlice(fromUserInput: true);
             }
         }
     }
@@ -594,7 +609,10 @@ public class HyperaSkiaControl : SKControl
         _inputBuffer.Append(e.KeyChar);
     }
 
-    private void OnFrameTimerTick(object? sender, EventArgs e)
+    private void OnFrameTimerTick(object? sender, EventArgs e) =>
+        PumpEngineSlice(fromUserInput: false);
+
+    private void PumpEngineSlice(bool fromUserInput)
     {
         if (_isTicking || _engine is not { } engine)
         {
@@ -604,34 +622,106 @@ public class HyperaSkiaControl : SKControl
         _isTicking = true;
         try
         {
+            long nowTs = Stopwatch.GetTimestamp();
             long elapsedMs = _animationStopwatch.ElapsedMilliseconds;
             engine.ElapsedAnimationMs = elapsedMs;
 
+            // Safety guard: clear IsMouseSkip if the right mouse button was released outside our control.
+            if (!fromUserInput && engine.IsMouseSkip && (Control.MouseButtons & MouseButtons.Right) == 0)
+            {
+                engine.IsMouseSkip = false;
+            }
+
+            bool skipActive = engine.IsMouseSkip || engine.IsMessageSkip;
+            if (fromUserInput || skipActive)
+            {
+                _awaitResumeTimestamp = 0;
+            }
+            else if (_awaitResumeTimestamp > 0 && nowTs >= _awaitResumeTimestamp)
+            {
+                _awaitResumeTimestamp = 0;
+            }
+
             bool needsRepaint = false;
             bool contentChanged = false;
+            bool stepped = false;
 
-            if (engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded)
+            if (_awaitResumeTimestamp == 0)
             {
-                long sliceDeadline = Stopwatch.GetTimestamp() +
-                                     (long)(_maxStepSliceMs * (Stopwatch.Frequency / 1000.0));
+                long sliceDeadline = nowTs + (long)(_maxStepSliceMs * (Stopwatch.Frequency / 1000.0));
                 int batches = 0;
-                do
+
+                while (batches < 4096)
                 {
+                    if (engine.Status == EngineStepStatus.WaitingInput && engine.PendingInputRequest is { } pendingReq)
+                    {
+                        bool canAutoSkip = (engine.IsMouseSkip || engine.IsMessageSkip) && pendingReq.CanSkipWithMessageSkip;
+                        if (canAutoSkip)
+                        {
+                            _timeoutDeadlineTimestamp = 0;
+                            _trackedGenerationId = -1;
+                            engine.SubmitInput(new InputResponse(
+                                pendingReq.GenerationId,
+                                IsTimeout: pendingReq.Kind == InputRequestKind.TimedWait));
+                            stepped = true;
+                        }
+                        else if (_trackedGenerationId == pendingReq.GenerationId &&
+                                 _timeoutDeadlineTimestamp > 0 &&
+                                 Stopwatch.GetTimestamp() >= _timeoutDeadlineTimestamp)
+                        {
+                            _timeoutDeadlineTimestamp = 0;
+                            _trackedGenerationId = -1;
+                            engine.SubmitInput(new InputResponse(pendingReq.GenerationId, IsTimeout: true));
+                            stepped = true;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+
+                    if (engine.Status is not (EngineStepStatus.Running or EngineStepStatus.Yielded))
+                    {
+                        break;
+                    }
+
+                    long flushBefore = engine.RedrawFlushSequence;
                     engine.Step();
                     batches++;
+                    stepped = true;
 
-                    // Yield immediately when AWAIT / REDRAW 2 explicitly requests a frame flush so
-                    // progress bars (e.g. CARD_TEXT_CACHE "初回検索中 XX%") actually present on screen.
-                    if (engine.Status == EngineStepStatus.Yielded &&
-                        engine.RedrawFlushSequence != _lastObservedFlushSeq)
+                    if (engine.Status == EngineStepStatus.Yielded)
+                    {
+                        long awaitMs = engine.LastAwaitMilliseconds;
+                        bool skipNow = engine.IsMouseSkip || engine.IsMessageSkip;
+                        if (awaitMs > 1 && !skipNow)
+                        {
+                            // Explicit timed AWAIT (e.g. AWAIT 100 / AWAIT 1000): present now and resume after delay.
+                            _awaitResumeTimestamp = Stopwatch.GetTimestamp() +
+                                (long)(awaitMs * (Stopwatch.Frequency / 1000.0));
+                            break;
+                        }
+
+                        // Under REDRAW 0, honor explicit flush banners (e.g. "初回検索中 5%") at most once per frame interval
+                        // so progress updates appear cleanly without stalling fast AWAIT 1 loops for 16-31ms per iteration.
+                        if (engine.CurrentRedrawMode == 0 &&
+                            engine.RedrawFlushSequence != flushBefore &&
+                            !skipNow &&
+                            elapsedMs - _lastPaintElapsedMs >= _frameIntervalMs)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (Stopwatch.GetTimestamp() >= sliceDeadline)
                     {
                         break;
                     }
                 }
-                while (engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded &&
-                       Stopwatch.GetTimestamp() < sliceDeadline &&
-                       batches < 32);
+            }
 
+            if (stepped)
+            {
                 _scrollbackOffset = 0;
                 engine.ConsoleBuffer.ScrollOffsetLines = 0;
                 ClearHoverState();
@@ -670,20 +760,6 @@ public class HyperaSkiaControl : SKControl
                     _frozenRedrawScene = null;
                     _lastObservedFlushSeq = engine.RedrawFlushSequence;
                     _pendingHoverRefresh = true;
-                    contentChanged = true;
-                    needsRepaint = true;
-                }
-                else if (engine.IsMouseSkip && req.Kind is InputRequestKind.AnyKey or InputRequestKind.TimedWait)
-                {
-                    _timeoutDeadlineTimestamp = 0;
-                    engine.SubmitInput(new InputResponse(req.GenerationId, IsTimeout: req.Kind == InputRequestKind.TimedWait));
-                    contentChanged = true;
-                    needsRepaint = true;
-                }
-                else if (_timeoutDeadlineTimestamp > 0 && Stopwatch.GetTimestamp() >= _timeoutDeadlineTimestamp)
-                {
-                    _timeoutDeadlineTimestamp = 0;
-                    engine.SubmitInput(new InputResponse(req.GenerationId, IsTimeout: true));
                     contentChanged = true;
                     needsRepaint = true;
                 }
@@ -869,11 +945,11 @@ public class HyperaSkiaControl : SKControl
         }
     }
 
-    private void TrySubmitPointerToEngine(EmueraEngine engine, LogicalPoint pt, MouseButtons button)
+    private bool TrySubmitPointerToEngine(EmueraEngine engine, LogicalPoint pt, bool inside, MouseButtons button)
     {
         if (engine.Status != EngineStepStatus.WaitingInput || engine.PendingInputRequest is not { } req)
         {
-            return;
+            return false;
         }
 
         int mouseBtnCode = button switch
@@ -886,7 +962,25 @@ public class HyperaSkiaControl : SKControl
 
         if (mouseBtnCode == 0)
         {
-            return;
+            return false;
+        }
+
+        // Allow clicking anywhere on the viewport (including letterbox margins) to advance PRINTW / WAIT / skippable TWAIT.
+        if (!inside)
+        {
+            if (req.Kind == InputRequestKind.AnyKey ||
+                (req.Kind == InputRequestKind.TimedWait && req.CanSkipWithMessageSkip))
+            {
+                engine.SubmitInput(new InputResponse(
+                    req.GenerationId,
+                    IsTimeout: req.Kind == InputRequestKind.TimedWait));
+                ClearHoverState();
+                ScrollToBottom();
+                PumpEngineSlice(fromUserInput: true);
+                return true;
+            }
+
+            return false;
         }
 
         ConsoleScene scene = _lastRenderedScene ?? engine.ConsoleBuffer.CaptureScene(
@@ -911,24 +1005,26 @@ public class HyperaSkiaControl : SKControl
             engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: intVal, StringValue: strVal, HitTest: hitSlots));
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
-            return;
+            PumpEngineSlice(fromUserInput: true);
+            return true;
         }
 
-        if (req.Kind is InputRequestKind.AnyKey or InputRequestKind.TimedWait)
+        if (req.Kind == InputRequestKind.AnyKey ||
+            (req.Kind == InputRequestKind.TimedWait && req.CanSkipWithMessageSkip))
         {
-            engine.SubmitInput(new InputResponse(req.GenerationId, HitTest: hitSlots));
+            engine.SubmitInput(new InputResponse(
+                req.GenerationId,
+                IsTimeout: req.Kind == InputRequestKind.TimedWait,
+                HitTest: hitSlots));
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
-            return;
+            PumpEngineSlice(fromUserInput: true);
+            return true;
         }
 
         if (button != MouseButtons.Left || !req.AllowMouseHitTest)
         {
-            return;
+            return false;
         }
 
         if (hit.HasActiveButton && hit.ActiveButton is { } activeBtn)
@@ -939,9 +1035,8 @@ public class HyperaSkiaControl : SKControl
             engine.SubmitInput(resp);
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
-            return;
+            PumpEngineSlice(fromUserInput: true);
+            return true;
         }
 
         if (hit.HasCbgButtonMapHit)
@@ -949,9 +1044,8 @@ public class HyperaSkiaControl : SKControl
             engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: hit.CbgButtonMapColor, HitTest: hitSlots));
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
-            return;
+            PumpEngineSlice(fromUserInput: true);
+            return true;
         }
 
         if (hit.HasSrcMapHit)
@@ -959,9 +1053,8 @@ public class HyperaSkiaControl : SKControl
             engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: hit.SrcMapColor, HitTest: hitSlots));
             ClearHoverState();
             ScrollToBottom();
-            Invalidate();
-            ContentUpdated?.Invoke(this, EventArgs.Empty);
-            return;
+            PumpEngineSlice(fromUserInput: true);
+            return true;
         }
 
         if (req.ActiveButtons is not null)
@@ -976,12 +1069,13 @@ public class HyperaSkiaControl : SKControl
                     engine.SubmitInput(resp);
                     ClearHoverState();
                     ScrollToBottom();
-                    Invalidate();
-                    ContentUpdated?.Invoke(this, EventArgs.Empty);
-                    return;
+                    PumpEngineSlice(fromUserInput: true);
+                    return true;
                 }
             }
         }
+
+        return false;
     }
 
     private static DisplaySnapshot ApplyScrollbackOffset(DisplaySnapshot snapshot, int scrollbackLines)

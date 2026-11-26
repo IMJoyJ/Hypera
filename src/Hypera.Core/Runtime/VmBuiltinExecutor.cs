@@ -2146,7 +2146,8 @@ internal static partial class VmBuiltinExecutor
             case BuiltinInstructionKind.WAIT:
             case BuiltinInstructionKind.WAITANYKEY:
             case BuiltinInstructionKind.FORCEWAIT:
-                return (!engine.IsSkipDisplay || kind == BuiltinInstructionKind.FORCEWAIT) && engine.IssueAnyKeyWait()
+                return (!engine.IsSkipDisplay || kind == BuiltinInstructionKind.FORCEWAIT) &&
+                       engine.IssueAnyKeyWait(canSkipWithMessageSkip: kind != BuiltinInstructionKind.FORCEWAIT)
                     ? EngineStepStatus.WaitingInput
                     : null;
 
