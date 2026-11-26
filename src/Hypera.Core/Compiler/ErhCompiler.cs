@@ -535,6 +535,7 @@ public sealed class ErhCompiler
 
             ImmutableArray<ExprNode?> initTerms = _expressionParser.ParseArgumentList(
                 ts, closingDelimiter: null, ownerFunction, line.FilePath, diagnostics);
+
             if (initTerms.Length == 0)
             {
                 diagnostics.ReportError("ERA1517", "Expected at least one constant initializer after '=' in #DIM/#DIMS.", lineSpan, line.FilePath, line.RawLineText, [], "diag.erh.ERA1517");

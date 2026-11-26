@@ -531,6 +531,17 @@ public sealed class VariableStore : IVariableStore
     // IVariableStore Implementation
     // -------------------------------------------------------------------------
 
+    public bool TryResolveExistingSlot(string name, out int slotId)
+    {
+        if (string.IsNullOrEmpty(name))
+        {
+            slotId = -1;
+            return false;
+        }
+
+        return _nameToSlot.TryGetValue(name, out slotId);
+    }
+
     public bool TryResolveSlot(string name, out int slotId)
     {
         if (string.IsNullOrEmpty(name))
@@ -1427,16 +1438,30 @@ public sealed class VariableStore : IVariableStore
 
         long[]? intData = null;
         string[]? strData = null;
+        long[]? initialInts = null;
+        string[]? initialStrs = null;
         if (!isChara && calcKind == BuiltinCalcKind.None)
         {
             if (desc.ValueKind == VariableValueKind.Int)
             {
                 intData = new long[total];
+                if (!desc.DefaultIntValues.IsDefaultOrEmpty)
+                {
+                    initialInts = [.. desc.DefaultIntValues];
+                    int n = Math.Min(initialInts.Length, intData.Length);
+                    initialInts.AsSpan(0, n).CopyTo(intData);
+                }
             }
             else
             {
                 strData = new string[total];
                 Array.Fill(strData, string.Empty);
+                if (!desc.DefaultStrValues.IsDefaultOrEmpty)
+                {
+                    initialStrs = [.. desc.DefaultStrValues];
+                    int n = Math.Min(initialStrs.Length, strData.Length);
+                    initialStrs.AsSpan(0, n).CopyTo(strData);
+                }
             }
         }
 
@@ -1460,6 +1485,8 @@ public sealed class VariableStore : IVariableStore
             CalcKind = calcKind,
             IntData = intData,
             StrData = strData,
+            InitialIntValues = initialInts,
+            InitialStrValues = initialStrs,
         };
 
         StoreSlotAt(desc.SlotId, storage);

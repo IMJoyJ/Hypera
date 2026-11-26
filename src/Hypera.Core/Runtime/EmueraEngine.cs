@@ -724,7 +724,7 @@ public sealed class EmueraEngine : IDisposable
             return;
         }
 
-        if (p.RegisterOrSlotIndex < callee.LocalSlots.Length &&
+        if ((uint)p.RegisterOrSlotIndex < (uint)callee.LocalSlots.Length &&
             callee.LocalSlots[p.RegisterOrSlotIndex] is { ValueKind: VariableValueKind.Int } loc &&
             string.Equals(loc.Name, p.Name, StringComparison.OrdinalIgnoreCase))
         {
@@ -745,7 +745,7 @@ public sealed class EmueraEngine : IDisposable
             return;
         }
 
-        if (p.RegisterOrSlotIndex < callee.LocalSlots.Length &&
+        if ((uint)p.RegisterOrSlotIndex < (uint)callee.LocalSlots.Length &&
             callee.LocalSlots[p.RegisterOrSlotIndex] is { ValueKind: VariableValueKind.Str } loc &&
             string.Equals(loc.Name, p.Name, StringComparison.OrdinalIgnoreCase))
         {
@@ -763,12 +763,12 @@ public sealed class EmueraEngine : IDisposable
             return;
         }
 
-        if (HasRegisteredName($"ARG@{funcName}") && FastVariables.TryResolveSlot($"ARG@{funcName}", out int argSlot))
+        if (FastVariables.TryResolveExistingSlot($"ARG@{funcName}", out int argSlot))
         {
             FastVariables.GetIntSpan(argSlot).Clear();
         }
 
-        if (HasRegisteredName($"ARGS@{funcName}") && FastVariables.TryResolveSlot($"ARGS@{funcName}", out int argsSlot))
+        if (FastVariables.TryResolveExistingSlot($"ARGS@{funcName}", out int argsSlot))
         {
             FastVariables.GetStrSpan(argsSlot).Fill(string.Empty);
         }
@@ -779,17 +779,8 @@ public sealed class EmueraEngine : IDisposable
         ResetFunctionArgStatics(funcName);
     }
 
-    private bool HasRegisteredName(string varName)
-    {
-        if (FastVariables is null) return false;
-        StringComparison cmp = Module.CompilerOptions.IgnoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-        foreach (string k in FastVariables.VariableNames)
-        {
-            if (string.Equals(k, varName, cmp)) return true;
-        }
-
-        return false;
-    }
+    private bool HasRegisteredName(string varName) =>
+        FastVariables is not null && FastVariables.TryResolveExistingSlot(varName, out _);
 
     internal void CompleteCurrentFrameVoid()
     {

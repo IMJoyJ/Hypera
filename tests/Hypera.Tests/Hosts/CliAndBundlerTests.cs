@@ -109,6 +109,95 @@ public sealed class CliAndBundlerTests
         }
     }
 
+    [Fact]
+    public void HyperaCli_CompilePackAndRun_PrintAllDiagnosticsSortedWithSummaryAndExitCodeOne()
+    {
+        string cliBinDir = LocateHyperaCliOutputDirectory();
+        string hyperaDll = Path.Combine(cliBinDir, "hypera.dll");
+        Assert.True(File.Exists(hyperaDll), $"Expected hypera.dll at '{hyperaDll}'.");
+
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_cli_diag_test_{Guid.NewGuid():N}");
+        string gameDir = Path.Combine(workDir, "Game");
+        string erbDir = Path.Combine(gameDir, "ERB");
+        Directory.CreateDirectory(erbDir);
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(erbDir, "A_Errors.erb"),
+                """
+                @SYSTEM_TITLE
+                CALL B_WARNINGS_AND_ERRORS
+                A:0 = UNKNOWN_IN_A
+                """);
+
+            File.WriteAllText(
+                Path.Combine(erbDir, "B_Errors.erb"),
+                """
+                @B_WARNINGS_AND_ERRORS
+                A:1 == 1
+                A:2 = UNKNOWN_IN_B_FIRST
+                A:3 = UNKNOWN_IN_B_SECOND
+                """);
+
+            string hebOut = Path.Combine(workDir, "should_not_exist.heb");
+            string hepOut = Path.Combine(workDir, "should_not_exist.hep");
+
+            // 1. hypera compile prints ALL diagnostics + summary to stderr and exits with code 1
+            (int compileExit, _, string compileStderr) = RunProcessCapturingExit(
+                "dotnet",
+                [hyperaDll, "compile", gameDir, "-o", hebOut],
+                workDir);
+            Assert.Equal(1, compileExit);
+            Assert.False(File.Exists(hebOut));
+
+            AssertContainsAllOrderedDiagnostics(compileStderr);
+
+            // 2. hypera pack also catches EmueraCompileException and prints batch diagnostics
+            (int packExit, _, string packStderr) = RunProcessCapturingExit(
+                "dotnet",
+                [hyperaDll, "pack", gameDir, "-o", hepOut],
+                workDir);
+            Assert.Equal(1, packExit);
+            Assert.False(File.Exists(hepOut));
+            AssertContainsAllOrderedDiagnostics(packStderr);
+
+            // 3. hypera run also catches EmueraCompileException and prints batch diagnostics
+            (int runExit, _, string runStderr) = RunProcessCapturingExit(
+                "dotnet",
+                [hyperaDll, "run", gameDir],
+                workDir);
+            Assert.Equal(1, runExit);
+            AssertContainsAllOrderedDiagnostics(runStderr);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir))
+            {
+                Directory.Delete(workDir, recursive: true);
+            }
+        }
+    }
+
+    private static void AssertContainsAllOrderedDiagnostics(string stderr)
+    {
+        Assert.Contains("ERA1426", stderr);
+        Assert.Contains("ERA1555", stderr);
+        Assert.Contains("UNKNOWN_IN_A", stderr);
+        Assert.Contains("UNKNOWN_IN_B_FIRST", stderr);
+        Assert.Contains("UNKNOWN_IN_B_SECOND", stderr);
+        Assert.Contains("[hypera] Compilation failed: 3 error(s), 1 warning(s) across 2 file(s).", stderr);
+
+        // Severity ordering: errors sorted before warning; file ordering: A_Errors before B_Errors
+        int idxA = stderr.IndexOf("UNKNOWN_IN_A", StringComparison.Ordinal);
+        int idxB1 = stderr.IndexOf("UNKNOWN_IN_B_FIRST", StringComparison.Ordinal);
+        int idxB2 = stderr.IndexOf("UNKNOWN_IN_B_SECOND", StringComparison.Ordinal);
+        int idxWarn = stderr.IndexOf("ERA1555", StringComparison.Ordinal);
+
+        Assert.True(idxA >= 0 && idxB1 > idxA && idxB2 > idxB1 && idxWarn > idxB2,
+            $"Unexpected diagnostic ordering in stderr:\n{stderr}");
+    }
+
     private static string LocateHyperaCliOutputDirectory()
     {
         string testsBin = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -188,6 +277,16 @@ public sealed class CliAndBundlerTests
 
     private static string RunProcess(string fileName, IEnumerable<string> arguments, string workingDirectory)
     {
+        (int exitCode, string stdout, string stderr) = RunProcessCapturingExit(fileName, arguments, workingDirectory);
+        Assert.True(exitCode == 0, $"Command '{fileName} {string.Join(' ', arguments)}' exited with {exitCode}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        return stdout;
+    }
+
+    private static (int ExitCode, string Stdout, string Stderr) RunProcessCapturingExit(
+        string fileName,
+        IEnumerable<string> arguments,
+        string workingDirectory)
+    {
         var psi = new ProcessStartInfo
         {
             FileName = fileName,
@@ -207,8 +306,6 @@ public sealed class CliAndBundlerTests
         string stdout = proc.StandardOutput.ReadToEnd();
         string stderr = proc.StandardError.ReadToEnd();
         proc.WaitForExit(30_000);
-
-        Assert.True(proc.ExitCode == 0, $"Command '{fileName} {string.Join(' ', arguments)}' exited with {proc.ExitCode}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
-        return stdout;
+        return (proc.ExitCode, stdout, stderr);
     }
 }

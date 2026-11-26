@@ -31,7 +31,7 @@ public enum WaitInputFlags : ushort
 /// </summary>
 internal static class VmDispatcher
 {
-    public static EngineStepStatus ExecuteStep(EmueraEngine engine, int budget)
+    public static EngineStepStatus ExecuteStep(EmueraEngine engine, int budget, int minCallDepth = 0)
     {
         BytecodeModule module = engine.Module;
         ReadOnlySpan<Instruction> insns = module.Instructions.AsSpan();
@@ -47,6 +47,11 @@ internal static class VmDispatcher
     ReloadFrame:
         while (executed < budget)
         {
+            if (minCallDepth > 0 && callStack.Count <= minCallDepth)
+            {
+                return EngineStepStatus.Yielded;
+            }
+
             if (callStack.Count == 0)
             {
                 if (engine.TryAdvanceEventsOrSystemFlow())

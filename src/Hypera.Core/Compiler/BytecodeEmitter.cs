@@ -326,29 +326,29 @@ internal sealed class FunctionBytecodeEmitter
 
     public FunctionDescriptor FinalizeFunctionDescriptor()
     {
-        // Ensure function ends with a Return instruction
-        if (_module.CurrentPc == _fn.EntryPc
-            || _module.GetInstruction(_module.CurrentPc - 1).Op is not (OpCode.ReturnVoid or OpCode.ReturnInt or OpCode.ReturnStr or OpCode.Halt))
+        // Always emit a dedicated epilogue Return instruction at the end of the function.
+        // Even when the physically last emitted instruction is Return* (e.g. a trailing
+        // `SIF cond` / `IF` / `SELECTCASE` branch ending in `RETURN`/`RETURNF`, or a trailing `$LABEL`),
+        // branch false/exit targets are patched to `_module.CurrentPc` and would otherwise
+        // fall through into the next function's instructions in the flat bytecode array.
+        if (_fn.IsMethod)
         {
-            if (_fn.IsMethod)
+            if (_fn.MethodReturnKind == VariableValueKind.Str)
             {
-                if (_fn.MethodReturnKind == VariableValueKind.Str)
-                {
-                    ushort r = AllocateStrReg();
-                    EmitLoadStrLiteral(r, string.Empty);
-                    _module.Emit(Instruction.Reg1(OpCode.ReturnStr, r));
-                }
-                else
-                {
-                    ushort r = AllocateIntReg();
-                    EmitLoadIntLiteral(r, 0);
-                    _module.Emit(Instruction.Reg1(OpCode.ReturnInt, r));
-                }
+                ushort r = AllocateStrReg();
+                EmitLoadStrLiteral(r, string.Empty);
+                _module.Emit(Instruction.Reg1(OpCode.ReturnStr, r));
             }
             else
             {
-                _module.Emit(Instruction.Simple(OpCode.ReturnVoid));
+                ushort r = AllocateIntReg();
+                EmitLoadIntLiteral(r, 0);
+                _module.Emit(Instruction.Reg1(OpCode.ReturnInt, r));
             }
+        }
+        else
+        {
+            _module.Emit(Instruction.Simple(OpCode.ReturnVoid));
         }
 
         _fn.InstructionCount = _module.CurrentPc - _fn.EntryPc;
@@ -365,9 +365,9 @@ internal sealed class FunctionBytecodeEmitter
                 paramName = $"{v.Name}:{sub0.Value}";
             }
 
-            ushort slotOrReg = _localSlotMap.TryGetValue(v, out int localIdx)
-                ? (ushort)localIdx
-                : (ushort)Math.Clamp(v.SlotId, 0, ushort.MaxValue);
+            int slotOrReg = _localSlotMap.TryGetValue(v, out int localIdx)
+                ? localIdx
+                : v.SlotId;
 
             paramDescriptors.Add(new FunctionParameterDescriptor(
                 Name: paramName,

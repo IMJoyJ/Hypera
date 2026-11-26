@@ -1,4 +1,5 @@
 using Hypera.Bytecode;
+using Hypera.Diagnostics;
 using Hypera.Runtime;
 using Hypera.VirtualFs;
 
@@ -82,8 +83,15 @@ public static class Program
 
         (string? headlessFramesDir, List<string> inputs) = ParseRunFlags(args[1..]);
         using var host = new AnsiConsoleHost(headlessFramesDir: headlessFramesDir, scriptedInputs: inputs);
-        using HyperaGameHost gameHost = HyperaGameHost.Load(targetPath);
-        return host.RunHost(gameHost);
+        try
+        {
+            using HyperaGameHost gameHost = HyperaGameHost.Load(targetPath);
+            return host.RunHost(gameHost);
+        }
+        catch (EmueraCompileException ex)
+        {
+            return ReportCompileDiagnostics(ex);
+        }
     }
 
     private static int HandleCompile(string[] args)
@@ -104,7 +112,16 @@ public static class Program
         string outputPath = ParseOptionValue(args[1..], "-o", "--output")
             ?? Path.Combine(Path.GetFullPath(sourceDir), "game.heb");
 
-        BytecodeModule module = CliCompilerBridge.CompileDirectory(sourceDir);
+        BytecodeModule module;
+        try
+        {
+            module = CliCompilerBridge.CompileDirectory(sourceDir);
+        }
+        catch (EmueraCompileException ex)
+        {
+            return ReportCompileDiagnostics(ex);
+        }
+
         string? outDir = Path.GetDirectoryName(Path.GetFullPath(outputPath));
         if (!string.IsNullOrEmpty(outDir))
         {
@@ -136,7 +153,16 @@ public static class Program
             ?? Path.Combine(Directory.GetCurrentDirectory(), Path.GetFileName(Path.GetFullPath(sourceDir).TrimEnd('\\', '/')) + ".hep");
         bool compress = !args.Contains("--no-compress", StringComparer.OrdinalIgnoreCase);
 
-        BytecodeModule? module = CliCompilerBridge.CompileDirectory(sourceDir);
+        BytecodeModule? module;
+        try
+        {
+            module = CliCompilerBridge.CompileDirectory(sourceDir);
+        }
+        catch (EmueraCompileException ex)
+        {
+            return ReportCompileDiagnostics(ex);
+        }
+
         if (module.Functions.Length == 0 && module.Instructions.Length == 0)
         {
             module = null;
@@ -207,6 +233,32 @@ public static class Program
         }
 
         return null;
+    }
+
+    private static int ReportCompileDiagnostics(EmueraCompileException ex)
+    {
+        IReadOnlyList<Diagnostic> diagnostics = ex.Diagnostics;
+        var ordered = diagnostics
+            .OrderByDescending(static d => (int)d.Severity)
+            .ThenBy(static d => d.FilePath ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(static d => d.Span.StartLine)
+            .ThenBy(static d => d.Span.StartColumn)
+            .ToList();
+
+        foreach (Diagnostic d in ordered)
+        {
+            Console.Error.WriteLine(d.ToString());
+        }
+
+        int errorCount = diagnostics.Count(static d => d.Severity == DiagnosticSeverity.Error);
+        int warningCount = diagnostics.Count(static d => d.Severity == DiagnosticSeverity.Warning);
+        int fileCount = diagnostics
+            .Select(static d => !string.IsNullOrEmpty(d.FilePath) ? d.FilePath : $"#{d.Span.FileId}")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+
+        Console.Error.WriteLine($"[hypera] Compilation failed: {errorCount} error(s), {warningCount} warning(s) across {fileCount} file(s).");
+        return 1;
     }
 
     private static int ReportUnknownCommand(string command)

@@ -888,7 +888,7 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
             engine.InvokeStaticCall(caller, callInsn, isTry: false, isJump: false);
             while (engine.InternalCallStack.Count > depthBefore + 1)
             {
-                EngineStepStatus st = VmDispatcher.ExecuteStep(engine, 100_000);
+                EngineStepStatus st = VmDispatcher.ExecuteStep(engine, 100_000, minCallDepth: depthBefore + 1);
                 if (st is EngineStepStatus.Faulted or EngineStepStatus.WaitingInput or EngineStepStatus.Completed)
                 {
                     break;
@@ -916,7 +916,7 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
             engine.InvokeStaticCall(caller, callInsn, isTry: false, isJump: false);
             while (engine.InternalCallStack.Count > depthBefore + 1)
             {
-                EngineStepStatus st = VmDispatcher.ExecuteStep(engine, 100_000);
+                EngineStepStatus st = VmDispatcher.ExecuteStep(engine, 100_000, minCallDepth: depthBefore + 1);
                 if (st is EngineStepStatus.Faulted or EngineStepStatus.WaitingInput or EngineStepStatus.Completed)
                 {
                     break;

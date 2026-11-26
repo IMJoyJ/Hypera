@@ -438,19 +438,8 @@ public sealed class DefaultRuntimeDynamicEvaluator : IDynamicEvaluator
         return varName;
     }
 
-    private static bool _HasDirectName(VariableStore store, string candidate)
-    {
-        // Check existing registered names before auto-creating
-        foreach (string existing in store.VariableNames)
-        {
-            if (string.Equals(existing, candidate, store.CompilerOptions.IgnoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+    private static bool _HasDirectName(VariableStore store, string candidate) =>
+        store.TryResolveExistingSlot(candidate, out _);
 
     private static List<string> SplitTopLevelColons(string s)
     {

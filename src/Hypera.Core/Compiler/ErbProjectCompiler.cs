@@ -153,7 +153,7 @@ public sealed class ErbProjectCompiler
                 diagnostics,
                 symbols.IsMacroDefined,
                 isErhFile: false);
-            ScanErbFileFunctions(erbPath, lines, symbols, lexer, exprParser, erhCompiler, diagnostics, parsedUnits);
+            ScanErbFileFunctions(erbPath, lines, symbols, lexer, exprParser, erhCompiler, diagnostics, external.IsDebugMode, parsedUnits);
         }
 
         erhCompiler.FinalizeGlobalDimDeclarations(diagnostics);
@@ -182,6 +182,7 @@ public sealed class ErbProjectCompiler
             descriptorsById[fn.FunctionId] = CompileFunctionUnit(
                 unit,
                 skipBody,
+                external.IsDebugMode,
                 moduleBuilder,
                 symbols,
                 lexer,
@@ -311,6 +312,7 @@ public sealed class ErbProjectCompiler
         ExpressionParser exprParser,
         ErhCompiler erhCompiler,
         DiagnosticBag diagnostics,
+        bool isDebugMode,
         List<ParsedFunctionUnit> outputUnits)
     {
         ParsedFunctionUnit? currentUnit = null;
@@ -332,7 +334,7 @@ public sealed class ErbProjectCompiler
             {
                 dataOrCallListDepth = 0;
                 seenBodyStatementInCurrentFunc = false;
-                currentUnit = ParseFunctionHeaderLine(filePath, line, trimmed, leadSkip, symbols, lexer, diagnostics);
+                currentUnit = ParseFunctionHeaderLine(filePath, line, trimmed, leadSkip, symbols, lexer, diagnostics, isDebugMode);
                 if (currentUnit is not null)
                 {
                     outputUnits.Add(currentUnit);
@@ -390,7 +392,9 @@ public sealed class ErbProjectCompiler
                 }
 
                 int endId = 0;
-                while (endId < labelSpan.Length && !char.IsWhiteSpace(labelSpan[endId]))
+                while (endId < labelSpan.Length
+                    && !char.IsWhiteSpace(labelSpan[endId])
+                    && !IsCommentStartAt(labelSpan, endId, _options.EnableSpecialCommentPrefixes, isDebugMode))
                 {
                     endId++;
                 }
@@ -446,7 +450,7 @@ public sealed class ErbProjectCompiler
                 }
                 else if (spec.Kind is BuiltinInstructionKind.VARI or BuiltinInstructionKind.VARS)
                 {
-                    PreRegisterScopedVariable(currentUnit.Symbol, spec.Kind == BuiltinInstructionKind.VARS, afterKw, line, leadSkip, symbols, diagnostics);
+                    PreRegisterScopedVariable(currentUnit.Symbol, spec.Kind == BuiltinInstructionKind.VARS, afterKw, line, leadSkip, symbols, diagnostics, isDebugMode);
                 }
             }
         }
@@ -459,7 +463,8 @@ public sealed class ErbProjectCompiler
         int leadSkip,
         SymbolTable symbols,
         ErbLexer lexer,
-        DiagnosticBag diagnostics)
+        DiagnosticBag diagnostics,
+        bool isDebugMode)
     {
         ReadOnlySpan<char> afterAt = trimmed[1..];
         int pos = 0;
@@ -483,7 +488,11 @@ public sealed class ErbProjectCompiler
         }
 
         string funcName = afterAt[nameStart..pos].ToString();
-        string rawArgsTail = afterAt[pos..].Trim().ToString();
+        string rawArgsTail = StripTrailingCommentOutsideQuotes(
+            afterAt[pos..],
+            _options.EnableSpecialCommentPrefixes,
+            isDebugMode,
+            _options.SystemAllowFullSpace).Trim().ToString();
 
         UserFunctionSymbol fn = symbols.RegisterFunction(funcName, headerSpan, filePath, [], diagnostics);
         return new ParsedFunctionUnit(fn, line, rawArgsTail);
@@ -668,14 +677,19 @@ public sealed class ErbProjectCompiler
         PreprocessedLine line,
         int leadSkip,
         SymbolTable symbols,
-        DiagnosticBag diagnostics)
+        DiagnosticBag diagnostics,
+        bool isDebugMode)
     {
         if (rawTail.IsEmpty || !(rawTail[0] == ' ' || rawTail[0] == '\t' || (_options.SystemAllowFullSpace && rawTail[0] == '\u3000')))
         {
             return;
         }
 
-        ReadOnlySpan<char> argText = rawTail.Trim();
+        ReadOnlySpan<char> argText = StripTrailingCommentOutsideQuotes(
+            rawTail,
+            _options.EnableSpecialCommentPrefixes,
+            isDebugMode,
+            _options.SystemAllowFullSpace).Trim();
         int eqIdx = FindTopLevelEquals(argText);
         ReadOnlySpan<char> lhs = eqIdx >= 0 ? argText[..eqIdx].Trim() : argText;
 
@@ -783,6 +797,11 @@ public sealed class ErbProjectCompiler
             LexModeFlags.AllowAssignment);
 
         var stream = new TokenStream(tokens, span);
+        if (stream.IsAtEnd)
+        {
+            return;
+        }
+
         bool parenthesized = false;
         if (stream.Match(ErbTokenKind.OpenParen))
         {
@@ -1166,6 +1185,7 @@ public sealed class ErbProjectCompiler
     private FunctionDescriptor CompileFunctionUnit(
         ParsedFunctionUnit unit,
         bool skipBody,
+        bool isDebugMode,
         ModuleEmitBuilder moduleBuilder,
         SymbolTable symbols,
         ErbLexer lexer,
@@ -1188,6 +1208,7 @@ public sealed class ErbProjectCompiler
 
         var fnCompiler = new FunctionStatementCompiler(
             _options,
+            isDebugMode,
             symbols,
             lexer,
             exprParser,
@@ -1219,6 +1240,7 @@ public sealed class ErbProjectCompiler
     private sealed class FunctionStatementCompiler
     {
         private readonly CompilerOptions _options;
+        private readonly bool _isDebugMode;
         private readonly SymbolTable _symbols;
         private readonly ErbLexer _lexer;
         private readonly ExpressionParser _exprParser;
@@ -1238,6 +1260,7 @@ public sealed class ErbProjectCompiler
 
         public FunctionStatementCompiler(
             CompilerOptions options,
+            bool isDebugMode,
             SymbolTable symbols,
             ErbLexer lexer,
             ExpressionParser exprParser,
@@ -1248,6 +1271,7 @@ public sealed class ErbProjectCompiler
             DiagnosticBag diagnostics)
         {
             _options = options;
+            _isDebugMode = isDebugMode;
             _symbols = symbols;
             _lexer = lexer;
             _exprParser = exprParser;
@@ -1335,7 +1359,13 @@ public sealed class ErbProjectCompiler
             {
                 ReadOnlySpan<char> labelSpan = trimmed[1..].Trim();
                 int endId = 0;
-                while (endId < labelSpan.Length && !char.IsWhiteSpace(labelSpan[endId])) endId++;
+                while (endId < labelSpan.Length
+                    && !char.IsWhiteSpace(labelSpan[endId])
+                    && !IsCommentStartAt(labelSpan, endId, _options.EnableSpecialCommentPrefixes, _isDebugMode))
+                {
+                    endId++;
+                }
+
                 string labelName = labelSpan[..endId].ToString();
                 if (!string.IsNullOrEmpty(labelName))
                 {
@@ -1368,29 +1398,36 @@ public sealed class ErbProjectCompiler
                     char sep = rawAfterKw[0];
                     if (sep != ' ' && sep != '\t' && (!_options.SystemAllowFullSpace || sep != '\u3000'))
                     {
-                        if (sep == '\u3000')
+                        if (IsCommentStartAt(rawAfterKw, 0, _options.EnableSpecialCommentPrefixes, _isDebugMode))
                         {
-                            _diagnostics.ReportError(
-                                "ERA1505",
-                                $"Full-width space after instruction '{spec.Name}' is forbidden when SystemAllowFullSpace is false.",
-                                line.CreateSpan(leadSkip + kw.Length, 1),
-                                _fn.FilePath,
-                                null,
-                                [spec.Name]);
+                            rawAfterKw = ReadOnlySpan<char>.Empty;
                         }
                         else
                         {
-                            _diagnostics.ReportError(
-                                "ERA1506",
-                                $"Unexpected character '{sep}' immediately after instruction '{spec.Name}'.",
-                                line.CreateSpan(leadSkip + kw.Length, 1),
-                                _fn.FilePath,
-                                null,
-                                [spec.Name, sep.ToString()]);
-                        }
+                            if (sep == '\u3000')
+                            {
+                                _diagnostics.ReportError(
+                                    "ERA1505",
+                                    $"Full-width space after instruction '{spec.Name}' is forbidden when SystemAllowFullSpace is false.",
+                                    line.CreateSpan(leadSkip + kw.Length, 1),
+                                    _fn.FilePath,
+                                    null,
+                                    [spec.Name]);
+                            }
+                            else
+                            {
+                                _diagnostics.ReportError(
+                                    "ERA1506",
+                                    $"Unexpected character '{sep}' immediately after instruction '{spec.Name}'.",
+                                    line.CreateSpan(leadSkip + kw.Length, 1),
+                                    _fn.FilePath,
+                                    null,
+                                    [spec.Name, sep.ToString()]);
+                            }
 
-                        index++;
-                        return;
+                            index++;
+                            return;
+                        }
                     }
                 }
 
@@ -1408,15 +1445,19 @@ public sealed class ErbProjectCompiler
                 }
 
                 ReadOnlySpan<char> argSpan = TrimSpaces(rawAfterKw);
-                int argCol1Based = rawAfterKw.IsEmpty ? col1Based + kw.Length : line.StartColumn + (line.Text.Length - argSpan.Length);
+                int leadArgSkip = rawAfterKw.Length - TrimLeadingSpaces(rawAfterKw).Length;
+                int argCol1Based = rawAfterKw.IsEmpty ? col1Based + kw.Length : col1Based + kw.Length + leadArgSkip;
                 CompileInstruction(spec, line, argSpan, argCol1Based, lineSpan, ref index);
                 return;
             }
 
             // 4. Bare expression-method call statement (e.g. GCREATE 0, 100, 100 / DT_CREATE "t" / XML_DOCUMENT ...)
             if (!string.IsNullOrEmpty(kw)
-                && (rawAfterKw.IsEmpty || rawAfterKw[0] is ' ' or '\t' or '(' || (_options.SystemAllowFullSpace && rawAfterKw[0] == '\u3000'))
-                && !LooksLikeAssignmentLine(trimmed)
+                && (rawAfterKw.IsEmpty
+                    || rawAfterKw[0] is ' ' or '\t' or '('
+                    || (_options.SystemAllowFullSpace && rawAfterKw[0] == '\u3000')
+                    || IsCommentStartAt(rawAfterKw, 0, _options.EnableSpecialCommentPrefixes, _isDebugMode))
+                && !LooksLikeAssignmentLine(trimmed, _options.EnableSpecialCommentPrefixes, _isDebugMode)
                 && CanResolveAsExpressionMethod(kw))
             {
                 index++;
@@ -1460,29 +1501,33 @@ public sealed class ErbProjectCompiler
         // Assignments & Prefix/Postfix IncDec
         // ---------------------------------------------------------------------
 
-        private static bool LooksLikeAssignmentLine(ReadOnlySpan<char> trimmed)
+        private static bool LooksLikeAssignmentLine(ReadOnlySpan<char> trimmed, bool enableSpecialPrefixes, bool isDebugMode)
         {
             int depth = 0;
-            bool inQuotes = false;
             for (int i = 0; i < trimmed.Length; i++)
             {
+                if (TrySkipStringLiteral(trimmed, ref i))
+                {
+                    i--;
+                    continue;
+                }
+
                 char c = trimmed[i];
-                if (c == '"')
-                {
-                    inQuotes = !inQuotes;
-                    continue;
-                }
-
-                if (inQuotes)
-                {
-                    if (c == '\\') i++;
-                    continue;
-                }
-
-                if (c == '(') depth++;
-                else if (c == ')' && depth > 0) depth--;
+                if (c is '(' or '[') depth++;
+                else if (c is ')' or ']' && depth > 0) depth--;
                 else if (depth == 0)
                 {
+                    if (c == ';')
+                    {
+                        if (IsCommentStartAt(trimmed, i, enableSpecialPrefixes, isDebugMode))
+                        {
+                            return false;
+                        }
+
+                        i += 2;
+                        continue;
+                    }
+
                     if ((c == '=' && (i == 0 || trimmed[i - 1] is not ('!' or '<' or '>')
                             || (i >= 2 && ((trimmed[i - 2] == '<' && trimmed[i - 1] == '<') || (trimmed[i - 2] == '>' && trimmed[i - 1] == '>')))))
                         || (c == '\'' && i + 1 < trimmed.Length && trimmed[i + 1] == '=')
@@ -1560,7 +1605,62 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            // First check if this is a standalone postfix `VAR++` or `VAR--` statement!
+            if (TryFindTopLevelAssignmentOperator(
+                    text,
+                    _options.EnableSpecialCommentPrefixes,
+                    _isDebugMode,
+                    out int opIdx,
+                    out int opLen,
+                    out OperatorKind scannedOp)
+                && scannedOp is OperatorKind.Assign or OperatorKind.Equal)
+            {
+                ReadOnlySpan<char> lhsText = text[..opIdx];
+                TokenStream lhsStream = MakeStream(lhsText.ToString(), line, col1Based, lineSpan, LexModeFlags.AllowAssignment);
+                VariableAccessExpr? directLhs = _exprParser.ParseVariableLValue(lhsStream, _fn, _fn.FilePath, _diagnostics);
+                if (directLhs is null)
+                {
+                    return;
+                }
+
+                if (!lhsStream.IsAtEnd)
+                {
+                    _diagnostics.ReportError(
+                        "ERA1554",
+                        $"Expected assignment operator after '{directLhs.Variable.Name}'.",
+                        lhsStream.Current.Span,
+                        _fn.FilePath,
+                        null,
+                        [directLhs.Variable.Name],
+                        "diag.ERA1554.expected_op");
+                    return;
+                }
+
+                SourceSpan opSpan = line.CreateSpan((col1Based - line.StartColumn) + opIdx, opLen);
+                if (scannedOp == OperatorKind.Equal)
+                {
+                    _diagnostics.ReportWarning("ERA1555", "Using '==' as an assignment operator; prefer '='.", opSpan, _fn.FilePath);
+                }
+
+                ReadOnlySpan<char> rawRhs = text[(opIdx + opLen)..];
+                if (directLhs.ValueKind == VariableValueKind.Str)
+                {
+                    EmitRawFormStringAssignment(line, directLhs, opSpan, text, rawRhs, col1Based, lineSpan);
+                    return;
+                }
+
+                int rhsCol = col1Based + (text.Length - rawRhs.Length);
+                TokenStream rhsStream = MakeStream(rawRhs.ToString(), line, rhsCol, lineSpan, LexModeFlags.AllowAssignment);
+                if (rhsStream.IsAtEnd)
+                {
+                    _diagnostics.ReportError("ERA1558", $"Missing right-hand expression in assignment to '{directLhs.Variable.Name}'.", opSpan, _fn.FilePath, null, [directLhs.Variable.Name]);
+                    return;
+                }
+
+                CompileIntAssignmentRhs(directLhs, opSpan, OperatorKind.Assign, rhsStream);
+                return;
+            }
+
+            // Remaining cases: '= / compound assignments (+=, -=, ...) / standalone postfix VAR++ / VAR--
             TokenStream probeStream = MakeStream(text.ToString(), line, col1Based, lineSpan, LexModeFlags.AllowAssignment);
             int topAssignIdx = FindTopLevelAssignmentInStream(probeStream);
 
@@ -1647,14 +1747,19 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            ExprNode firstRhs = ParseCommaItemInt(probeStream);
+            CompileIntAssignmentRhs(lhs, opTok.Span, assignOp, probeStream);
+        }
+
+        private void CompileIntAssignmentRhs(VariableAccessExpr lhs, SourceSpan opSpan, OperatorKind assignOp, TokenStream rhsStream)
+        {
+            ExprNode firstRhs = ParseCommaItemInt(rhsStream);
 
             // Comma-list bulk array assignment: `A:10 = 1, 2, 3`!
-            if (probeStream.Match(ErbTokenKind.Comma))
+            if (rhsStream.Match(ErbTokenKind.Comma))
             {
                 if (assignOp != OperatorKind.Assign)
                 {
-                    _diagnostics.ReportError("ERA1559", "Compound assignment cannot be combined with comma-separated bulk array assignment.", opTok.Span, _fn.FilePath);
+                    _diagnostics.ReportError("ERA1559", "Compound assignment cannot be combined with comma-separated bulk array assignment.", opSpan, _fn.FilePath);
                     return;
                 }
 
@@ -1665,16 +1770,19 @@ public sealed class ErbProjectCompiler
                 }
 
                 var items = new List<ExprNode> { firstRhs };
-                do
+                while (!rhsStream.IsAtEnd)
                 {
-                    items.Add(ParseCommaItemInt(probeStream));
+                    items.Add(ParseCommaItemInt(rhsStream));
+                    if (!rhsStream.Match(ErbTokenKind.Comma))
+                    {
+                        break;
+                    }
                 }
-                while (probeStream.Match(ErbTokenKind.Comma));
 
-                if (!probeStream.IsAtEnd)
+                if (!rhsStream.IsAtEnd)
                 {
-                    string tok = probeStream.Current.Text ?? probeStream.Current.Kind.ToString();
-                    _diagnostics.ReportError("ERA1561", $"Unexpected token '{tok}' in array assignment.", probeStream.Current.Span, _fn.FilePath, null, [tok]);
+                    string tok = rhsStream.Current.Text ?? rhsStream.Current.Kind.ToString();
+                    _diagnostics.ReportError("ERA1561", $"Unexpected token '{tok}' in array assignment.", rhsStream.Current.Span, _fn.FilePath, null, [tok]);
                     return;
                 }
 
@@ -1682,10 +1790,10 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            if (!probeStream.IsAtEnd)
+            if (!rhsStream.IsAtEnd)
             {
-                string tok = probeStream.Current.Text ?? probeStream.Current.Kind.ToString();
-                _diagnostics.ReportError("ERA1561", $"Unexpected token '{tok}' after assignment expression.", probeStream.Current.Span, _fn.FilePath, null, [tok]);
+                string tok = rhsStream.Current.Text ?? rhsStream.Current.Kind.ToString();
+                _diagnostics.ReportError("ERA1561", $"Unexpected token '{tok}' after assignment expression.", rhsStream.Current.Span, _fn.FilePath, null, [tok]);
                 return;
             }
 
@@ -1701,6 +1809,40 @@ public sealed class ErbProjectCompiler
             EmitCompoundIntAssignment(lhs, assignOp, firstRhs);
         }
 
+        private void EmitRawFormStringAssignment(
+            PreprocessedLine line,
+            VariableAccessExpr lhs,
+            SourceSpan opSpan,
+            ReadOnlySpan<char> fullLineText,
+            ReadOnlySpan<char> rawRhs,
+            int col1Based,
+            SourceSpan lineSpan)
+        {
+            if (_options.SystemIgnoreStringSet)
+            {
+                _diagnostics.ReportError(
+                    "ERA1562",
+                    $"Assigning to string variable '{lhs.Variable.Name}' with '=' is forbidden when SystemIgnoreStringSet is enabled; use ''=''.",
+                    opSpan,
+                    _fn.FilePath,
+                    null,
+                    [lhs.Variable.Name]);
+                return;
+            }
+
+            if (!rawRhs.IsEmpty && (rawRhs[0] == ' ' || rawRhs[0] == '\t'))
+            {
+                rawRhs = rawRhs[1..];
+            }
+
+            int rhsCol = col1Based + (fullLineText.Length - rawRhs.Length);
+            StrFormExpr formExpr = ParseFormString(rawRhs.ToString(), line, rhsCol, lineSpan);
+            var mark = _emitter.MarkTempRegs();
+            ushort valReg = _emitter.EmitExprToStrReg(formExpr);
+            _emitter.EmitVariableStoreStr(lhs, valReg);
+            _emitter.ReleaseTempRegs(mark);
+        }
+
         private void CompileStringAssignment(
             PreprocessedLine line,
             ReadOnlySpan<char> fullLineText,
@@ -1713,18 +1855,6 @@ public sealed class ErbProjectCompiler
         {
             if (assignOp == OperatorKind.Assign)
             {
-                if (_options.SystemIgnoreStringSet)
-                {
-                    _diagnostics.ReportError(
-                        "ERA1562",
-                        $"Assigning to string variable '{lhs.Variable.Name}' with '=' is forbidden when SystemIgnoreStringSet is enabled; use ''=''.",
-                        opTok.Span,
-                        _fn.FilePath,
-                        null,
-                        [lhs.Variable.Name]);
-                    return;
-                }
-
                 int eqIdx = FindTopLevelEquals(fullLineText);
                 ReadOnlySpan<char> rawRhs = (eqIdx >= 0 && eqIdx + 1 < fullLineText.Length)
                     ? fullLineText[(eqIdx + 1)..]
@@ -1734,17 +1864,7 @@ public sealed class ErbProjectCompiler
                     rawRhs = rawRhs[1..]; // handle `==` warning case
                 }
 
-                if (!rawRhs.IsEmpty && (rawRhs[0] == ' ' || rawRhs[0] == '\t'))
-                {
-                    rawRhs = rawRhs[1..];
-                }
-
-                int rhsCol = line.StartColumn + (line.Text.Length - rawRhs.Length);
-                StrFormExpr formExpr = ParseFormString(rawRhs.ToString(), line, rhsCol, lineSpan);
-                var mark = _emitter.MarkTempRegs();
-                ushort valReg = _emitter.EmitExprToStrReg(formExpr);
-                _emitter.EmitVariableStoreStr(lhs, valReg);
-                _emitter.ReleaseTempRegs(mark);
+                EmitRawFormStringAssignment(line, lhs, opTok.Span, fullLineText, rawRhs, col1Based, lineSpan);
                 return;
             }
 
@@ -1777,11 +1897,14 @@ public sealed class ErbProjectCompiler
                 }
 
                 var items = new List<ExprNode> { firstStr };
-                do
+                while (!stream.IsAtEnd)
                 {
                     items.Add(ParseCommaItemStr(stream));
+                    if (!stream.Match(ErbTokenKind.Comma))
+                    {
+                        break;
+                    }
                 }
-                while (stream.Match(ErbTokenKind.Comma));
 
                 if (!stream.IsAtEnd)
                 {
@@ -2018,8 +2141,15 @@ public sealed class ErbProjectCompiler
 
             if (spec.ArgPattern == InstructionArgumentPattern.Void && !argSpan.IsEmpty)
             {
-                _diagnostics.ReportError("ERA1570", $"Instruction '{spec.Name}' does not accept arguments.", lineSpan, _fn.FilePath, null, [spec.Name]);
-                return;
+                if (IsCommentStartAt(argSpan, 0, _options.EnableSpecialCommentPrefixes, _isDebugMode))
+                {
+                    argSpan = ReadOnlySpan<char>.Empty;
+                }
+                else
+                {
+                    _diagnostics.ReportError("ERA1570", $"Instruction '{spec.Name}' does not accept arguments.", lineSpan, _fn.FilePath, null, [spec.Name]);
+                    return;
+                }
             }
 
             if ((spec.Traits & InstructionTraitFlags.IsPrint) != 0
@@ -2441,7 +2571,7 @@ public sealed class ErbProjectCompiler
 
                 case BuiltinInstructionKind.ALIGNMENT:
                 {
-                    string align = argSpan.Trim().ToString().ToUpperInvariant();
+                    string align = StripComment(argSpan).Trim().ToString().ToUpperInvariant();
                     if (align is not ("LEFT" or "CENTER" or "RIGHT"))
                     {
                         string rawAlign = argSpan.ToString();
@@ -2681,7 +2811,12 @@ public sealed class ErbProjectCompiler
 
                 case BuiltinInstructionKind.PRINTCPERLINE:
                 case BuiltinInstructionKind.SAVENOS:
-                    CompileGetConfigIntoVar(spec.Kind == BuiltinInstructionKind.PRINTCPERLINE ? "PRINTCを並べる数" : "セーブデータ数", line, argSpan, argCol, lineSpan);
+                    CompileGetConfigIntoVar(
+                        spec.Kind == BuiltinInstructionKind.PRINTCPERLINE ? BuiltinMethodKind.PRINTCPERLINE : BuiltinMethodKind.SAVENOS,
+                        line,
+                        argSpan,
+                        argCol,
+                        lineSpan);
                     return;
 
                 case BuiltinInstructionKind.SORTCHARA:
@@ -2748,14 +2883,15 @@ public sealed class ErbProjectCompiler
 
                 case InstructionArgumentPattern.StrExpr:
                 {
-                    if (argSpan.IsEmpty)
+                    ReadOnlySpan<char> strippedStrArg = StripComment(argSpan);
+                    if (strippedStrArg.IsEmpty)
                     {
                         strReg = _emitter.AllocateStrReg();
                         _emitter.EmitLoadStrLiteral(strReg, string.Empty);
                     }
                     else
                     {
-                        ExprNode expr = ParseSingleStrArg(spec.Name, line, argSpan, argCol, lineSpan);
+                        ExprNode expr = ParseSingleStrArg(spec.Name, line, strippedStrArg, argCol, lineSpan);
                         ushort rawReg = _emitter.EmitExprToStrReg(expr);
                         if (spec.Name.Contains("FORMS", StringComparison.OrdinalIgnoreCase))
                         {
@@ -3676,7 +3812,9 @@ public sealed class ErbProjectCompiler
 
         private void CompileStaticGoto(BuiltinInstructionSpec spec, ReadOnlySpan<char> argSpan, SourceSpan lineSpan)
         {
-            string labelName = ExtractTargetIdentifier(argSpan, stripDollarOrAt: '$');
+            string labelName = ExtractTargetIdentifier(
+                StripComment(argSpan),
+                stripDollarOrAt: '$');
             if (string.IsNullOrEmpty(labelName))
             {
                 _diagnostics.ReportError("ERA1604", $"Missing target label name after '{spec.Name}'.", lineSpan, _fn.FilePath, null, [spec.Name]);
@@ -3697,14 +3835,19 @@ public sealed class ErbProjectCompiler
 
         private void CompileDynamicGoto(BuiltinInstructionSpec spec, PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
         {
-            if (argSpan.IsEmpty)
+            ReadOnlySpan<char> cleanArg = StripTrailingFormComment(
+                argSpan,
+                _options.EnableSpecialCommentPrefixes,
+                _isDebugMode,
+                _options.SystemAllowFullSpace);
+            if (cleanArg.IsEmpty)
             {
                 _diagnostics.ReportError("ERA1604", $"Missing FORM label expression after '{spec.Name}'.", lineSpan, _fn.FilePath, null, [spec.Name]);
                 return;
             }
 
-            ReadOnlySpan<char> formSpan = argSpan[0] == '$' ? argSpan[1..] : argSpan;
-            int formCol = argSpan[0] == '$' ? argCol + 1 : argCol;
+            ReadOnlySpan<char> formSpan = cleanArg[0] == '$' ? cleanArg[1..] : cleanArg;
+            int formCol = cleanArg[0] == '$' ? argCol + 1 : argCol;
             StrFormExpr form = ParseFormString(formSpan.ToString(), line, formCol, lineSpan);
 
             bool isTry = (spec.Traits & InstructionTraitFlags.IsTry) != 0;
@@ -3798,7 +3941,15 @@ public sealed class ErbProjectCompiler
             bool isTry = (spec.Traits & InstructionTraitFlags.IsTry) != 0;
             bool isTryC = (spec.Traits & InstructionTraitFlags.IsTryC) != 0;
 
-            if (!TrySplitCallTargetAndArgs(argSpan, isForm: false, out string rawName, out string rawArgs, out int argsOffset))
+            if (!TrySplitCallTargetAndArgs(
+                    argSpan,
+                    isForm: false,
+                    _options.EnableSpecialCommentPrefixes,
+                    _isDebugMode,
+                    _options.SystemAllowFullSpace,
+                    out string rawName,
+                    out string rawArgs,
+                    out int argsOffset))
             {
                 _diagnostics.ReportError("ERA1610", $"Missing target function name in '{spec.Name}'.", lineSpan, _fn.FilePath, null, [spec.Name]);
                 return;
@@ -3926,7 +4077,15 @@ public sealed class ErbProjectCompiler
             bool isTry = (spec.Traits & InstructionTraitFlags.IsTry) != 0;
             bool isTryC = (spec.Traits & InstructionTraitFlags.IsTryC) != 0;
 
-            if (!TrySplitCallTargetAndArgs(argSpan, isForm: true, out string rawFormTarget, out string rawArgs, out int argsOffset))
+            if (!TrySplitCallTargetAndArgs(
+                    argSpan,
+                    isForm: true,
+                    _options.EnableSpecialCommentPrefixes,
+                    _isDebugMode,
+                    _options.SystemAllowFullSpace,
+                    out string rawFormTarget,
+                    out string rawArgs,
+                    out int argsOffset))
             {
                 _diagnostics.ReportError("ERA1610", $"Missing FORM target in '{spec.Name}'.", lineSpan, _fn.FilePath, null, [spec.Name]);
                 return;
@@ -4063,11 +4222,24 @@ public sealed class ErbProjectCompiler
                 int fArgCol = fl.StartColumn + (fl.Text.Length - fArg.Length);
                 if (isGoto)
                 {
-                    ReadOnlySpan<char> gSpan = !fArg.IsEmpty && fArg[0] == '$' ? fArg[1..] : fArg;
+                    ReadOnlySpan<char> cleanGoto = StripTrailingFormComment(
+                        fArg,
+                        _options.EnableSpecialCommentPrefixes,
+                        _isDebugMode,
+                        _options.SystemAllowFullSpace);
+                    ReadOnlySpan<char> gSpan = !cleanGoto.IsEmpty && cleanGoto[0] == '$' ? cleanGoto[1..] : cleanGoto;
                     StrFormExpr form = ParseFormString(gSpan.ToString(), fl, fArgCol, fSpan);
                     items.Add((form, [], fSpan));
                 }
-                else if (TrySplitCallTargetAndArgs(fArg, isForm: true, out string rawFormTarget, out string rawArgs, out int argsOff))
+                else if (TrySplitCallTargetAndArgs(
+                    fArg,
+                    isForm: true,
+                    _options.EnableSpecialCommentPrefixes,
+                    _isDebugMode,
+                    _options.SystemAllowFullSpace,
+                    out string rawFormTarget,
+                    out string rawArgs,
+                    out int argsOff))
                 {
                     StrFormExpr form = ParseFormString(rawFormTarget, fl, fArgCol, fSpan);
                     ImmutableArray<ExprNode?> callArgs = ParseCallRawArgsList(fl, rawArgs, fArgCol + argsOff, targetFn: null, fSpan);
@@ -4085,7 +4257,15 @@ public sealed class ErbProjectCompiler
 
         private void CompileStaticCallF(bool isTry, PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
         {
-            if (!TrySplitCallTargetAndArgs(argSpan, isForm: false, out string rawName, out string rawArgs, out int argsOffset))
+            if (!TrySplitCallTargetAndArgs(
+                    argSpan,
+                    isForm: false,
+                    _options.EnableSpecialCommentPrefixes,
+                    _isDebugMode,
+                    _options.SystemAllowFullSpace,
+                    out string rawName,
+                    out string rawArgs,
+                    out int argsOffset))
             {
                 string kw = isTry ? "TRYCALLF" : "CALLF";
                 _diagnostics.ReportError("ERA1614", $"Missing method name in '{kw}'.", lineSpan, _fn.FilePath, null, [kw]);
@@ -4124,7 +4304,15 @@ public sealed class ErbProjectCompiler
 
         private void CompileDynamicCallF(bool isTry, PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
         {
-            if (!TrySplitCallTargetAndArgs(argSpan, isForm: true, out string rawFormTarget, out string rawArgs, out int argsOffset))
+            if (!TrySplitCallTargetAndArgs(
+                    argSpan,
+                    isForm: true,
+                    _options.EnableSpecialCommentPrefixes,
+                    _isDebugMode,
+                    _options.SystemAllowFullSpace,
+                    out string rawFormTarget,
+                    out string rawArgs,
+                    out int argsOffset))
             {
                 string kw = isTry ? "TRYCALLFORMF" : "CALLFORMF";
                 _diagnostics.ReportError("ERA1614", $"Missing FORM method name in '{kw}'.", lineSpan, _fn.FilePath, null, [kw]);
@@ -4155,13 +4343,13 @@ public sealed class ErbProjectCompiler
             int col1Based,
             SourceSpan lineSpan)
         {
-            ReadOnlySpan<char> trimmedRest = TrimSpaces(rawAfterName);
+            ReadOnlySpan<char> trimmedRest = TrimSpaces(StripComment(rawAfterName));
             string exprText;
             if (trimmedRest.IsEmpty)
             {
                 exprText = $"{methodName}()";
             }
-            else if (trimmedRest[0] == '(')
+            else if (trimmedRest[0] == '(' && IsSingleGroupedParenthesizedExpression(trimmedRest))
             {
                 exprText = $"{methodName}{trimmedRest.ToString()}";
             }
@@ -4220,7 +4408,7 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            string evName = ExtractTargetIdentifier(argSpan, stripDollarOrAt: '@');
+            string evName = ExtractTargetIdentifier(StripComment(argSpan), stripDollarOrAt: '@');
             if (string.IsNullOrEmpty(evName))
             {
                 _diagnostics.ReportError("ERA1619", "Missing event name after 'CALLEVENT'.", lineSpan, _fn.FilePath);
@@ -4233,7 +4421,15 @@ public sealed class ErbProjectCompiler
 
         private void CompileCallSharp(PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
         {
-            if (!TrySplitCallTargetAndArgs(argSpan, isForm: false, out string pluginName, out string rawArgs, out int argsOffset))
+            if (!TrySplitCallTargetAndArgs(
+                    argSpan,
+                    isForm: false,
+                    _options.EnableSpecialCommentPrefixes,
+                    _isDebugMode,
+                    _options.SystemAllowFullSpace,
+                    out string pluginName,
+                    out string rawArgs,
+                    out int argsOffset))
             {
                 _diagnostics.ReportError("ERA1620", "Missing C# plugin method name in 'CALLSHARP'.", lineSpan, _fn.FilePath);
                 return;
@@ -4259,13 +4455,14 @@ public sealed class ErbProjectCompiler
 
         private void CompileReturn(PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
         {
-            if (argSpan.IsEmpty)
+            ReadOnlySpan<char> cleanArg = StripComment(argSpan);
+            if (cleanArg.IsEmpty)
             {
                 _module.Emit(Instruction.Simple(OpCode.ReturnVoid));
                 return;
             }
 
-            List<ExprNode?> vals = ParseCommaExprList(line, argSpan, argCol, lineSpan, minCount: 1, maxCount: 64, static _ => VariableValueKind.Int);
+            List<ExprNode?> vals = ParseCommaExprList(line, cleanArg, argCol, lineSpan, minCount: 1, maxCount: 64, static _ => VariableValueKind.Int);
             var mark = _emitter.MarkTempRegs();
             ushort baseReg = _emitter.AllocateContiguousIntRegs(vals.Count);
             for (int i = 0; i < vals.Count; i++)
@@ -4306,8 +4503,9 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
+            ReadOnlySpan<char> cleanArg = StripComment(argSpan);
             var mark = _emitter.MarkTempRegs();
-            if (argSpan.IsEmpty)
+            if (cleanArg.IsEmpty)
             {
                 if (_fn.MethodReturnKind == VariableValueKind.Str)
                 {
@@ -4326,7 +4524,7 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            TokenStream ts = MakeStream(argSpan.ToString(), line, argCol, lineSpan);
+            TokenStream ts = MakeStream(cleanArg.ToString(), line, argCol, lineSpan);
             ExprNode retExpr = _exprParser.ParseExpression(ts, _fn, _fn.FilePath, _diagnostics);
             if (!ts.IsAtEnd)
             {
@@ -4364,7 +4562,7 @@ public sealed class ErbProjectCompiler
 
         private void CompileBeginPhase(bool isForce, ReadOnlySpan<char> argSpan, SourceSpan lineSpan)
         {
-            string kw = argSpan.Trim().ToString().ToUpperInvariant();
+            string kw = StripComment(argSpan).Trim().ToString().ToUpperInvariant();
             SystemPhaseKind phase = kw switch
             {
                 "TITLE" => SystemPhaseKind.Title,
@@ -4379,7 +4577,7 @@ public sealed class ErbProjectCompiler
 
             if (phase == SystemPhaseKind.Unknown)
             {
-                string phaseStr = argSpan.Trim().ToString();
+                string phaseStr = StripComment(argSpan).Trim().ToString();
                 string beginKw = isForce ? "FORCE_BEGIN" : "BEGIN";
                 _diagnostics.ReportError(
                     "ERA1635",
@@ -4624,7 +4822,7 @@ public sealed class ErbProjectCompiler
 
         private void CompileSetColorByName(bool isBg, ReadOnlySpan<char> argSpan, SourceSpan lineSpan)
         {
-            string colorName = argSpan.Trim().ToString();
+            string colorName = StripComment(argSpan).Trim().ToString();
             if (string.IsNullOrEmpty(colorName))
             {
                 string colorKw = isBg ? "SETBGCOLORBYNAME" : "SETCOLORBYNAME";
@@ -4659,8 +4857,9 @@ public sealed class ErbProjectCompiler
 
         private void CompileScopedVarRuntimeInit(bool isString, PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
         {
-            int eqIdx = FindTopLevelEquals(argSpan);
-            ReadOnlySpan<char> lhs = eqIdx >= 0 ? argSpan[..eqIdx].Trim() : argSpan.Trim();
+            ReadOnlySpan<char> cleanArg = StripComment(argSpan);
+            int eqIdx = FindTopLevelEquals(cleanArg);
+            ReadOnlySpan<char> lhs = eqIdx >= 0 ? cleanArg[..eqIdx].Trim() : cleanArg.Trim();
             string varName = lhs.ToString().Split(',')[0].Trim();
             if (!_fn.PrivateVariables.TryGetValue(varName, out ResolvedVariable? priv))
             {
@@ -4693,8 +4892,10 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            ReadOnlySpan<char> rhsSpan = argSpan[(eqIdx + 1)..].Trim();
-            int rhsCol = line.StartColumn + (line.Text.Length - rhsSpan.Length);
+            ReadOnlySpan<char> afterEq = cleanArg[(eqIdx + 1)..];
+            ReadOnlySpan<char> rhsSpan = afterEq.Trim();
+            int leadRhsWs = afterEq.Length - afterEq.TrimStart().Length;
+            int rhsCol = argCol + eqIdx + 1 + leadRhsWs;
             TokenStream ts = MakeStream(rhsSpan.ToString(), line, rhsCol, lineSpan);
             var m = _emitter.MarkTempRegs();
             if (isString)
@@ -4715,15 +4916,16 @@ public sealed class ErbProjectCompiler
 
         private void CompileTimes(PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
         {
-            int commaIdx = FindTopLevelComma(argSpan);
+            ReadOnlySpan<char> cleanArg = StripComment(argSpan);
+            int commaIdx = FindTopLevelComma(cleanArg);
             if (commaIdx < 0)
             {
                 _diagnostics.ReportError("ERA1580", "'TIMES' expects 'variable, floatLiteral'.", lineSpan, _fn.FilePath);
                 return;
             }
 
-            ReadOnlySpan<char> varPart = argSpan[..commaIdx].Trim();
-            ReadOnlySpan<char> floatPart = argSpan[(commaIdx + 1)..].Trim();
+            ReadOnlySpan<char> varPart = cleanArg[..commaIdx].Trim();
+            ReadOnlySpan<char> floatPart = cleanArg[(commaIdx + 1)..].Trim();
 
             TokenStream ts = MakeStream(varPart.ToString(), line, argCol, lineSpan);
             VariableAccessExpr? dst = _exprParser.ParseVariableLValue(ts, _fn, _fn.FilePath, _diagnostics);
@@ -5106,7 +5308,7 @@ public sealed class ErbProjectCompiler
 
         private void CompileVarSize(ReadOnlySpan<char> argSpan, SourceSpan lineSpan)
         {
-            string rawName = argSpan.Trim().ToString();
+            string rawName = StripComment(argSpan).Trim().ToString();
             var mark = _emitter.MarkTempRegs();
             BuiltinMethodSpec vsSpec = BuiltinMethodCatalog.ByKind[BuiltinMethodKind.VARSIZE];
             if (_symbols.TryResolveVariable("RESULT", null, null, out ResolvedVariable? resVar) && resVar is not null)
@@ -5123,14 +5325,40 @@ public sealed class ErbProjectCompiler
             _emitter.ReleaseTempRegs(mark);
         }
 
-        private void CompileGetConfigIntoVar(string configKey, PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
+        private void CompileGetConfigIntoVar(BuiltinMethodKind methodKind, PreprocessedLine line, ReadOnlySpan<char> argSpan, int argCol, SourceSpan lineSpan)
         {
             TokenStream ts = MakeStream(argSpan.ToString(), line, argCol, lineSpan);
-            VariableAccessExpr? dst = _exprParser.ParseVariableLValue(ts, _fn, _fn.FilePath, _diagnostics);
-            if (dst is null) return;
+            VariableAccessExpr? dst;
+            if (ts.IsAtEnd)
+            {
+                if (!_symbols.TryResolveVariable("RESULT", null, null, out ResolvedVariable? resVar) || resVar is null)
+                {
+                    return;
+                }
+
+                dst = new VariableAccessExpr(resVar, [new IntLiteralExpr(0, lineSpan)], IsBareArrayReference: false, lineSpan);
+            }
+            else
+            {
+                dst = _exprParser.ParseVariableLValue(ts, _fn, _fn.FilePath, _diagnostics);
+                if (dst is null) return;
+                if (dst.ValueKind != VariableValueKind.Int)
+                {
+                    _diagnostics.ReportError("ERA1401", "Expected an integer expression.", dst.Span, _fn.FilePath);
+                    return;
+                }
+
+                if (!ts.IsAtEnd)
+                {
+                    string tok = ts.Current.Text ?? ts.Current.Kind.ToString();
+                    _diagnostics.ReportError("ERA1596", $"Unexpected token '{tok}' after '{methodKind}' expression.", ts.Current.Span, _fn.FilePath, null, [methodKind.ToString(), tok]);
+                    return;
+                }
+            }
+
             var mark = _emitter.MarkTempRegs();
-            BuiltinMethodSpec gcSpec = BuiltinMethodCatalog.ByKind[BuiltinMethodKind.GETCONFIG];
-            ushort r = _emitter.EmitExprToIntReg(new BuiltinMethodCallExpr(gcSpec, [new StrLiteralExpr(configKey, lineSpan)], lineSpan));
+            BuiltinMethodSpec gcSpec = BuiltinMethodCatalog.ByKind[methodKind];
+            ushort r = _emitter.EmitExprToIntReg(new BuiltinMethodCallExpr(gcSpec, [], lineSpan));
             _emitter.EmitVariableStoreInt(dst, r);
             _emitter.ReleaseTempRegs(mark);
         }
@@ -5376,11 +5604,6 @@ public sealed class ErbProjectCompiler
                     result.Add(null);
                     ts.Advance();
                     idx++;
-                    if (ts.IsAtEnd)
-                    {
-                        result.Add(null);
-                    }
-
                     continue;
                 }
 
@@ -5391,14 +5614,7 @@ public sealed class ErbProjectCompiler
                 result.Add(expr);
                 idx++;
 
-                if (ts.Match(ErbTokenKind.Comma))
-                {
-                    if (ts.IsAtEnd)
-                    {
-                        result.Add(null);
-                    }
-                }
-                else
+                if (!ts.Match(ErbTokenKind.Comma))
                 {
                     break;
                 }
@@ -5452,13 +5668,6 @@ public sealed class ErbProjectCompiler
                     args.Add(null);
                     ts.Advance();
                     idx++;
-                    if (ts.IsAtEnd || (hasParens && ts.Current.Kind == ErbTokenKind.CloseParen))
-                    {
-                        args.Add(null);
-                        if (hasParens) ts.Match(ErbTokenKind.CloseParen);
-                        break;
-                    }
-
                     continue;
                 }
 
@@ -5482,16 +5691,7 @@ public sealed class ErbProjectCompiler
                     break;
                 }
 
-                if (ts.Match(ErbTokenKind.Comma))
-                {
-                    if (ts.IsAtEnd || (hasParens && ts.Current.Kind == ErbTokenKind.CloseParen))
-                    {
-                        args.Add(null);
-                        if (hasParens) ts.Match(ErbTokenKind.CloseParen);
-                        break;
-                    }
-                }
-                else
+                if (!ts.Match(ErbTokenKind.Comma))
                 {
                     break;
                 }
@@ -5610,9 +5810,19 @@ public sealed class ErbProjectCompiler
             }
         }
 
+        private ReadOnlySpan<char> StripComment(ReadOnlySpan<char> span) =>
+            StripTrailingCommentOutsideQuotes(
+                span,
+                _options.EnableSpecialCommentPrefixes,
+                _isDebugMode,
+                _options.SystemAllowFullSpace);
+
         private static bool TrySplitCallTargetAndArgs(
             ReadOnlySpan<char> span,
             bool isForm,
+            bool enableSpecialPrefixes,
+            bool isDebugMode,
+            bool allowFullSpace,
             out string rawTarget,
             out string rawArgs,
             out int argsOffset)
@@ -5620,6 +5830,11 @@ public sealed class ErbProjectCompiler
             rawTarget = string.Empty;
             rawArgs = string.Empty;
             argsOffset = 0;
+
+            if (!isForm)
+            {
+                span = StripTrailingCommentOutsideQuotes(span, enableSpecialPrefixes, isDebugMode, allowFullSpace);
+            }
 
             ReadOnlySpan<char> trimmed = span.Trim();
             if (trimmed.IsEmpty)
@@ -5631,6 +5846,7 @@ public sealed class ErbProjectCompiler
             int i = start;
             int braceDepth = 0;
             bool inPercent = false;
+            bool hitComment = false;
 
             while (i < trimmed.Length)
             {
@@ -5643,6 +5859,11 @@ public sealed class ErbProjectCompiler
                         continue;
                     }
 
+                    if ((braceDepth > 0 || inPercent) && TrySkipStringLiteral(trimmed, ref i))
+                    {
+                        continue;
+                    }
+
                     if (c == '{') braceDepth++;
                     else if (c == '}' && braceDepth > 0) braceDepth--;
                     else if (c == '%') inPercent = !inPercent;
@@ -5652,6 +5873,22 @@ public sealed class ErbProjectCompiler
                         i++;
                         continue;
                     }
+
+                    if (c == ';')
+                    {
+                        if (IsCommentStartAt(trimmed, i, enableSpecialPrefixes, isDebugMode))
+                        {
+                            hitComment = true;
+                            break;
+                        }
+
+                        i += 3;
+                        continue;
+                    }
+                }
+                else if (TrySkipStringLiteral(trimmed, ref i))
+                {
+                    continue;
                 }
 
                 if (c is '(' or ',')
@@ -5668,7 +5905,7 @@ public sealed class ErbProjectCompiler
                 rawTarget = rawTarget[1..].Trim();
             }
 
-            rawArgs = i < trimmed.Length ? trimmed[i..].ToString() : string.Empty;
+            rawArgs = !hitComment && i < trimmed.Length ? trimmed[i..].ToString() : string.Empty;
             argsOffset = i;
             return rawTarget.Length > 0;
         }
@@ -5682,7 +5919,7 @@ public sealed class ErbProjectCompiler
             }
 
             int i = 0;
-            while (i < s.Length && !char.IsWhiteSpace(s[i]) && s[i] != ',' && s[i] != '(')
+            while (i < s.Length && !char.IsWhiteSpace(s[i]) && s[i] != ',' && s[i] != '(' && s[i] != ';')
             {
                 i++;
             }
@@ -5793,25 +6030,407 @@ public sealed class ErbProjectCompiler
         rest = span[i..];
     }
 
-    private static int FindTopLevelEquals(ReadOnlySpan<char> span)
+    private static bool IsCommentStartAt(
+        ReadOnlySpan<char> text,
+        int pos,
+        bool enableSpecialPrefixes,
+        bool isDebugMode)
     {
-        bool inQuotes = false;
-        int depth = 0;
+        if ((uint)pos >= (uint)text.Length || text[pos] != ';')
+        {
+            return false;
+        }
+
+        if (enableSpecialPrefixes && pos + 2 < text.Length && text[pos + 2] == ';')
+        {
+            char mid = text[pos + 1];
+            if (mid is '!' or '^' || (mid == '#' && isDebugMode))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TrySkipStringLiteral(ReadOnlySpan<char> text, ref int index)
+    {
+        if (index < text.Length && text[index] == '@' && index + 1 < text.Length && text[index + 1] == '"')
+        {
+            index += 2;
+            int braceDepth = 0;
+            bool inPercent = false;
+            while (index < text.Length)
+            {
+                char c = text[index];
+                if (c == '\\' && index + 1 < text.Length)
+                {
+                    index += 2;
+                    continue;
+                }
+
+                if ((braceDepth > 0 || inPercent) && c == '"')
+                {
+                    index++;
+                    while (index < text.Length)
+                    {
+                        if (text[index] == '\\' && index + 1 < text.Length)
+                        {
+                            index += 2;
+                            continue;
+                        }
+
+                        if (text[index] == '"')
+                        {
+                            index++;
+                            break;
+                        }
+
+                        index++;
+                    }
+
+                    continue;
+                }
+
+                if (c == '{')
+                {
+                    braceDepth++;
+                }
+                else if (c == '}' && braceDepth > 0)
+                {
+                    braceDepth--;
+                }
+                else if (c == '%')
+                {
+                    inPercent = !inPercent;
+                }
+                else if (c == '"' && braceDepth == 0 && !inPercent)
+                {
+                    index++;
+                    break;
+                }
+
+                index++;
+            }
+
+            return true;
+        }
+
+        if (index < text.Length && text[index] == '"')
+        {
+            index++;
+            while (index < text.Length)
+            {
+                char c = text[index];
+                if (c == '\\' && index + 1 < text.Length)
+                {
+                    index += 2;
+                    continue;
+                }
+
+                index++;
+                if (c == '"')
+                {
+                    break;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static ReadOnlySpan<char> StripTrailingCommentOutsideQuotes(
+        ReadOnlySpan<char> span,
+        bool enableSpecialPrefixes,
+        bool isDebugMode,
+        bool allowFullSpace)
+    {
+        for (int i = 0; i < span.Length; i++)
+        {
+            if (TrySkipStringLiteral(span, ref i))
+            {
+                i--;
+                continue;
+            }
+
+            if (span[i] == ';')
+            {
+                if (IsCommentStartAt(span, i, enableSpecialPrefixes, isDebugMode))
+                {
+                    ReadOnlySpan<char> before = span[..i];
+                    int end = before.Length;
+                    while (end > 0 && (before[end - 1] is ' ' or '\t' || (allowFullSpace && before[end - 1] == '\u3000')))
+                    {
+                        end--;
+                    }
+
+                    return before[..end];
+                }
+
+                i += 2;
+            }
+        }
+
+        return span;
+    }
+
+    private static ReadOnlySpan<char> StripTrailingFormComment(
+        ReadOnlySpan<char> span,
+        bool enableSpecialPrefixes,
+        bool isDebugMode,
+        bool allowFullSpace)
+    {
+        int braceDepth = 0;
+        bool inPercent = false;
         for (int i = 0; i < span.Length; i++)
         {
             char c = span[i];
-            if (c == '"')
+            if (c == '\\' && i + 1 < span.Length)
             {
-                inQuotes = !inQuotes;
+                i++;
                 continue;
             }
 
-            if (inQuotes)
+            if ((braceDepth > 0 || inPercent) && TrySkipStringLiteral(span, ref i))
             {
-                if (c == '\\') i++;
+                i--;
                 continue;
             }
 
+            if (c == '{') braceDepth++;
+            else if (c == '}' && braceDepth > 0) braceDepth--;
+            else if (c == '%') inPercent = !inPercent;
+            else if (braceDepth == 0 && !inPercent && c == ';')
+            {
+                if (IsCommentStartAt(span, i, enableSpecialPrefixes, isDebugMode))
+                {
+                    ReadOnlySpan<char> before = span[..i];
+                    int end = before.Length;
+                    while (end > 0 && (before[end - 1] is ' ' or '\t' || (allowFullSpace && before[end - 1] == '\u3000')))
+                    {
+                        end--;
+                    }
+
+                    return before[..end];
+                }
+
+                i += 2;
+            }
+        }
+
+        return span;
+    }
+
+    private static bool IsSingleGroupedParenthesizedExpression(ReadOnlySpan<char> trimmedRest)
+    {
+        if (trimmedRest.IsEmpty || trimmedRest[0] != '(')
+        {
+            return false;
+        }
+
+        int depth = 0;
+        for (int i = 0; i < trimmedRest.Length; i++)
+        {
+            if (TrySkipStringLiteral(trimmedRest, ref i))
+            {
+                i--;
+                continue;
+            }
+
+            char c = trimmedRest[i];
+            if (c == '(')
+            {
+                depth++;
+            }
+            else if (c == ')')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    return i == trimmedRest.Length - 1;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryFindTopLevelAssignmentOperator(
+        ReadOnlySpan<char> text,
+        bool enableSpecialPrefixes,
+        bool isDebugMode,
+        out int opIndex,
+        out int opLength,
+        out OperatorKind opKind)
+    {
+        opIndex = -1;
+        opLength = 0;
+        opKind = OperatorKind.None;
+
+        int parenDepth = 0;
+        int bracketDepth = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (TrySkipStringLiteral(text, ref i))
+            {
+                i--;
+                continue;
+            }
+
+            char c = text[i];
+            if (c == '(')
+            {
+                parenDepth++;
+                continue;
+            }
+
+            if (c == ')')
+            {
+                if (parenDepth > 0) parenDepth--;
+                continue;
+            }
+
+            if (c == '[')
+            {
+                bracketDepth++;
+                continue;
+            }
+
+            if (c == ']')
+            {
+                if (bracketDepth > 0) bracketDepth--;
+                continue;
+            }
+
+            if (parenDepth != 0 || bracketDepth != 0)
+            {
+                continue;
+            }
+
+            if (c == ';')
+            {
+                if (IsCommentStartAt(text, i, enableSpecialPrefixes, isDebugMode))
+                {
+                    return false;
+                }
+
+                i += 2;
+                continue;
+            }
+
+            char next = i + 1 < text.Length ? text[i + 1] : '\0';
+            char next2 = i + 2 < text.Length ? text[i + 2] : '\0';
+
+            switch (c)
+            {
+                case '<':
+                    if (next == '<' && next2 == '=')
+                    {
+                        opIndex = i;
+                        opLength = 3;
+                        opKind = OperatorKind.ShiftLeftAssign;
+                        return true;
+                    }
+
+                    if (next is '<' or '=')
+                    {
+                        i++;
+                    }
+                    break;
+
+                case '>':
+                    if (next == '>' && next2 == '=')
+                    {
+                        opIndex = i;
+                        opLength = 3;
+                        opKind = OperatorKind.ShiftRightAssign;
+                        return true;
+                    }
+
+                    if (next is '>' or '=')
+                    {
+                        i++;
+                    }
+                    break;
+
+                case '!':
+                    if (next is '=' or '&' or '|')
+                    {
+                        i++;
+                    }
+                    break;
+
+                case '=':
+                    opIndex = i;
+                    if (next == '=')
+                    {
+                        opLength = 2;
+                        opKind = OperatorKind.Equal;
+                    }
+                    else
+                    {
+                        opLength = 1;
+                        opKind = OperatorKind.Assign;
+                    }
+
+                    return true;
+
+                case '\'':
+                    if (next == '=')
+                    {
+                        opIndex = i;
+                        opLength = 2;
+                        opKind = OperatorKind.AssignStr;
+                        return true;
+                    }
+                    break;
+
+                case '+':
+                case '-':
+                case '*':
+                case '/':
+                case '%':
+                case '&':
+                case '|':
+                case '^':
+                    if (next == '=')
+                    {
+                        opIndex = i;
+                        opLength = 2;
+                        opKind = c switch
+                        {
+                            '+' => OperatorKind.AddAssign,
+                            '-' => OperatorKind.SubAssign,
+                            '*' => OperatorKind.MulAssign,
+                            '/' => OperatorKind.DivAssign,
+                            '%' => OperatorKind.ModAssign,
+                            '&' => OperatorKind.BitAndAssign,
+                            '|' => OperatorKind.BitOrAssign,
+                            _ => OperatorKind.BitXorAssign,
+                        };
+                        return true;
+                    }
+                    break;
+            }
+        }
+
+        return false;
+    }
+
+    private static int FindTopLevelEquals(ReadOnlySpan<char> span)
+    {
+        int depth = 0;
+        for (int i = 0; i < span.Length; i++)
+        {
+            if (TrySkipStringLiteral(span, ref i))
+            {
+                i--;
+                continue;
+            }
+
+            char c = span[i];
             if (c == '(') depth++;
             else if (c == ')' && depth > 0) depth--;
             else if (depth == 0 && c == '=')
@@ -5825,23 +6444,16 @@ public sealed class ErbProjectCompiler
 
     private static int FindTopLevelComma(ReadOnlySpan<char> span)
     {
-        bool inQuotes = false;
         int depth = 0;
         for (int i = 0; i < span.Length; i++)
         {
+            if (TrySkipStringLiteral(span, ref i))
+            {
+                i--;
+                continue;
+            }
+
             char c = span[i];
-            if (c == '"')
-            {
-                inQuotes = !inQuotes;
-                continue;
-            }
-
-            if (inQuotes)
-            {
-                if (c == '\\') i++;
-                continue;
-            }
-
             if (c == '(') depth++;
             else if (c == ')' && depth > 0) depth--;
             else if (depth == 0 && c == ',')

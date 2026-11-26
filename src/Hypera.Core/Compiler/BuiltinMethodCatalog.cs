@@ -108,7 +108,7 @@ public static class BuiltinMethodCatalog
             M(BuiltinMethodKind.EXISTCSV, VariableValueKind.Int, Ov([I, I], opt: 1)),
 
             // General & Console State (23)
-            M(BuiltinMethodKind.VARSIZE, VariableValueKind.Int, Ov([S, I], opt: 1)),
+            M(BuiltinMethodKind.VARSIZE, VariableValueKind.Int, Ov([S, I], opt: 1), fold: true),
             M(BuiltinMethodKind.CHKFONT, VariableValueKind.Int, Ov([S])),
             M(BuiltinMethodKind.CHKDATA, VariableValueKind.Int, Ov([I])),
             M(BuiltinMethodKind.ISSKIP, VariableValueKind.Int, Ov([])),

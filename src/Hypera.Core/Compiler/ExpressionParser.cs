@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Text;
 using Hypera.Bytecode;
 using Hypera.Diagnostics;
+using Hypera.Runtime;
 
 namespace Hypera.Compiler;
 
@@ -96,16 +97,6 @@ public sealed class ExpressionParser
     {
         var args = new List<ExprNode?>();
 
-        if (closingDelimiter is { } close && stream.Match(close))
-        {
-            return [];
-        }
-
-        if (closingDelimiter is null && stream.IsAtEnd)
-        {
-            return [];
-        }
-
         while (true)
         {
             if (stream.IsAtEnd)
@@ -114,18 +105,12 @@ public sealed class ExpressionParser
                 {
                     diagnostics.ReportError("ERA1403", $"Missing closing '{closingDelimiter}' in argument list.", stream.Current.Span, filePath, null, [closingDelimiter.Value.ToString()]);
                 }
-                else
-                {
-                    args.Add(null);
-                }
 
                 break;
             }
 
-            if (closingDelimiter is { } c && stream.Current.Kind == c)
+            if (closingDelimiter is { } close && stream.Match(close))
             {
-                args.Add(null);
-                stream.Advance();
                 break;
             }
 
@@ -164,7 +149,6 @@ public sealed class ExpressionParser
             {
                 string tokText = stream.Current.Text ?? stream.Current.Kind.ToString();
                 diagnostics.ReportError("ERA1405", $"Unexpected token '{tokText}' after argument.", stream.Current.Span, filePath, null, [tokText]);
-                break;
             }
 
             break;
@@ -898,19 +882,30 @@ public sealed class ExpressionParser
 
         if (variable.Scope == VariableScopeKind.Constant && variable.IsConst && !variable.IsCalc)
         {
-            // Keep VariableAccessExpr when bare 1D array > 1 so FINDELEMENT(CONST_ARR, ...) works,
-            // EXCEPT scalar #DIM CONST X = 42 (Dimensions[0] == 1) folds immediately unless hasNoExplicitSubs && Dimensions[0] > 1!
+            // Fold scalar / single-element #DIM(S) CONST (Dimensions[0] == 1) to a literal for value positions,
+            // while retaining ConstArraySource when bare so read-only array methods (e.g. FINDELEMENT / MATCH)
+            // still receive a VariableAccessExpr reference.
             int constLen = variable.Dimensions.Length > 0 ? variable.Dimensions[0] : 1;
             if (constLen == 1 && (!hasNoExplicitSubs || finalSubs.Count <= 1))
             {
+                VariableAccessExpr? constArraySource = hasNoExplicitSubs
+                    ? new VariableAccessExpr(variable, [.. finalSubs], IsBareArrayReference: true, fullSpan)
+                    : null;
+
                 if (variable.ValueKind == VariableValueKind.Int && variable.DefaultIntValues.Length == 1)
                 {
-                    return new IntLiteralExpr(variable.DefaultIntValues[0], fullSpan);
+                    return new IntLiteralExpr(variable.DefaultIntValues[0], fullSpan)
+                    {
+                        ConstArraySource = constArraySource,
+                    };
                 }
 
                 if (variable.ValueKind == VariableValueKind.Str && variable.DefaultStrValues.Length == 1)
                 {
-                    return new StrLiteralExpr(variable.DefaultStrValues[0], fullSpan);
+                    return new StrLiteralExpr(variable.DefaultStrValues[0], fullSpan)
+                    {
+                        ConstArraySource = constArraySource,
+                    };
                 }
             }
             else if (!hasNoExplicitSubs && finalSubs is [IntLiteralExpr constIdx])
@@ -1164,24 +1159,24 @@ public sealed class ExpressionParser
         string? lastMismatchReason = null;
         foreach (MethodOverloadSpec ov in spec.Overloads)
         {
-            if (TryMatchOverload(spec, ov, rawArgs, out string? mismatch))
+            if (TryMatchOverload(spec, ov, rawArgs, out ImmutableArray<ExprNode?> resolvedArgs, out string? mismatch))
             {
                 // Mark any local dynamic array passed by ref so it is not scalar-register-promoted!
-                for (int i = 0; i < rawArgs.Length; i++)
+                for (int i = 0; i < resolvedArgs.Length; i++)
                 {
                     MethodParamKind pk = GetParamKindAt(ov, i);
-                    if (IsRefParamKind(pk) && rawArgs[i] is VariableAccessExpr va && va.Variable.Scope == VariableScopeKind.FunctionDynamic)
+                    if (IsRefParamKind(pk) && resolvedArgs[i] is VariableAccessExpr va && va.Variable.Scope == VariableScopeKind.FunctionDynamic)
                     {
                         va.Variable.IsRegisterPromoted = false;
                     }
                 }
 
-                if (spec.CanConstantFold && TryFoldBuiltinMethod(spec.Kind, rawArgs, callSpan, out ExprNode? folded))
+                if (spec.CanConstantFold && TryFoldBuiltinMethod(spec.Kind, resolvedArgs, callSpan, ctx.ActiveFunction, out ExprNode? folded))
                 {
                     return folded!;
                 }
 
-                return new BuiltinMethodCallExpr(spec, rawArgs, callSpan);
+                return new BuiltinMethodCallExpr(spec, resolvedArgs, callSpan);
             }
 
             lastMismatchReason = mismatch;
@@ -1227,8 +1222,11 @@ public sealed class ExpressionParser
         BuiltinMethodSpec spec,
         MethodOverloadSpec ov,
         ImmutableArray<ExprNode?> args,
+        out ImmutableArray<ExprNode?> resolvedArgs,
         out string? error)
     {
+        resolvedArgs = args;
+        ExprNode?[]? rewritten = null;
         error = null;
         if (args.Length < ov.MinArgs)
         {
@@ -1341,12 +1339,39 @@ public sealed class ExpressionParser
                 case MethodParamKind.RefStr1D:
                 case MethodParamKind.RefAny1D:
                 case MethodParamKind.RefAnyArray:
-                    if (!ValidateRefArrayArg(arg, pk, ov.AllowConstRef, i + 1, out error))
+                {
+                    ExprNode candidate = arg;
+                    if (ov.AllowConstRef)
+                    {
+                        if (arg is IntLiteralExpr { ConstArraySource: { } constIntVa })
+                        {
+                            candidate = constIntVa;
+                        }
+                        else if (arg is StrLiteralExpr { ConstArraySource: { } constStrVa })
+                        {
+                            candidate = constStrVa;
+                        }
+                    }
+
+                    if (!ValidateRefArrayArg(candidate, pk, ov.AllowConstRef, i + 1, out error))
                     {
                         return false;
                     }
+
+                    if (!ReferenceEquals(candidate, arg))
+                    {
+                        rewritten ??= [.. args];
+                        rewritten[i] = candidate;
+                    }
+
                     break;
+                }
             }
+        }
+
+        if (rewritten is not null)
+        {
+            resolvedArgs = [.. rewritten];
         }
 
         return true;
@@ -1554,10 +1579,11 @@ public sealed class ExpressionParser
         }
     }
 
-    private static bool TryFoldBuiltinMethod(
+    private bool TryFoldBuiltinMethod(
         BuiltinMethodKind kind,
         ImmutableArray<ExprNode?> args,
         SourceSpan span,
+        UserFunctionSymbol? activeFunction,
         out ExprNode? folded)
     {
         folded = null;
@@ -1615,9 +1641,88 @@ public sealed class ExpressionParser
             case BuiltinMethodKind.TOSTR when args is [IntLiteralExpr n]:
                 folded = new StrLiteralExpr(n.Value.ToString(CultureInfo.InvariantCulture), span);
                 return true;
+
+            case BuiltinMethodKind.UNICODE when args is [IntLiteralExpr cp]:
+                if (cp.Value > 0 && cp.Value <= 0x10FFFF && cp.Value is not (>= 0xD800 and <= 0xDFFF))
+                {
+                    folded = new StrLiteralExpr(EastAsianStringOps.Unicode(cp.Value), span);
+                    return true;
+                }
+
+                return false;
+
+            case BuiltinMethodKind.VARSIZE when args.Length is 1 or 2
+                && args[0] is StrLiteralExpr varNameExpr
+                && (args.Length == 1 || args[1] is null or IntLiteralExpr):
+                return TryFoldVarSize(
+                    varNameExpr.Value,
+                    args.Length == 2 && args[1] is IntLiteralExpr dimLit ? dimLit.Value : 0L,
+                    span,
+                    activeFunction,
+                    out folded);
         }
 
         return false;
+    }
+
+    private bool TryFoldVarSize(
+        string rawVarName,
+        long rawDim,
+        SourceSpan span,
+        UserFunctionSymbol? activeFunction,
+        out ExprNode? folded)
+    {
+        folded = null;
+        string targetName = rawVarName.Trim();
+        string? explicitSubFunc = null;
+        int atIdx = targetName.IndexOf('@');
+        if (atIdx > 0)
+        {
+            explicitSubFunc = targetName[(atIdx + 1)..].Trim();
+            targetName = targetName[..atIdx].Trim();
+        }
+
+        if (string.IsNullOrEmpty(targetName)
+            || !_symbols.TryResolveVariable(targetName, explicitSubFunc, activeFunction, out ResolvedVariable? rv)
+            || rv is null
+            || rv.IsByRef
+            || rv.Scope == VariableScopeKind.Reference)
+        {
+            return false;
+        }
+
+        int dim = rawDim is >= 0 and <= 2 ? (int)rawDim : -1;
+        long size;
+        if (rv.IsCharaData)
+        {
+            int d0 = rv.ArrayRank >= 1 && rv.Dimensions.Length >= 1 ? Math.Max(1, rv.Dimensions[0]) : 1;
+            int d1 = rv.ArrayRank >= 2 && rv.Dimensions.Length >= 2 ? Math.Max(1, rv.Dimensions[1]) : 1;
+            int d2 = rv.ArrayRank >= 3 && rv.Dimensions.Length >= 3 ? Math.Max(1, rv.Dimensions[2]) : 1;
+            size = dim switch
+            {
+                0 => d0,
+                1 => d1,
+                2 => d2,
+                _ => 0L,
+            };
+        }
+        else
+        {
+            int rank = rv.Dimensions.Length;
+            int d0 = rank >= 1 ? Math.Max(1, rv.Dimensions[0]) : 1;
+            int d1 = rank >= 2 ? Math.Max(1, rv.Dimensions[1]) : 1;
+            int d2 = rank >= 3 ? Math.Max(1, rv.Dimensions[2]) : 1;
+            size = dim switch
+            {
+                0 => d0,
+                1 => rank >= 2 ? d1 : 0L,
+                2 => rank >= 3 ? d2 : 0L,
+                _ => 0L,
+            };
+        }
+
+        folded = new IntLiteralExpr(size, span);
+        return true;
     }
 
     private ExprNode BuildImplicitTargetExpr(SourceSpan span)

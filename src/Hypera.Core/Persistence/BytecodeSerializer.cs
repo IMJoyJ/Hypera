@@ -444,7 +444,7 @@ public static class BytecodeSerializer
             string pName = ReadUtf8String(r);
             var pKind = (VariableValueKind)r.ReadByte();
             bool isByRef = r.ReadBoolean();
-            ushort regIndex = r.ReadUInt16();
+            int regIndex = r.ReadInt32();
             bool hasDefault = r.ReadBoolean();
             long defInt = r.ReadInt64();
             bool hasDefStr = r.ReadBoolean();
@@ -485,12 +485,36 @@ public static class BytecodeSerializer
             w.Write(dim);
         }
 
+        bool hasDefaults = (v.ValueKind == VariableValueKind.Int && !v.DefaultIntValues.IsDefaultOrEmpty)
+            || (v.ValueKind == VariableValueKind.Str && !v.DefaultStrValues.IsDefaultOrEmpty);
+
         byte flags = 0;
         if (v.IsCharaData) flags |= 1 << 0;
         if (v.IsSavedata) flags |= 1 << 1;
         if (v.IsGlobal) flags |= 1 << 2;
         if (v.IsConst) flags |= 1 << 3;
+        if (hasDefaults) flags |= 1 << 4;
         w.Write(flags);
+
+        if (hasDefaults)
+        {
+            if (v.ValueKind == VariableValueKind.Int)
+            {
+                w.Write(v.DefaultIntValues.Length);
+                foreach (long defVal in v.DefaultIntValues)
+                {
+                    w.Write(defVal);
+                }
+            }
+            else
+            {
+                w.Write(v.DefaultStrValues.Length);
+                foreach (string defVal in v.DefaultStrValues)
+                {
+                    WriteUtf8String(w, defVal ?? string.Empty);
+                }
+            }
+        }
     }
 
     private static VariableSlotDescriptor ReadVariableSlot(BinaryReader r)
@@ -507,6 +531,33 @@ public static class BytecodeSerializer
         }
 
         byte flags = r.ReadByte();
+        ImmutableArray<long> defaultInts = default;
+        ImmutableArray<string> defaultStrs = default;
+        if ((flags & (1 << 4)) != 0)
+        {
+            int defCount = r.ReadInt32();
+            if (valueKind == VariableValueKind.Int)
+            {
+                var arr = ImmutableArray.CreateBuilder<long>(defCount);
+                for (int i = 0; i < defCount; i++)
+                {
+                    arr.Add(r.ReadInt64());
+                }
+
+                defaultInts = arr.MoveToImmutable();
+            }
+            else
+            {
+                var arr = ImmutableArray.CreateBuilder<string>(defCount);
+                for (int i = 0; i < defCount; i++)
+                {
+                    arr.Add(ReadUtf8String(r));
+                }
+
+                defaultStrs = arr.MoveToImmutable();
+            }
+        }
+
         return new VariableSlotDescriptor(
             slotId,
             name,
@@ -516,7 +567,9 @@ public static class BytecodeSerializer
             IsCharaData: (flags & (1 << 0)) != 0,
             IsSavedata: (flags & (1 << 1)) != 0,
             IsGlobal: (flags & (1 << 2)) != 0,
-            IsConst: (flags & (1 << 3)) != 0);
+            IsConst: (flags & (1 << 3)) != 0,
+            DefaultIntValues: defaultInts,
+            DefaultStrValues: defaultStrs);
     }
 
     private static void WriteSourceMap(BinaryWriter w, SourceMap map)

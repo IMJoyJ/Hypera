@@ -46,7 +46,9 @@ public sealed class StrFormParser
         if (form.Segments.Length == 1
             && form.Segments[0] is ValueFormSegment { Width: null, Value.ValueKind: VariableValueKind.Str } singleStr)
         {
-            return singleStr.Value;
+            return singleStr.Value is StrLiteralExpr singleStrLit
+                ? new StrLiteralExpr(singleStrLit.Value, wholeSpan)
+                : singleStr.Value;
         }
 
         return form;
@@ -184,7 +186,7 @@ public sealed class StrFormParser
                         ExprNode? widthExpr = null;
                         bool leftAlign = false;
 
-                        if (ts.Match(ErbTokenKind.Comma))
+                        if (ts.Match(ErbTokenKind.Comma) && !ts.IsAtEnd)
                         {
                             widthExpr = _expressionParser.ParseExpression(
                                 ts, activeFunction, filePath, diagnostics, stopAtComma: true, onUserFunctionReferenced: onUserFunctionReferenced);
@@ -193,7 +195,7 @@ public sealed class StrFormParser
                                 diagnostics.ReportError("ERA1305", "FORM placeholder width specifier must be an integer expression.", widthExpr.Span, filePath);
                             }
 
-                            if (ts.Match(ErbTokenKind.Comma))
+                            if (ts.Match(ErbTokenKind.Comma) && !ts.IsAtEnd)
                             {
                                 if (ts.Current.Kind != ErbTokenKind.Identifier || string.IsNullOrEmpty(ts.Current.Text))
                                 {

@@ -10,10 +10,16 @@ namespace Hypera.Compiler;
 public abstract record ExprNode(VariableValueKind ValueKind, SourceSpan Span);
 
 public sealed record IntLiteralExpr(long Value, SourceSpan Span)
-    : ExprNode(VariableValueKind.Int, Span);
+    : ExprNode(VariableValueKind.Int, Span)
+{
+    public VariableAccessExpr? ConstArraySource { get; init; }
+}
 
 public sealed record StrLiteralExpr(string Value, SourceSpan Span)
-    : ExprNode(VariableValueKind.Str, Span);
+    : ExprNode(VariableValueKind.Str, Span)
+{
+    public VariableAccessExpr? ConstArraySource { get; init; }
+}
 
 public sealed record UnaryExpr(
     OperatorKind Operator,
@@ -156,7 +162,9 @@ public sealed class ResolvedVariable
             IsCharaData,
             IsSavedata,
             IsGlobal,
-            IsConst);
+            IsConst,
+            DefaultIntValues,
+            DefaultStrValues);
 }
 
 /// <summary>

@@ -20,7 +20,7 @@ public readonly record struct BytecodeModuleHeader(
     uint StaticVariableCount)
 {
     public const uint ExpectedMagic = 0x43424548u; // "HEBC" in little-endian ASCII
-    public const ushort CurrentVersion = 1;
+    public const ushort CurrentVersion = 2;
     public const int SizeInBytes = 28;
 
     public bool IsValid => Magic == ExpectedMagic && Version == CurrentVersion;
@@ -118,13 +118,15 @@ public sealed record VariableSlotDescriptor(
     bool IsCharaData = false,
     bool IsSavedata = false,
     bool IsGlobal = false,
-    bool IsConst = false);
+    bool IsConst = false,
+    ImmutableArray<long> DefaultIntValues = default,
+    ImmutableArray<string> DefaultStrValues = default);
 
 public sealed record FunctionParameterDescriptor(
     string Name,
     VariableValueKind ValueKind,
     bool IsByRef,
-    ushort RegisterOrSlotIndex,
+    int RegisterOrSlotIndex,
     bool HasDefaultValue = false,
     long DefaultIntValue = 0,
     string? DefaultStrValue = null);
