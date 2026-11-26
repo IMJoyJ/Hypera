@@ -947,9 +947,9 @@ public sealed class StandaloneHostTests
             // Matches Emuera.NET ButtonStringCreator: suffix-mode buttons on a shared line include their leading padding.
             List<ConsoleRenderPart> line0Btns = scene1.VisibleLines[0].Parts.Where(static p => p.Button is { IsButton: true }).ToList();
             Assert.Equal(2, line0Btns.Count);
-            Assert.Equal("移動[400]", line0Btns[0].Text.Trim());
+            Assert.Equal("移動[400]", line0Btns[0].Text?.Trim());
             Assert.Equal(400L, line0Btns[0].Button!.IntValue);
-            Assert.Equal("外出する[460]", line0Btns[1].Text.Trim());
+            Assert.Equal("外出する[460]", line0Btns[1].Text?.Trim());
             Assert.Equal(460L, line0Btns[1].Button!.IntValue);
 
             List<ConsoleRenderPart> line1Btns = scene1.VisibleLines[1].Parts.Where(static p => p.Button is { IsButton: true }).ToList();
@@ -1210,14 +1210,15 @@ public sealed class StandaloneHostTests
         try
         {
             string prefPath = WindowStatePreferenceStore.ResolveFilePath(workDir);
-            Assert.Equal(Path.Combine(workDir, WindowStatePreferenceStore.DefaultFileName), prefPath);
+            Assert.Equal(Path.Combine(workDir, "config.json"), prefPath);
+            Assert.Equal("config.json", WindowStatePreferenceStore.DefaultFileName);
 
             // 1. Default when file does not exist => maximized startup
             WindowStatePreference initial = WindowStatePreferenceStore.Load(prefPath);
             Assert.True(initial.IsMaximized);
             Assert.False(initial.HasNormalSize);
 
-            // 2. Persist restored windowed state & normal bounds
+            // 2. Persist restored windowed state & verify nested "window" JSON structure
             var windowed = new WindowStatePreference(
                 IsMaximized: false,
                 NormalX: 120,
@@ -1225,6 +1226,16 @@ public sealed class StandaloneHostTests
                 NormalWidth: 1280,
                 NormalHeight: 800);
             Assert.True(WindowStatePreferenceStore.TrySave(prefPath, windowed));
+
+            string rawJson = File.ReadAllText(prefPath);
+            using (var doc = System.Text.Json.JsonDocument.Parse(rawJson))
+            {
+                Assert.True(doc.RootElement.TryGetProperty("window", out var winObj));
+                Assert.Equal(System.Text.Json.JsonValueKind.Object, winObj.ValueKind);
+                Assert.False(winObj.GetProperty("isMaximized").GetBoolean());
+                Assert.Equal(1280, winObj.GetProperty("normalWidth").GetInt32());
+                Assert.False(doc.RootElement.TryGetProperty("isMaximized", out _));
+            }
 
             WindowStatePreference reloadedWindowed = WindowStatePreferenceStore.Load(prefPath);
             Assert.False(reloadedWindowed.IsMaximized);
@@ -1235,16 +1246,110 @@ public sealed class StandaloneHostTests
             Assert.Equal(1280, reloadedWindowed.NormalWidth);
             Assert.Equal(800, reloadedWindowed.NormalHeight);
 
-            // 3. Persist maximized state while keeping remembered normal bounds
+            // 3. Updating "window" preserves sibling future top-level config sections!
+            File.WriteAllText(
+                prefPath,
+                """
+                {
+                  "audio": { "masterVolume": 0.75 },
+                  "window": { "isMaximized": false, "normalWidth": 1280, "normalHeight": 800 }
+                }
+                """);
             Assert.True(WindowStatePreferenceStore.TrySave(prefPath, reloadedWindowed with { IsMaximized = true }));
             WindowStatePreference reloadedMax = WindowStatePreferenceStore.Load(prefPath);
             Assert.True(reloadedMax.IsMaximized);
             Assert.Equal(1280, reloadedMax.NormalWidth);
+            using (var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(prefPath)))
+            {
+                Assert.True(doc.RootElement.TryGetProperty("audio", out var audioObj));
+                Assert.Equal(0.75, audioObj.GetProperty("masterVolume").GetDouble(), precision: 4);
+                Assert.True(doc.RootElement.GetProperty("window").GetProperty("isMaximized").GetBoolean());
+            }
 
-            // 4. Corrupt JSON safely falls back to default maximized startup
+            // 4. Legacy hypera.window.json fallback when config.json does not exist yet
+            File.Delete(prefPath);
+            File.WriteAllText(
+                Path.Combine(workDir, WindowStatePreferenceStore.LegacyFileName),
+                """{ "isMaximized": false, "normalX": 40, "normalY": 50, "normalWidth": 1024, "normalHeight": 768 }""");
+            WindowStatePreference migrated = WindowStatePreferenceStore.Load(prefPath);
+            Assert.False(migrated.IsMaximized);
+            Assert.Equal(1024, migrated.NormalWidth);
+            Assert.Equal(768, migrated.NormalHeight);
+
+            // 5. Corrupt JSON safely falls back to default maximized startup
             File.WriteAllText(prefPath, "{ invalid json !!!");
             WindowStatePreference recovered = WindowStatePreferenceStore.Load(prefPath);
             Assert.True(recovered.IsMaximized);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void HepLoadProgress_ReportsMonotonicByteProgressAcrossDecompressAndDeserialize()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_hep_byte_prog_{Guid.NewGuid():N}");
+        string gameDir = Path.Combine(workDir, "game");
+        string hepPath = Path.Combine(workDir, "pkg.hep");
+        Directory.CreateDirectory(Path.Combine(gameDir, "ERB"));
+
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("@SYSTEM_TITLE");
+            for (int i = 0; i < 400; i++)
+            {
+                sb.AppendLine($"A:{i % 100} = {i}");
+            }
+
+            sb.AppendLine("QUIT");
+            File.WriteAllText(Path.Combine(gameDir, "ERB", "Main.erb"), sb.ToString());
+
+            using (var srcVfs = new PhysicalDirectoryVfs(gameDir))
+            {
+                ConfigLoadResult cfg = ConfigLoader.Default.Load(srcVfs);
+                GameData gd = CsvGameDataLoader.Default.Load(srcVfs, cfg.CompilerOptions);
+                var compiler = new ErbProjectCompiler(cfg.CompilerOptions, CompilerExternalContext.FromGameData(gd));
+                byte[] hebBytes = BytecodeSerializer.Serialize(compiler.CompileProject(srcVfs, throwOnError: true).Module);
+                HepPackageWriter.PackDirectory(
+                    gameDir,
+                    hepPath,
+                    prebuiltBytecode: hebBytes,
+                    compress: true,
+                    includeFileFilter: HepPackageWriter.CreateCompiledDistributionFilter());
+            }
+
+            var reports = new List<GameLoadProgress>();
+            using var hepVfs = new HepArchiveVfs(hepPath);
+            using HyperaGameHost host = HyperaGameHost.LoadFromVfs(
+                hepVfs,
+                ownsVfs: false,
+                options: new HyperaGameLoadOptions
+                {
+                    AutoStartSystemFlow = true,
+                    Progress = new SynchronousProgress<GameLoadProgress>(reports.Add),
+                });
+
+            Assert.NotEmpty(reports);
+            Assert.Equal(100, reports[^1].Percent);
+
+            int prevPct = -1;
+            foreach (GameLoadProgress r in reports)
+            {
+                Assert.True(r.Percent >= prevPct, $"Progress went backwards: {prevPct}% -> {r.Percent}% ({r.Stage})");
+                prevPct = r.Percent;
+            }
+
+            var decompressReports = reports.Where(static r => r.Stage == "Reading package bytecode..." && r.TotalBytes is > 0).ToList();
+            var deserializeReports = reports.Where(static r => r.Stage == "Loading precompiled bytecode..." && r.TotalBytes is > 0).ToList();
+            Assert.NotEmpty(decompressReports);
+            Assert.NotEmpty(deserializeReports);
+            Assert.Equal(decompressReports[^1].TotalBytes, decompressReports[^1].BytesRead);
+            Assert.Equal(deserializeReports[^1].TotalBytes, deserializeReports[^1].BytesRead);
+            Assert.InRange(decompressReports[^1].Percent, 8, 36);
+            Assert.InRange(deserializeReports[^1].Percent, 36, 88);
         }
         finally
         {

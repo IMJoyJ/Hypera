@@ -122,9 +122,42 @@ public static class BytecodeSerializer
         return Deserialize(ms);
     }
 
-    public static BytecodeModule Deserialize(Stream input)
+    public static BytecodeModule Deserialize(Stream input) =>
+        Deserialize(input, byteProgress: null, cancellationToken: default);
+
+    public static BytecodeModule Deserialize(
+        Stream input,
+        Action<long, long>? byteProgress,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(input);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        long totalBytes = input.CanSeek ? input.Length : -1L;
+        long reportStep = byteProgress is not null && totalBytes > 0
+            ? Math.Max(256 * 1024L, totalBytes / 100)
+            : long.MaxValue;
+        long nextReportAt = reportStep;
+
+        void MaybeReportProgress()
+        {
+            if (byteProgress is null || totalBytes <= 0)
+            {
+                return;
+            }
+
+            long pos = input.Position;
+            if (pos >= nextReportAt)
+            {
+                byteProgress(Math.Min(pos, totalBytes), totalBytes);
+                nextReportAt = pos + reportStep;
+            }
+        }
+
+        if (byteProgress is not null && totalBytes > 0)
+        {
+            byteProgress(input.Position, totalBytes);
+        }
 
         Span<byte> headerBytes = stackalloc byte[BytecodeModuleHeader.SizeInBytes];
         try
@@ -145,41 +178,61 @@ public static class BytecodeSerializer
 
         CompilerOptions compilerOptions = ReadCompilerOptions(reader);
         ReplaceConfiguration replaceConfig = ReadReplaceConfig(reader);
+        MaybeReportProgress();
 
-        // Flat Instruction[]
+        // Flat Instruction[] (streamed in bounded 2 MB chunks to avoid LOH spike and report smooth byte progress)
         int insnCount = checked((int)header.InstructionCount);
         var instructions = ImmutableArray.CreateBuilder<Instruction>(insnCount);
         if (insnCount > 0)
         {
-            int byteCount = checked(insnCount * Instruction.SizeInBytes);
-            byte[] rawInsns = reader.ReadBytes(byteCount);
-            if (rawInsns.Length != byteCount)
-            {
-                throw new InvalidDataException("Truncated .heb instruction stream.");
-            }
+            const int ChunkInsns = 131_072; // 131,072 * 16B = 2 MB
+            int chunkBufInsns = Math.Min(insnCount, ChunkInsns);
+            byte[] chunkBuf = new byte[chunkBufInsns * Instruction.SizeInBytes];
+            int remaining = insnCount;
 
-            if (BitConverter.IsLittleEndian)
+            while (remaining > 0)
             {
-                ReadOnlySpan<Instruction> casted = MemoryMarshal.Cast<byte, Instruction>(rawInsns);
-                foreach (Instruction insn in casted)
+                cancellationToken.ThrowIfCancellationRequested();
+                int takeInsns = Math.Min(remaining, chunkBufInsns);
+                int byteCount = takeInsns * Instruction.SizeInBytes;
+                int offset = 0;
+                while (offset < byteCount)
                 {
-                    instructions.Add(insn);
+                    int read = input.Read(chunkBuf, offset, byteCount - offset);
+                    if (read == 0)
+                    {
+                        throw new InvalidDataException("Truncated .heb instruction stream.");
+                    }
+
+                    offset += read;
                 }
-            }
-            else
-            {
-                using var insnReader = new BinaryReader(new MemoryStream(rawInsns, writable: false));
-                for (int i = 0; i < insnCount; i++)
+
+                if (BitConverter.IsLittleEndian)
                 {
-                    instructions.Add(new Instruction(
-                        (OpCode)insnReader.ReadUInt16(),
-                        insnReader.ReadUInt16(),
-                        insnReader.ReadUInt16(),
-                        insnReader.ReadUInt16(),
-                        insnReader.ReadUInt16(),
-                        insnReader.ReadUInt16(),
-                        insnReader.ReadInt32()));
+                    ReadOnlySpan<Instruction> casted = MemoryMarshal.Cast<byte, Instruction>(chunkBuf.AsSpan(0, byteCount));
+                    for (int i = 0; i < casted.Length; i++)
+                    {
+                        instructions.Add(casted[i]);
+                    }
                 }
+                else
+                {
+                    using var insnReader = new BinaryReader(new MemoryStream(chunkBuf, 0, byteCount, writable: false));
+                    for (int i = 0; i < takeInsns; i++)
+                    {
+                        instructions.Add(new Instruction(
+                            (OpCode)insnReader.ReadUInt16(),
+                            insnReader.ReadUInt16(),
+                            insnReader.ReadUInt16(),
+                            insnReader.ReadUInt16(),
+                            insnReader.ReadUInt16(),
+                            insnReader.ReadUInt16(),
+                            insnReader.ReadInt32()));
+                    }
+                }
+
+                remaining -= takeInsns;
+                MaybeReportProgress();
             }
         }
 
@@ -189,7 +242,14 @@ public static class BytecodeSerializer
         for (int i = 0; i < intConstCount; i++)
         {
             intConstants.Add(reader.ReadInt64());
+            if ((i & 0xFFFF) == 0xFFFF)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                MaybeReportProgress();
+            }
         }
+
+        MaybeReportProgress();
 
         // StringConstants
         int strConstCount = checked((int)header.StringConstantCount);
@@ -197,7 +257,14 @@ public static class BytecodeSerializer
         for (int i = 0; i < strConstCount; i++)
         {
             strConstants.Add(ReadUtf8String(reader));
+            if ((i & 0x1FFF) == 0x1FFF)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                MaybeReportProgress();
+            }
         }
+
+        MaybeReportProgress();
 
         // Functions
         int funcCount = checked((int)header.FunctionCount);
@@ -205,7 +272,14 @@ public static class BytecodeSerializer
         for (int i = 0; i < funcCount; i++)
         {
             functions.Add(ReadFunctionDescriptor(reader));
+            if ((i & 0x3FF) == 0x3FF)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                MaybeReportProgress();
+            }
         }
+
+        MaybeReportProgress();
 
         // EventGroups
         int eventGroupCount = reader.ReadInt32();
@@ -231,13 +305,22 @@ public static class BytecodeSerializer
             eventGroups.Add(new EventFunctionGroup(eventName, handlers.MoveToImmutable()));
         }
 
+        MaybeReportProgress();
+
         // StaticVariables
         int staticVarCount = checked((int)header.StaticVariableCount);
         var staticVars = ImmutableArray.CreateBuilder<VariableSlotDescriptor>(staticVarCount);
         for (int i = 0; i < staticVarCount; i++)
         {
             staticVars.Add(ReadVariableSlot(reader));
+            if ((i & 0xFFF) == 0xFFF)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                MaybeReportProgress();
+            }
         }
+
+        MaybeReportProgress();
 
         // DefinedMacros
         int macroCount = reader.ReadInt32();
@@ -248,7 +331,12 @@ public static class BytecodeSerializer
         }
 
         // SourceMap
-        SourceMap sourceMap = ReadSourceMap(reader);
+        SourceMap sourceMap = ReadSourceMap(reader, MaybeReportProgress, cancellationToken);
+
+        if (byteProgress is not null && totalBytes > 0)
+        {
+            byteProgress(totalBytes, totalBytes);
+        }
 
         return new BytecodeModule
         {
@@ -608,7 +696,10 @@ public static class BytecodeSerializer
         }
     }
 
-    private static SourceMap ReadSourceMap(BinaryReader r)
+    private static SourceMap ReadSourceMap(
+        BinaryReader r,
+        Action? maybeReportProgress = null,
+        CancellationToken cancellationToken = default)
     {
         int fileCount = r.ReadInt32();
         var files = new SourceFileEntry[fileCount];
@@ -628,6 +719,11 @@ public static class BytecodeSerializer
             int fileId = r.ReadInt32();
             int lineNo = r.ReadInt32();
             runs[i] = new SourceMapRun(startPc, fileId, lineNo);
+            if ((i & 0x3FFF) == 0x3FFF)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                maybeReportProgress?.Invoke();
+            }
         }
 
         return new SourceMap(files, runs);

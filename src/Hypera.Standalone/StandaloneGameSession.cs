@@ -66,7 +66,7 @@ public sealed class StandaloneGameSession : IDisposable
 
         cancellationToken.ThrowIfCancellationRequested();
         string targetName = Path.GetFileName(target.Path);
-        progress?.Report(new GameLoadProgress(2, "Opening game package...", string.IsNullOrEmpty(targetName) ? target.Path : targetName));
+        progress?.Report(new GameLoadProgress(1, "Opening game package...", string.IsNullOrEmpty(targetName) ? target.Path : targetName));
 
         var sw = Stopwatch.StartNew();
         var owned = new List<IDisposable>();
@@ -91,9 +91,22 @@ public sealed class StandaloneGameSession : IDisposable
                     }
                     else if (trailer.PayloadKind == BundlePayloadKind.Heb)
                     {
-                        progress?.Report(new GameLoadProgress(15, "Loading embedded bytecode...", targetName));
+                        progress?.Report(new GameLoadProgress(10, "Loading embedded bytecode...", targetName));
                         using Stream subStream = SingleFileBundleCodec.OpenPayloadStream(target.Path, trailer);
-                        preloadedModule = BytecodeSerializer.Deserialize(subStream);
+                        preloadedModule = BytecodeSerializer.Deserialize(
+                            subStream,
+                            progress is null
+                                ? null
+                                : (read, total) =>
+                                {
+                                    double frac = total > 0 ? Math.Clamp((double)read / total, 0.0, 1.0) : 1.0;
+                                    int pct = 10 + (int)Math.Round(78.0 * frac);
+                                    string detail = total >= 1024 * 1024
+                                        ? string.Create(CultureInfo.InvariantCulture, $"{targetName} ({read / 1048576.0:0.0} / {total / 1048576.0:0.0} MB)")
+                                        : string.Create(CultureInfo.InvariantCulture, $"{targetName} ({read:N0} / {total:N0} B)");
+                                    progress.Report(new GameLoadProgress(pct, "Loading embedded bytecode...", detail, read, total));
+                                },
+                            cancellationToken);
                         string dir = Path.GetDirectoryName(target.Path) ?? target.SaveDirectory;
                         vfs = new PhysicalDirectoryVfs(dir);
                     }
@@ -121,10 +134,23 @@ public sealed class StandaloneGameSession : IDisposable
 
                 case StandaloneTargetKind.HebBytecode:
                 {
-                    progress?.Report(new GameLoadProgress(15, "Loading precompiled bytecode...", targetName));
+                    progress?.Report(new GameLoadProgress(10, "Loading precompiled bytecode...", targetName));
                     using (var fs = new FileStream(target.Path, FileMode.Open, FileAccess.Read, FileShare.Read))
                     {
-                        preloadedModule = BytecodeSerializer.Deserialize(fs);
+                        preloadedModule = BytecodeSerializer.Deserialize(
+                            fs,
+                            progress is null
+                                ? null
+                                : (read, total) =>
+                                {
+                                    double frac = total > 0 ? Math.Clamp((double)read / total, 0.0, 1.0) : 1.0;
+                                    int pct = 10 + (int)Math.Round(78.0 * frac);
+                                    string detail = total >= 1024 * 1024
+                                        ? string.Create(CultureInfo.InvariantCulture, $"{targetName} ({read / 1048576.0:0.0} / {total / 1048576.0:0.0} MB)")
+                                        : string.Create(CultureInfo.InvariantCulture, $"{targetName} ({read:N0} / {total:N0} B)");
+                                    progress.Report(new GameLoadProgress(pct, "Loading precompiled bytecode...", detail, read, total));
+                                },
+                            cancellationToken);
                     }
 
                     string dir = Path.GetDirectoryName(target.Path) ?? target.SaveDirectory;

@@ -93,43 +93,116 @@ public sealed class HepArchiveVfs : IVirtualFileSystem
         return new MemoryStream(data, writable: false);
     }
 
-    public byte[] ReadAllBytes(string virtualPath)
+    public byte[] ReadAllBytes(string virtualPath) =>
+        ReadAllBytes(virtualPath, byteProgress: null, cancellationToken: default);
+
+    public byte[] ReadAllBytes(
+        string virtualPath,
+        Action<long, long>? byteProgress,
+        CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+
         string normalized = VfsPathNormalizer.Normalize(virtualPath);
         if (!_entryIndex.TryGetValue(normalized, out ArchiveEntryDescriptor desc))
         {
             throw new FileNotFoundException($"Virtual file not found in .hep archive: '{normalized}'.", normalized);
         }
 
-        byte[] storedBytes;
-        lock (_syncLock)
-        {
-            _stream.Position = checked((long)desc.PayloadOffset);
-            storedBytes = new byte[checked((int)desc.StoredByteLength)];
-            _stream.ReadExactly(storedBytes);
-        }
+        int uncompressedLen = checked((int)desc.UncompressedByteLength);
+        long totalBytes = uncompressedLen;
+        byteProgress?.Invoke(0L, totalBytes);
 
         byte[] result;
+        uint actualCrc;
         if (desc.IsCompressed)
         {
-            result = new byte[checked((int)desc.UncompressedByteLength)];
+            byte[] storedBytes;
+            lock (_syncLock)
+            {
+                _stream.Position = checked((long)desc.PayloadOffset);
+                storedBytes = new byte[checked((int)desc.StoredByteLength)];
+                _stream.ReadExactly(storedBytes);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            result = new byte[uncompressedLen];
+            uint runningCrc = Crc32Helper.Initial;
+            int offset = 0;
+            const int ChunkBytes = 512 * 1024;
+            long reportStep = byteProgress is not null ? Math.Max(256 * 1024L, totalBytes / 64) : long.MaxValue;
+            long nextReportAt = reportStep;
+
             using var compressedStream = new MemoryStream(storedBytes, writable: false);
             using var deflate = new DeflateStream(compressedStream, CompressionMode.Decompress);
-            deflate.ReadExactly(result);
+            while (offset < uncompressedLen)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int toRead = Math.Min(ChunkBytes, uncompressedLen - offset);
+                int read = deflate.Read(result, offset, toRead);
+                if (read == 0)
+                {
+                    throw new EndOfStreamException(
+                        $"Unexpected end of compressed stream reading '{normalized}' from .hep archive ({offset}/{uncompressedLen} bytes).");
+                }
+
+                runningCrc = Crc32Helper.Update(runningCrc, result.AsSpan(offset, read));
+                offset += read;
+
+                if (byteProgress is not null && offset >= nextReportAt)
+                {
+                    byteProgress(offset, totalBytes);
+                    nextReportAt = offset + reportStep;
+                }
+            }
+
+            actualCrc = Crc32Helper.Finalize(runningCrc);
         }
         else
         {
-            result = storedBytes;
+            result = new byte[uncompressedLen];
+            uint runningCrc = Crc32Helper.Initial;
+            int offset = 0;
+            const int ChunkBytes = 512 * 1024;
+            long reportStep = byteProgress is not null ? Math.Max(256 * 1024L, totalBytes / 64) : long.MaxValue;
+            long nextReportAt = reportStep;
+
+            lock (_syncLock)
+            {
+                _stream.Position = checked((long)desc.PayloadOffset);
+                while (offset < uncompressedLen)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    int toRead = Math.Min(ChunkBytes, uncompressedLen - offset);
+                    int read = _stream.Read(result, offset, toRead);
+                    if (read == 0)
+                    {
+                        throw new EndOfStreamException(
+                            $"Unexpected end of stream reading '{normalized}' from .hep archive ({offset}/{uncompressedLen} bytes).");
+                    }
+
+                    runningCrc = Crc32Helper.Update(runningCrc, result.AsSpan(offset, read));
+                    offset += read;
+
+                    if (byteProgress is not null && offset >= nextReportAt)
+                    {
+                        byteProgress(offset, totalBytes);
+                        nextReportAt = offset + reportStep;
+                    }
+                }
+            }
+
+            actualCrc = Crc32Helper.Finalize(runningCrc);
         }
 
-        uint actualCrc = Crc32Helper.Compute(result);
         if (actualCrc != desc.Crc32)
         {
             throw new InvalidDataException(
                 $"CRC32 mismatch reading '{normalized}' from .hep archive (expected 0x{desc.Crc32:X8}, got 0x{actualCrc:X8}).");
         }
 
+        byteProgress?.Invoke(totalBytes, totalBytes);
         return result;
     }
 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using Hypera.Audio;
 using Hypera.Bytecode;
 using Hypera.Compiler;
@@ -29,7 +30,9 @@ public interface ISharpPluginHost
 public readonly record struct GameLoadProgress(
     int Percent,
     string Stage,
-    string? Detail = null);
+    string? Detail = null,
+    long? BytesRead = null,
+    long? TotalBytes = null);
 
 /// <summary>
 /// Read-only compiled game package bundle shareable across concurrent <see cref="HyperaGameHost"/> sessions
@@ -381,8 +384,33 @@ public sealed class HyperaGameHost : IDisposable
         IProgress<GameLoadProgress>? progress = opts.Progress;
         CancellationToken ct = opts.CancellationToken;
 
-        static void Report(IProgress<GameLoadProgress>? sink, int percent, string stage, string? detail = null) =>
-            sink?.Report(new GameLoadProgress(Math.Clamp(percent, 0, 100), stage, detail));
+        static void Report(
+            IProgress<GameLoadProgress>? sink,
+            int percent,
+            string stage,
+            string? detail = null,
+            long? bytesRead = null,
+            long? totalBytes = null) =>
+            sink?.Report(new GameLoadProgress(Math.Clamp(percent, 0, 100), stage, detail, bytesRead, totalBytes));
+
+        static string FormatByteDetail(string label, long read, long total)
+        {
+            if (total >= 1024 * 1024)
+            {
+                return string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{label} ({read / 1048576.0:0.0} / {total / 1048576.0:0.0} MB)");
+            }
+
+            if (total >= 1024)
+            {
+                return string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{label} ({read / 1024.0:0.0} / {total / 1024.0:0.0} KB)");
+            }
+
+            return string.Create(CultureInfo.InvariantCulture, $"{label} ({read:N0} / {total:N0} B)");
+        }
 
         ct.ThrowIfCancellationRequested();
 
@@ -397,7 +425,7 @@ public sealed class HyperaGameHost : IDisposable
 
         if (opts.SharedPackage is { } shared)
         {
-            Report(progress, 44, "Attaching shared game package...");
+            Report(progress, 88, "Attaching shared game package...");
             config = shared.Config;
             compilerOptions = opts.CompilerOptionsOverride ?? config.CompilerOptions;
             runtimeOptions = opts.RuntimeOptionsOverride ?? config.RuntimeOptions;
@@ -408,36 +436,65 @@ public sealed class HyperaGameHost : IDisposable
         }
         else
         {
+            // Empirical .hep load time budget (measured on ERAOCG2.hep, ~2.1s cold / ~1.8s warm):
+            //   0..2%:   Open .hep VFS & load configuration (~1-2%)
+            //   2..8%:   Load CSV / ERD / resource metadata (~6-8%)
+            //   8..36%:  Read & decompress game.heb bytes from .hep (~26-33%)
+            //   36..88%: Deserialize game.heb bytecode stream (~52-53%)
+            //   88..92%: Allocate lazy VariableStore / CharacterStore (~3-4%)
+            //   92..96%: Initialize engine, fonts & sprites (~2-5%)
+            //   96..100%: Apply game data, dynamic evaluator, save storage & start title (~2-4%)
+
             // 1. Load layered configuration: csv/_default.config -> emuera.config -> csv/_fixed.config + setting.json
-            Report(progress, 6, "Loading configuration...", "emuera.config & defaults");
+            Report(progress, 2, "Loading configuration...", "emuera.config & defaults");
             config = ConfigLoader.Default.Load(vfs);
             compilerOptions = opts.CompilerOptionsOverride ?? config.CompilerOptions;
             runtimeOptions = opts.RuntimeOptionsOverride ?? config.RuntimeOptions;
             ct.ThrowIfCancellationRequested();
 
             // 2. Load all CSV, ERD, ALS, VarExt, and resources metadata
-            Report(progress, 10, "Loading CSV & resource metadata...", "CSV / ERD / resources");
+            Report(progress, 3, "Loading CSV & resource metadata...", "CSV / ERD / resources");
             gameData = CsvGameDataLoader.Default.Load(vfs, compilerOptions);
+            Report(progress, 8, "Loaded CSV & resource metadata", "CSV / ERD / resources");
             ct.ThrowIfCancellationRequested();
 
             // 3. Resolve BytecodeModule: explicit preloaded -> embedded .heb in VFS -> strict ErbProjectCompiler
             if (preloadedModule is not null)
             {
-                Report(progress, 44, "Using preloaded bytecode...");
+                Report(progress, 88, "Using preloaded bytecode...");
                 module = preloadedModule;
                 loadedPrebuilt = true;
             }
             else if (opts.UsePrebuiltBytecode && HasPrebuiltBytecode(vfs))
             {
-                Report(progress, 15, "Loading precompiled bytecode...", "game.heb");
-                if (TryLoadPrebuiltBytecode(vfs, out BytecodeModule? embedded) && embedded is not null)
+                Report(progress, 8, "Reading package bytecode...", "game.heb");
+                if (TryLoadPrebuiltBytecode(
+                        vfs,
+                        out BytecodeModule? embedded,
+                        decompressProgress: progress is null
+                            ? null
+                            : (entryName, read, total) =>
+                            {
+                                double frac = total > 0 ? Math.Clamp((double)read / total, 0.0, 1.0) : 1.0;
+                                int pct = 8 + (int)Math.Round(28.0 * frac);
+                                Report(progress, pct, "Reading package bytecode...", FormatByteDetail(entryName, read, total), read, total);
+                            },
+                        deserializeProgress: progress is null
+                            ? null
+                            : (entryName, read, total) =>
+                            {
+                                double frac = total > 0 ? Math.Clamp((double)read / total, 0.0, 1.0) : 1.0;
+                                int pct = 36 + (int)Math.Round(52.0 * frac);
+                                Report(progress, pct, "Loading precompiled bytecode...", FormatByteDetail(entryName, read, total), read, total);
+                            },
+                        cancellationToken: ct) && embedded is not null)
                 {
                     module = embedded;
                     loadedPrebuilt = true;
                 }
                 else
                 {
-                    Report(progress, 15, "Compiling ERB scripts...");
+                    Report(progress, 10, "Compiling ERB scripts...");
                     CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, compilerOptions.IgnoreCase) with
                     {
                         IsDebugMode = opts.IsDebugMode,
@@ -449,7 +506,7 @@ public sealed class HyperaGameHost : IDisposable
             }
             else
             {
-                Report(progress, 15, "Compiling ERB scripts...");
+                Report(progress, 10, "Compiling ERB scripts...");
                 CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, compilerOptions.IgnoreCase) with
                 {
                     IsDebugMode = opts.IsDebugMode,
@@ -464,7 +521,7 @@ public sealed class HyperaGameHost : IDisposable
 
         // 4. Construct isolated stores & engine
         int totalStaticVars = module.StaticVariables.Length;
-        Report(progress, 46, "Allocating runtime variables...", totalStaticVars > 0 ? $"0 / {totalStaticVars:N0} slots" : null);
+        Report(progress, 88, "Allocating runtime variables...", totalStaticVars > 0 ? $"0 / {totalStaticVars:N0} slots" : null);
         var characters = new CharacterStore(module.CompilerOptions, gameData.ReplaceConfig);
         var variables = new VariableStore(
             module,
@@ -474,13 +531,13 @@ public sealed class HyperaGameHost : IDisposable
                 ? null
                 : (done, total) =>
                 {
-                    int pct = 46 + (int)Math.Round(34.0 * done / Math.Max(1, total));
+                    int pct = 88 + (int)Math.Round(4.0 * done / Math.Max(1, total));
                     Report(progress, pct, "Allocating runtime variables...", $"{done:N0} / {total:N0} slots");
                 },
             ct);
         ct.ThrowIfCancellationRequested();
 
-        Report(progress, 81, "Initializing engine, fonts & sprites...");
+        Report(progress, 92, "Initializing engine, fonts & sprites...");
         var engine = new EmueraEngine(
             module,
             vfs,
@@ -497,20 +554,20 @@ public sealed class HyperaGameHost : IDisposable
         ct.ThrowIfCancellationRequested();
 
         // 5. Populate CSV tables, VariableSize overrides, STR.CSV, _Replace.csv, Chara*.csv, ERD, VarExt, and #DIM initializers
-        Report(progress, 85, "Applying game data tables...");
+        Report(progress, 96, "Applying game data tables...");
         engine.ConfigureConfigValues(config.RawValues);
         engine.ApplyGameData(gameData);
         compilation?.ApplyStaticInitializers(variables);
         ct.ThrowIfCancellationRequested();
 
         // 6. Wire RuntimeDynamicCompiler (IDynamicEvaluator)
-        Report(progress, 88, "Preparing dynamic expression evaluator...");
+        Report(progress, 97, "Preparing dynamic expression evaluator...");
         var dynamicCompiler = new RuntimeDynamicCompiler(module, sharedSymbols ?? compilation?.Symbols);
         dynamicCompiler.AttachTo(engine);
         ct.ThrowIfCancellationRequested();
 
         // 7. Wire sandboxed IWritableUserStorage (pluggable host backend; never mutates read-only archives)
-        Report(progress, 96, "Configuring save storage...");
+        Report(progress, 98, "Configuring save storage...");
         IWritableUserStorage? writableStorage = opts.WritableStorage ?? opts.WritableSaveDirectory;
         if (writableStorage is null)
         {
@@ -537,7 +594,7 @@ public sealed class HyperaGameHost : IDisposable
         // 9. Optionally enter BEGIN TITLE lifecycle
         if (opts.AutoStartSystemFlow)
         {
-            Report(progress, 98, "Starting title sequence...");
+            Report(progress, 99, "Starting title sequence...");
             engine.StartSystemFlow(SystemPhaseKind.Title);
         }
 
@@ -575,25 +632,38 @@ public sealed class HyperaGameHost : IDisposable
         return vfs is HepArchiveVfs { HasPrebuiltBytecode: true };
     }
 
-    internal static bool TryLoadPrebuiltBytecode(IVirtualFileSystem vfs, out BytecodeModule? module)
+    internal static bool TryLoadPrebuiltBytecode(
+        IVirtualFileSystem vfs,
+        out BytecodeModule? module,
+        Action<string, long, long>? decompressProgress = null,
+        Action<string, long, long>? deserializeProgress = null,
+        CancellationToken cancellationToken = default)
     {
         module = null;
 
         if (vfs.FileExists(HepPackageWriter.DefaultPrebuiltBytecodePath))
         {
-            using Stream s = vfs.OpenRead(HepPackageWriter.DefaultPrebuiltBytecodePath);
-            module = BytecodeSerializer.Deserialize(s);
+            module = ReadAndDeserializeBytecodeEntry(
+                vfs,
+                HepPackageWriter.DefaultPrebuiltBytecodePath,
+                decompressProgress,
+                deserializeProgress,
+                cancellationToken);
             return true;
         }
 
         if (vfs.FileExists(LegacyEmbeddedBytecodePath))
         {
-            using Stream s = vfs.OpenRead(LegacyEmbeddedBytecodePath);
-            module = BytecodeSerializer.Deserialize(s);
+            module = ReadAndDeserializeBytecodeEntry(
+                vfs,
+                LegacyEmbeddedBytecodePath,
+                decompressProgress,
+                deserializeProgress,
+                cancellationToken);
             return true;
         }
 
-        if (TryLoadFromHepIfPrebuilt(vfs, out module))
+        if (TryLoadFromHepIfPrebuilt(vfs, out module, decompressProgress, deserializeProgress, cancellationToken))
         {
             return true;
         }
@@ -601,13 +671,76 @@ public sealed class HyperaGameHost : IDisposable
         return false;
     }
 
-    private static bool TryLoadFromHepIfPrebuilt(IVirtualFileSystem vfs, out BytecodeModule? module)
+    private static BytecodeModule ReadAndDeserializeBytecodeEntry(
+        IVirtualFileSystem vfs,
+        string entryPath,
+        Action<string, long, long>? decompressProgress,
+        Action<string, long, long>? deserializeProgress,
+        CancellationToken cancellationToken)
+    {
+        string displayName = Path.GetFileName(entryPath);
+        if (TryResolveHepArchiveForEntry(vfs, entryPath, out HepArchiveVfs? hepVfs) && hepVfs is not null)
+        {
+            byte[] raw = hepVfs.ReadAllBytes(
+                entryPath,
+                decompressProgress is null ? null : (read, total) => decompressProgress(displayName, read, total),
+                cancellationToken);
+            using var ms = new MemoryStream(raw, writable: false);
+            return BytecodeSerializer.Deserialize(
+                ms,
+                deserializeProgress is null ? null : (read, total) => deserializeProgress(displayName, read, total),
+                cancellationToken);
+        }
+
+        using Stream s = vfs.OpenRead(entryPath);
+        if (s.CanSeek)
+        {
+            decompressProgress?.Invoke(displayName, s.Length, s.Length);
+        }
+
+        return BytecodeSerializer.Deserialize(
+            s,
+            deserializeProgress is null ? null : (read, total) => deserializeProgress(displayName, read, total),
+            cancellationToken);
+    }
+
+    private static bool TryResolveHepArchiveForEntry(IVirtualFileSystem vfs, string entryPath, out HepArchiveVfs? hepVfs)
+    {
+        if (vfs is HepArchiveVfs hep && hep.FileExists(entryPath))
+        {
+            hepVfs = hep;
+            return true;
+        }
+
+        if (vfs is OverlayVirtualFileSystem overlay)
+        {
+            if (overlay.Upper.FileExists(entryPath))
+            {
+                return TryResolveHepArchiveForEntry(overlay.Upper, entryPath, out hepVfs);
+            }
+
+            if (overlay.Lower.FileExists(entryPath))
+            {
+                return TryResolveHepArchiveForEntry(overlay.Lower, entryPath, out hepVfs);
+            }
+        }
+
+        hepVfs = null;
+        return false;
+    }
+
+    private static bool TryLoadFromHepIfPrebuilt(
+        IVirtualFileSystem vfs,
+        out BytecodeModule? module,
+        Action<string, long, long>? decompressProgress = null,
+        Action<string, long, long>? deserializeProgress = null,
+        CancellationToken cancellationToken = default)
     {
         module = null;
         if (vfs is OverlayVirtualFileSystem overlay)
         {
-            return TryLoadFromHepIfPrebuilt(overlay.Upper, out module) ||
-                   TryLoadFromHepIfPrebuilt(overlay.Lower, out module);
+            return TryLoadFromHepIfPrebuilt(overlay.Upper, out module, decompressProgress, deserializeProgress, cancellationToken) ||
+                   TryLoadFromHepIfPrebuilt(overlay.Lower, out module, decompressProgress, deserializeProgress, cancellationToken);
         }
 
         if (vfs is HepArchiveVfs { HasPrebuiltBytecode: true })
@@ -616,8 +749,7 @@ public sealed class HyperaGameHost : IDisposable
                 .FirstOrDefault(static p => VfsPathNormalizer.GetExtension(p).Equals(".heb", StringComparison.OrdinalIgnoreCase));
             if (firstHeb is not null)
             {
-                using Stream s = vfs.OpenRead(firstHeb);
-                module = BytecodeSerializer.Deserialize(s);
+                module = ReadAndDeserializeBytecodeEntry(vfs, firstHeb, decompressProgress, deserializeProgress, cancellationToken);
                 return true;
             }
         }

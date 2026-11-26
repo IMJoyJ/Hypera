@@ -22,14 +22,20 @@ internal static class Crc32Helper
         return table;
     }
 
-    public static uint Compute(ReadOnlySpan<byte> data)
+    public const uint Initial = 0xFFFFFFFFu;
+
+    public static uint Update(uint runningCrc, ReadOnlySpan<byte> data)
     {
-        uint crc = 0xFFFFFFFFu;
+        uint crc = runningCrc;
         for (int i = 0; i < data.Length; i++)
         {
             crc = Table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
         }
 
-        return ~crc;
+        return crc;
     }
+
+    public static uint Finalize(uint runningCrc) => ~runningCrc;
+
+    public static uint Compute(ReadOnlySpan<byte> data) => Finalize(Update(Initial, data));
 }

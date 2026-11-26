@@ -615,13 +615,27 @@ public sealed class MainForm : Form
 
     private void UpdateLoadingProgress(GameLoadProgress report)
     {
+        bool stageChanged = !string.Equals(_loadingStageLabel.Text, report.Stage, StringComparison.Ordinal);
         _currentLoadPercent = Math.Max(_currentLoadPercent, Math.Clamp(report.Percent, 0, 100));
         _currentLoadDetail = report.Detail;
-        _loadingStageLabel.Text = report.Stage;
+        if (stageChanged)
+        {
+            _loadingStageLabel.Text = report.Stage;
+        }
+
         _loadingProgressBar.Value = _currentLoadPercent;
         _statusLabel.Text = $"Loading {_currentLoadPercent}%";
         RefreshLoadingDetailText();
-        UpdateLoadingOverlayLayout();
+
+        if (stageChanged ||
+            TextRenderer.MeasureText(
+                _loadingDetailLabel.Text,
+                _loadingDetailLabel.Font,
+                new Size(int.MaxValue, int.MaxValue),
+                TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine).Width > _loadingDetailLabel.Width)
+        {
+            UpdateLoadingOverlayLayout();
+        }
     }
 
     private void OnLoadingAnimTick(object? sender, EventArgs e)
