@@ -7,7 +7,6 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <AssemblyName>Hypera.Standalone</AssemblyName>
     <RootNamespace>Hypera.Standalone</RootNamespace>
-    <Version>0.1.0</Version>
     <Product>Hypera Standalone</Product>
     <Description>Standalone Windows desktop Emuera-compatible binary runner powered by Hypera.</Description>
   </PropertyGroup>

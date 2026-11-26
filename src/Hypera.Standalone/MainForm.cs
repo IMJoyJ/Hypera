@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
+using System.Reflection;
 using System.Windows.Forms;
 using Hypera.Configuration;
 using Hypera.Data;
@@ -784,7 +785,7 @@ public sealed class MainForm : Form
     {
         Text = session.GetEffectiveWindowTitle();
 
-        // Custom icon (e.g. resources/cow.webp in eraOCG2)
+        // Custom window icon (e.g. resources/icon.webp)
         Icon? nextIcon = session.TryLoadWindowIcon();
         if (nextIcon is not null)
         {
@@ -1501,12 +1502,27 @@ public sealed class MainForm : Form
     {
         MessageBox.Show(
             this,
-            "Hypera Standalone 0.1.0\n\n" +
+            $"Hypera Standalone {GetVersionString()}\n\n" +
             "Direct binary Emuera-compatible runner built on .NET 10, 16-byte Register VM, and SkiaSharp.\n\n" +
             "Supports HYPRBNDL single-file bundles, .hep packages, .heb bytecode, .zip archives, and raw game folders.",
             "About Hypera Standalone",
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
+    }
+
+    private static string GetVersionString()
+    {
+        string? info = typeof(MainForm).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(info))
+        {
+            int plusIdx = info.IndexOf('+');
+            return plusIdx >= 0 ? info[..plusIdx] : info;
+        }
+
+        Version? version = typeof(MainForm).Assembly.GetName().Version;
+        return version is not null ? $"{version.Major}.{version.Minor}.{version.Build}" : "1.0.0";
     }
 
     private void OnFormDragEnter(object? sender, DragEventArgs e)

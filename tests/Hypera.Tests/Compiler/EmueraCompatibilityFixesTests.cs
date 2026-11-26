@@ -666,7 +666,7 @@ public sealed class EmueraCompatibilityFixesTests
     [Fact]
     public void StringAssignment_TrimsOuterAsciiSpacesAndTabs_WhilePreservingFullWidthAndAtFormSpaces()
     {
-        // Reproduces eraOCG2 `31.情報更新(Loadup) （新）.ERB:268`:
+        // Reproduces trailing ASCII whitespace in string assignment:
         // `非ターンプレイヤー = %対面者% ` (trailing space after `%対面者%`) followed by
         // `GETVAR(@"%非ターンプレイヤー%_戦場:0")`. Original Emuera trims leading & trailing
         // ASCII spaces/tabs in `STR = ...` (SP_SET_ArgumentBuilder: SkipHalfSpace + trim=true),

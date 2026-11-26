@@ -1,3 +1,4 @@
+using System.Reflection;
 using Hypera.Bytecode;
 using Hypera.Diagnostics;
 using Hypera.Runtime;
@@ -24,7 +25,7 @@ public static class Program
 
         if (args[0] is "-v" or "--version" or "version")
         {
-            Console.WriteLine("hypera 0.1.0");
+            Console.WriteLine($"hypera {GetVersionString()}");
             return 0;
         }
 
@@ -312,6 +313,21 @@ public static class Program
         Console.Error.WriteLine($"Unknown command: '{command}'.");
         PrintUsage();
         return 2;
+    }
+
+    private static string GetVersionString()
+    {
+        string? info = typeof(Program).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(info))
+        {
+            int plusIdx = info.IndexOf('+');
+            return plusIdx >= 0 ? info[..plusIdx] : info;
+        }
+
+        Version? version = typeof(Program).Assembly.GetName().Version;
+        return version is not null ? $"{version.Major}.{version.Minor}.{version.Build}" : "1.0.0";
     }
 
     private static void PrintUsage()

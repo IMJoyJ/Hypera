@@ -289,7 +289,7 @@ public sealed class StandaloneHostTests
     public void FontRegistry_ExtractsTrueTypeLegacyFamilyNameWhenSubfamilyIsCustom()
     {
         // Build a minimal valid TrueType sfnt with a 'name' table where nameID=1 is "xonFont"
-        // (matching eraOCG2's ぉんFont.ttf whose DirectWrite FamilyName becomes "xonFont xonng_angreed328").
+        // (matching custom TTF fonts whose DirectWrite FamilyName combines legacy family + custom subfamily).
         byte[] ttfBytes = BuildMinimalTtfWithNameTable(
             (platformId: 3, encodingId: 1, langId: 0x0409, nameId: 1, text: "xonFont"),
             (platformId: 3, encodingId: 1, langId: 0x0409, nameId: 2, text: "xonng_angreed328"),
@@ -833,7 +833,7 @@ public sealed class StandaloneHostTests
                 Path.Combine(workDir, "emuera.config"),
                 "履歴ログの行数:100\n");
 
-            // Mirrors eraOCG2 @CARD_TEXT_CACHE: once MaxLog (100) is exceeded, LINECOUNT must still advance
+            // Mirrors large cache scripts: once MaxLog (100) is exceeded, LINECOUNT must still advance
             // monotonically so CLEARLINE deletes every printed card line, and GETDISPLAYLINE(100..100-N)
             // reads every card's lines cleanly across repeated print+clear iterations.
             File.WriteAllText(
@@ -983,7 +983,7 @@ public sealed class StandaloneHostTests
                 Path.Combine(workDir, "ERB", "Main.erb"),
                 """
                 @SYSTEM_TITLE
-                ; Line 0: eraOCG2 card list pattern (multiple PRINTFORM calls + SETCOLOR -> single full-line button 0)
+                ; Line 0: Multi-part colored list pattern (multiple PRINTFORM calls + SETCOLOR -> single full-line button 0)
                 PRINTFORM %"山札",6,RIGHT%
                 PRINTFORM [{0,4}] 
                 SETCOLOR 0xFFCC66
@@ -992,7 +992,7 @@ public sealed class StandaloneHostTests
                 PRINTFORM  / (★ 2) / (攻:   500/守:     0)
                 RESETCOLOR
                 PRINTL
-                ; Line 1: eraOCG2 abbreviated mode (PRINTFORM run flushed before HTML_PRINT ...,1 explicit button)
+                ; Line 1: Abbreviated mode (PRINTFORM run flushed before HTML_PRINT ...,1 explicit button)
                 PRINTFORM %"山札",6,RIGHT%
                 PRINTFORM [{5,4}] 
                 HTML_PRINT "<button value='5' title='CardTooltip'>Live☆Twin リィラ</button>", 1

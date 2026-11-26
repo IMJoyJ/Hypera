@@ -436,7 +436,7 @@ public sealed class HyperaGameHost : IDisposable
         }
         else
         {
-            // Empirical .hep load time budget (measured on ERAOCG2.hep, ~2.1s cold / ~1.8s warm):
+            // Empirical .hep load time budget (measured on a large precompiled .hep package, ~2.1s cold / ~1.8s warm):
             //   0..2%:   Open .hep VFS & load configuration (~1-2%)
             //   2..8%:   Load CSV / ERD / resource metadata (~6-8%)
             //   8..36%:  Read & decompress game.heb bytes from .hep (~26-33%)

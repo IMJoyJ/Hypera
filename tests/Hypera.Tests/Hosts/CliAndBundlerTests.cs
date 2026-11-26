@@ -40,6 +40,10 @@ public sealed class CliAndBundlerTests
             string hebPath = Path.Combine(workDir, "game.heb");
             string hepPath = Path.Combine(workDir, "game.hep");
 
+            // 0. hypera --version prints dynamic assembly version (1.0.0+)
+            string versionOut = RunProcess("dotnet", [hyperaDll, "--version"], workDir).Trim();
+            Assert.StartsWith("hypera 1.", versionOut, StringComparison.Ordinal);
+
             // 1. hypera compile <dir> -o <out.heb>
             RunProcess("dotnet", [hyperaDll, "compile", gameDir, "-o", hebPath], workDir);
             Assert.True(File.Exists(hebPath));
