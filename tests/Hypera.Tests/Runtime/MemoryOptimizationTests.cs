@@ -2,8 +2,10 @@ using Hypera.Bytecode;
 using Hypera.Compiler;
 using Hypera.Data;
 using Hypera.Persistence;
+using Hypera.Rendering;
 using Hypera.Runtime;
 using Hypera.VirtualFs;
+using SkiaSharp;
 using Xunit;
 
 namespace Hypera.Tests.Runtime;
@@ -273,6 +275,109 @@ public sealed class MemoryOptimizationTests
 
             // COLD_UNHYDRATED_FN still untouched in shared symbol table
             Assert.DoesNotContain(shared.SharedSymbols.AllFunctions, static f => f.Name.Equals("COLD_UNHYDRATED_FN", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SpriteRegistry_LazyDecodingAndLruEviction_RespectsByteBudgetAndReDecodesCleanly()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_p2_sprites_{Guid.NewGuid():N}");
+        string resDir = Path.Combine(workDir, "resources");
+        Directory.CreateDirectory(resDir);
+
+        try
+        {
+            static byte[] CreateSolidPng(int width, int height, SKColor color)
+            {
+                using var bmp = new SKBitmap(new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul));
+                bmp.Erase(color);
+                return ImageCodecDecoder.EncodeToPng(bmp);
+            }
+
+            // 64x64 BGRA8888 = 16,384 bytes per decoded bitmap
+            File.WriteAllBytes(Path.Combine(resDir, "red.png"), CreateSolidPng(64, 64, new SKColor(0xFF, 0x00, 0x00, 0xFF)));
+            File.WriteAllBytes(Path.Combine(resDir, "green.png"), CreateSolidPng(64, 64, new SKColor(0x00, 0xFF, 0x00, 0xFF)));
+            File.WriteAllBytes(Path.Combine(resDir, "blue.png"), CreateSolidPng(64, 64, new SKColor(0x00, 0x00, 0xFF, 0xFF)));
+
+            // Multi-frame animated WebP (2 frames, 16x16 each = 1,024 bytes/frame)
+            using (var f0 = new SKBitmap(new SKImageInfo(16, 16, SKColorType.Bgra8888, SKAlphaType.Premul)))
+            using (var f1 = new SKBitmap(new SKImageInfo(16, 16, SKColorType.Bgra8888, SKAlphaType.Premul)))
+            {
+                f0.Erase(new SKColor(0xFF, 0xFF, 0x00, 0xFF));
+                f1.Erase(new SKColor(0x00, 0xFF, 0xFF, 0xFF));
+                byte[] webp = ImageCodecDecoder.EncodeAnimatedWebp(
+                    [new DecodedImageFrame(f0, 50), new DecodedImageFrame(f1, 80)],
+                    quality: 100);
+                File.WriteAllBytes(Path.Combine(resDir, "anim.webp"), webp);
+            }
+
+            // Mix of explicit-rect static PNG, implicit-size static PNG, and multi-frame WebP
+            File.WriteAllText(
+                Path.Combine(resDir, "sprites.csv"),
+                """
+                RED_EXPLICIT,red.png,0,0,64,64
+                GREEN_IMPLICIT,green.png
+                BLUE_EXPLICIT,blue.png,0,0,64,64
+                ANIM_LAZY,anim.webp
+                """);
+
+            using var vfs = new PhysicalDirectoryVfs(workDir);
+            using var sprites = new SpriteRegistry();
+            int loaded = sprites.LoadResourcesFromVfs(vfs);
+
+            Assert.Equal(4, loaded);
+            Assert.True(sprites.Exists("RED_EXPLICIT"));
+            Assert.True(sprites.Exists("GREEN_IMPLICIT"));
+            Assert.True(sprites.Exists("BLUE_EXPLICIT"));
+            Assert.True(sprites.Exists("ANIM_LAZY"));
+            Assert.True(sprites.HasAnimatedSprites);
+            Assert.Equal(64, sprites.GetWidth("RED_EXPLICIT"));
+            Assert.Equal(64, sprites.GetHeight("GREEN_IMPLICIT"));
+            Assert.Equal(16, sprites.GetWidth("ANIM_LAZY"));
+
+            // Zero pixel buffers decoded during CSV load!
+            Assert.Equal(0, sprites.DecodedFileCount);
+            Assert.Equal(0L, sprites.CurrentDecodedCacheBytes);
+
+            // Cap LRU cache to 36 KB (holds at most two 64x64 bitmaps = 32,768 bytes)
+            sprites.MaxDecodedCacheBytes = 36_000;
+
+            // 1. Decode red + green -> 2 files resident (32,768 bytes)
+            Assert.Equal(0xFFFF0000u, sprites.GetColor("RED_EXPLICIT", 10, 10));
+            Assert.Equal(1, sprites.DecodedFileCount);
+            Assert.Equal(16_384L, sprites.CurrentDecodedCacheBytes);
+
+            Assert.Equal(0xFF00FF00u, sprites.GetColor("GREEN_IMPLICIT", 10, 10));
+            Assert.Equal(2, sprites.DecodedFileCount);
+            Assert.Equal(32_768L, sprites.CurrentDecodedCacheBytes);
+
+            // 2. Touch red again so green becomes LRU; then decode blue -> evicts green, stays <= 36 KB
+            Assert.Equal(0xFFFF0000u, sprites.GetColor("RED_EXPLICIT", 5, 5));
+            Assert.Equal(0xFF0000FFu, sprites.GetColor("BLUE_EXPLICIT", 10, 10));
+            Assert.Equal(2, sprites.DecodedFileCount);
+            Assert.Equal(32_768L, sprites.CurrentDecodedCacheBytes);
+
+            // 3. Re-request evicted green -> re-decodes cleanly and evicts red (now LRU)
+            Assert.Equal(0xFF00FF00u, sprites.GetColor("GREEN_IMPLICIT", 20, 20));
+            Assert.Equal(2, sprites.DecodedFileCount);
+            Assert.True(sprites.CurrentDecodedCacheBytes <= 36_000L);
+
+            // 4. Lazy multi-frame animated WebP decodes on demand with accurate frame timing
+            Assert.Equal(0xFFFFFF00u, sprites.GetColor("ANIM_LAZY", 4, 4, elapsedMs: 10));
+            Assert.Equal(0xFF00FFFFu, sprites.GetColor("ANIM_LAZY", 4, 4, elapsedMs: 65));
+            Assert.True(sprites.CurrentDecodedCacheBytes <= 36_000L);
+
+            // 5. Explicit trim to 0 evicts everything cleanly; subsequent access still re-decodes!
+            int evicted = sprites.TrimDecodedCache(0);
+            Assert.True(evicted >= 2);
+            Assert.Equal(0, sprites.DecodedFileCount);
+            Assert.Equal(0L, sprites.CurrentDecodedCacheBytes);
+            Assert.Equal(0xFFFF0000u, sprites.GetColor("RED_EXPLICIT", 1, 1));
+            Assert.Equal(1, sprites.DecodedFileCount);
         }
         finally
         {

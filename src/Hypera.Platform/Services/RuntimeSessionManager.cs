@@ -535,6 +535,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     AutoStartSystemFlow = true,
                     SharpPluginHost = allowSharpPlugins ? null : DisabledSharpPluginHost.Instance,
                     SharedPackage = sharedPackage,
+                    MaxSpriteCacheBytes = 16L * 1024 * 1024,
                 };
 
                 host = HyperaGameHost.LoadFromVfs(
@@ -606,38 +607,6 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
         return lazy.Value;
-    }
-
-    private static bool TryDeserializeEmbeddedBytecode(HepArchiveVfs vfs, out BytecodeModule? module)
-    {
-        if (vfs.FileExists(HepPackageWriter.DefaultPrebuiltBytecodePath))
-        {
-            using Stream s = vfs.OpenRead(HepPackageWriter.DefaultPrebuiltBytecodePath);
-            module = BytecodeSerializer.Deserialize(s);
-            return true;
-        }
-
-        if (vfs.FileExists(HyperaGameHost.LegacyEmbeddedBytecodePath))
-        {
-            using Stream s = vfs.OpenRead(HyperaGameHost.LegacyEmbeddedBytecodePath);
-            module = BytecodeSerializer.Deserialize(s);
-            return true;
-        }
-
-        if (vfs.HasPrebuiltBytecode)
-        {
-            string? firstHeb = vfs.EnumerateFiles(recursive: true)
-                .FirstOrDefault(static p => VfsPathNormalizer.GetExtension(p).Equals(".heb", StringComparison.OrdinalIgnoreCase));
-            if (firstHeb is not null)
-            {
-                using Stream s = vfs.OpenRead(firstHeb);
-                module = BytecodeSerializer.Deserialize(s);
-                return true;
-            }
-        }
-
-        module = null;
-        return false;
     }
 
     private async Task<bool> DetermineAllowSharpPluginsAsync(Guid submissionId, CancellationToken cancellationToken)

@@ -130,6 +130,12 @@ public sealed class HyperaGameLoadOptions
     /// so each session only allocates its own mutable <see cref="VariableStore"/> and <see cref="CharacterStore"/>.
     /// </summary>
     public SharedGamePackage? SharedPackage { get; init; }
+
+    /// <summary>
+    /// Optional decoded pixel-buffer byte budget for <see cref="SpriteRegistry.MaxDecodedCacheBytes"/>
+    /// (defaults to <see cref="SpriteRegistry.DefaultMaxDecodedCacheBytes"/>, 128 MB).
+    /// </summary>
+    public long? MaxSpriteCacheBytes { get; init; }
 }
 
 /// <summary>
@@ -483,6 +489,11 @@ public sealed class HyperaGameHost : IDisposable
             characters,
             opts.AudioBackend,
             opts.DisplaySink);
+        if (opts.MaxSpriteCacheBytes.HasValue)
+        {
+            engine.Sprites.MaxDecodedCacheBytes = opts.MaxSpriteCacheBytes.Value;
+        }
+
         ct.ThrowIfCancellationRequested();
 
         // 5. Populate CSV tables, VariableSize overrides, STR.CSV, _Replace.csv, Chara*.csv, ERD, VarExt, and #DIM initializers

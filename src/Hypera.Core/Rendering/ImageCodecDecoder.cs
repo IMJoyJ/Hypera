@@ -14,12 +14,79 @@ public readonly record struct AnimatedWebpFrameOptions(
     bool DisposeToBackground = false);
 
 /// <summary>
+/// Lightweight decoded image header metadata extracted via <see cref="SKCodec"/> without allocating pixel buffers.
+/// </summary>
+public readonly record struct ImageHeaderInfo(
+    int Width,
+    int Height,
+    int FrameCount,
+    int[] FrameDurationsMs);
+
+/// <summary>
 /// Cross-platform static and multi-frame animated image codec built on <see cref="SKCodec"/>.
 /// Supports PNG, BMP, JPG, GIF, static WebP, and multi-frame animated WebP with proper
 /// <see cref="SKCodecFrameInfo.RequiredFrame"/> blending and disposal reconstruction.
 /// </summary>
 public static class ImageCodecDecoder
 {
+    public static bool TryPeekHeader(Stream imageStream, out ImageHeaderInfo header)
+    {
+        ArgumentNullException.ThrowIfNull(imageStream);
+        header = default;
+
+        Stream seekable = imageStream;
+        MemoryStream? ownedCopy = null;
+        if (!imageStream.CanSeek)
+        {
+            ownedCopy = new MemoryStream();
+            imageStream.CopyTo(ownedCopy);
+            ownedCopy.Position = 0;
+            seekable = ownedCopy;
+        }
+        else
+        {
+            seekable.Position = 0;
+        }
+
+        try
+        {
+            using var managedStream = new SKManagedStream(seekable, disposeManagedStream: false);
+            using SKCodec? codec = SKCodec.Create(managedStream);
+            if (codec is null)
+            {
+                return false;
+            }
+
+            int width = codec.Info.Width;
+            int height = codec.Info.Height;
+            if (width <= 0 || height <= 0)
+            {
+                return false;
+            }
+
+            int rawFrameCount = codec.FrameCount;
+            if (rawFrameCount <= 1)
+            {
+                header = new ImageHeaderInfo(width, height, 1, []);
+                return true;
+            }
+
+            SKCodecFrameInfo[] frameInfos = codec.FrameInfo;
+            int[] durations = new int[rawFrameCount];
+            for (int i = 0; i < rawFrameCount; i++)
+            {
+                int rawDuration = i < frameInfos.Length ? frameInfos[i].Duration : 100;
+                durations[i] = rawDuration > 0 ? rawDuration : 100;
+            }
+
+            header = new ImageHeaderInfo(width, height, rawFrameCount, durations);
+            return true;
+        }
+        finally
+        {
+            ownedCopy?.Dispose();
+        }
+    }
     public static IReadOnlyList<DecodedImageFrame> DecodeFrames(ReadOnlySpan<byte> encodedBytes)
     {
         if (encodedBytes.IsEmpty)

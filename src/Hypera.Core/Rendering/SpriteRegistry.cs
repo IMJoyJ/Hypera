@@ -18,7 +18,9 @@ public sealed record SpriteFrameSpec(
     SKRectI SourceRect,
     int PosX,
     int PosY,
-    int DelayMs);
+    int DelayMs,
+    string? ImageFilePath = null,
+    int ImageFrameIndex = 0);
 
 public sealed class SpriteDefinition
 {
@@ -62,16 +64,103 @@ public sealed class SpriteDefinition
 /// <summary>
 /// Instance-scoped sprite registry loading <c>resources/*.csv</c> static (<c>SpriteF</c>) &amp; animated (<c>SpriteAnime</c>) definitions
 /// (including multi-frame animated WebP/GIF auto-expansion) and script-created sprites (<c>SPRITECREATE</c> / <c>SPRITEANIMECREATE</c>).
+/// File-backed sprites are decoded lazily on first <see cref="TryResolveFrame"/> and bounded by an LRU byte-budget cache.
 /// </summary>
 public sealed class SpriteRegistry : IDisposable
 {
+    public const long DefaultMaxDecodedCacheBytes = 128L * 1024 * 1024;
+
+    private sealed class DecodedCacheEntry
+    {
+        public required string Path { get; init; }
+        public required IReadOnlyList<DecodedImageFrame> Frames { get; init; }
+        public required long ByteSize { get; init; }
+        public required LinkedListNode<string> LruNode { get; init; }
+    }
+
+    private readonly object _cacheSync = new();
     private readonly Dictionary<string, SpriteDefinition> _sprites = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, IReadOnlyList<DecodedImageFrame>> _decodedFiles = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DecodedCacheEntry> _decodedFileCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly LinkedList<string> _lruOrder = new();
+    private readonly Dictionary<string, ImageHeaderInfo> _headerCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, IReadOnlyList<DecodedImageFrame>> _pinnedMemoryFrames = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, IVirtualFileSystem> _fileVfsOverrides = new(StringComparer.OrdinalIgnoreCase);
+    private IVirtualFileSystem? _primaryVfs;
+    private long _maxDecodedCacheBytes = DefaultMaxDecodedCacheBytes;
+    private long _currentDecodedBytes;
     private int _animatedSpriteCount;
     private bool _disposed;
 
     public int Count => _sprites.Count;
     public bool HasAnimatedSprites => _animatedSpriteCount > 0;
+
+    /// <summary>
+    /// Maximum decoded native pixel-buffer bytes kept in the lazy file-backed LRU cache.
+    /// Setting a lower value immediately evicts least-recently-used entries down to the new budget.
+    /// </summary>
+    public long MaxDecodedCacheBytes
+    {
+        get
+        {
+            lock (_cacheSync)
+            {
+                return _maxDecodedCacheBytes;
+            }
+        }
+        set
+        {
+            lock (_cacheSync)
+            {
+                _maxDecodedCacheBytes = Math.Max(0L, value);
+                if (!_disposed)
+                {
+                    TrimDecodedCacheLocked(protectedKey: null, _maxDecodedCacheBytes);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Current total decoded pixel bytes resident in the file-backed sprite LRU cache.
+    /// </summary>
+    public long CurrentDecodedCacheBytes
+    {
+        get
+        {
+            lock (_cacheSync)
+            {
+                return _currentDecodedBytes;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Number of decoded image files currently resident in the file-backed sprite LRU cache.
+    /// </summary>
+    public int DecodedFileCount
+    {
+        get
+        {
+            lock (_cacheSync)
+            {
+                return _decodedFileCache.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Evicts least-recently-used decoded file-backed bitmaps until resident bytes are at or below
+    /// <paramref name="maxBytes"/> (or <see cref="MaxDecodedCacheBytes"/> when null).
+    /// </summary>
+    public int TrimDecodedCache(long? maxBytes = null)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        lock (_cacheSync)
+        {
+            long budget = maxBytes.HasValue ? Math.Max(0L, maxBytes.Value) : _maxDecodedCacheBytes;
+            return TrimDecodedCacheLocked(protectedKey: null, budget);
+        }
+    }
 
     private void SetSpriteInternal(string key, SpriteDefinition def)
     {
@@ -176,43 +265,63 @@ public sealed class SpriteRegistry : IDisposable
                 continue;
             }
 
-            // Static sprite or frame appended to an existing ANIME sprite
-            IReadOnlyList<DecodedImageFrame>? decoded = LoadOrGetDecodedImage(vfs, baseDirectory, second);
-            if (decoded is null || decoded.Count == 0)
+            // Static sprite or frame appended to an existing ANIME sprite (lazy decode — zero pixel buffers allocated here)
+            string? resolvedPath = ResolveResourceImagePath(vfs, baseDirectory, second);
+            if (resolvedPath is null)
             {
                 continue;
             }
 
-            SKBitmap firstBmp = decoded[0].Bitmap;
+            BindFileSource(resolvedPath, vfs);
+
             int sx = tokens.Length >= 3 && TryParseInt(tokens[2], out int px) ? px : 0;
             int sy = tokens.Length >= 4 && TryParseInt(tokens[3], out int py) ? py : 0;
-            int sw = tokens.Length >= 5 && TryParseInt(tokens[4], out int psw) && psw > 0 ? psw : firstBmp.Width - sx;
-            int sh = tokens.Length >= 6 && TryParseInt(tokens[5], out int psh) && psh > 0 ? psh : firstBmp.Height - sy;
+            int psw = 0;
+            int psh = 0;
+            bool hasExplicitSw = tokens.Length >= 5 && TryParseInt(tokens[4], out psw) && psw > 0;
+            bool hasExplicitSh = tokens.Length >= 6 && TryParseInt(tokens[5], out psh) && psh > 0;
             int posX = tokens.Length >= 7 && TryParseInt(tokens[6], out int ox) ? ox : 0;
             int posY = tokens.Length >= 8 && TryParseInt(tokens[7], out int oy) ? oy : 0;
             int delay = tokens.Length >= 9 && TryParseInt(tokens[8], out int d) && d > 0 ? d : 100;
 
+            bool needsHeader = !hasExplicitSw || !hasExplicitSh || IsPotentiallyAnimatedExtension(resolvedPath);
+            ImageHeaderInfo header = default;
+            if (needsHeader && !TryPeekOrGetHeader(vfs, resolvedPath, out header))
+            {
+                continue;
+            }
+
+            int sw = hasExplicitSw ? psw : header.Width - sx;
+            int sh = hasExplicitSh ? psh : header.Height - sy;
             var srcRect = SKRectI.Create(sx, sy, Math.Max(0, sw), Math.Max(0, sh));
 
             if (_sprites.TryGetValue(name, out SpriteDefinition? existing) && existing.IsAnimated)
             {
-                existing.AddFrame(new SpriteFrameSpec(firstBmp, null, srcRect, posX, posY, delay));
+                existing.AddFrame(new SpriteFrameSpec(null, null, srcRect, posX, posY, delay, resolvedPath, 0));
                 continue;
             }
 
-            if (decoded.Count > 1)
+            if (needsHeader && header.FrameCount > 1)
             {
-                // Multi-frame animated WebP / GIF automatically registers all decoded frames & durations!
+                // Multi-frame animated WebP / GIF automatically registers all frames & durations without decoding pixels upfront!
                 var animDef = new SpriteDefinition(name, srcRect.Width, srcRect.Height, posX, posY, isAnimated: true, isDynamic: false);
-                foreach (DecodedImageFrame f in decoded)
+                int clampedW = Math.Min(srcRect.Width, Math.Max(0, header.Width - sx));
+                int clampedH = Math.Min(srcRect.Height, Math.Max(0, header.Height - sy));
+                SKRectI frameRect = SKRectI.Create(sx, sy, clampedW, clampedH);
+                for (int fi = 0; fi < header.FrameCount; fi++)
                 {
+                    int durationMs = fi < header.FrameDurationsMs.Length && header.FrameDurationsMs[fi] > 0
+                        ? header.FrameDurationsMs[fi]
+                        : 100;
                     animDef.AddFrame(new SpriteFrameSpec(
-                        f.Bitmap,
                         null,
-                        SKRectI.Create(sx, sy, Math.Min(srcRect.Width, f.Bitmap.Width - sx), Math.Min(srcRect.Height, f.Bitmap.Height - sy)),
+                        null,
+                        frameRect,
                         posX,
                         posY,
-                        f.DurationMs > 0 ? f.DurationMs : 100));
+                        durationMs,
+                        resolvedPath,
+                        fi));
                 }
 
                 SetSpriteInternal(name, animDef);
@@ -221,7 +330,7 @@ public sealed class SpriteRegistry : IDisposable
             else
             {
                 var def = new SpriteDefinition(name, srcRect.Width, srcRect.Height, posX, posY, isAnimated: false, isDynamic: false);
-                def.AddFrame(new SpriteFrameSpec(firstBmp, null, srcRect, posX, posY, 0));
+                def.AddFrame(new SpriteFrameSpec(null, null, srcRect, posX, posY, 0, resolvedPath, 0));
                 SetSpriteInternal(name, def);
                 count++;
             }
@@ -309,7 +418,18 @@ public sealed class SpriteRegistry : IDisposable
         }
 
         string key = name.Trim();
-        _decodedFiles[$"__mem__/{key}"] = frames;
+        string memKey = $"__mem__/{key}";
+        lock (_cacheSync)
+        {
+            if (_pinnedMemoryFrames.TryGetValue(memKey, out IReadOnlyList<DecodedImageFrame>? previous) &&
+                !ReferenceEquals(previous, frames))
+            {
+                DisposeFrames(previous);
+            }
+
+            _pinnedMemoryFrames[memKey] = frames;
+        }
+
         SKBitmap first = frames[0].Bitmap;
         var def = new SpriteDefinition(key, first.Width, first.Height, posX, posY, isAnimated: frames.Count > 1, isDynamic: true);
         foreach (DecodedImageFrame frame in frames)
@@ -421,8 +541,19 @@ public sealed class SpriteRegistry : IDisposable
 
         SpriteFrameSpec spec = SelectFrame(def, elapsedMs);
         SKBitmap? bmp = spec.StaticBitmap;
-        if (bmp is null && spec.GraphicsId.HasValue && graphics is not null &&
-            graphics.TryGetSurface(spec.GraphicsId.Value, out GraphicsSurface surface))
+        if (bmp is null && !string.IsNullOrEmpty(spec.ImageFilePath))
+        {
+            IReadOnlyList<DecodedImageFrame>? frames = GetOrDecodeFileFrames(spec.ImageFilePath);
+            if (frames is not null && frames.Count > 0)
+            {
+                int idx = (uint)spec.ImageFrameIndex < (uint)frames.Count
+                    ? spec.ImageFrameIndex
+                    : frames.Count - 1;
+                bmp = frames[idx].Bitmap;
+            }
+        }
+        else if (bmp is null && spec.GraphicsId.HasValue && graphics is not null &&
+                 graphics.TryGetSurface(spec.GraphicsId.Value, out GraphicsSurface surface))
         {
             bmp = surface.Bitmap;
         }
@@ -432,13 +563,21 @@ public sealed class SpriteRegistry : IDisposable
             return false;
         }
 
+        SKRectI rect = spec.SourceRect;
+        if (rect.Right > bmp.Width || rect.Bottom > bmp.Height)
+        {
+            int clampedW = Math.Max(0, Math.Min(rect.Width, bmp.Width - rect.Left));
+            int clampedH = Math.Max(0, Math.Min(rect.Height, bmp.Height - rect.Top));
+            rect = SKRectI.Create(rect.Left, rect.Top, clampedW, clampedH);
+        }
+
         resolved = new SpriteResolvedFrame(
             bmp,
-            spec.SourceRect,
+            rect,
             def.IsAnimated ? spec.PosX : def.PosX,
             def.IsAnimated ? spec.PosY : def.PosY,
-            def.Width > 0 ? def.Width : spec.SourceRect.Width,
-            def.Height > 0 ? def.Height : spec.SourceRect.Height);
+            def.Width > 0 ? def.Width : rect.Width,
+            def.Height > 0 ? def.Height : rect.Height);
         return true;
     }
 
@@ -499,7 +638,7 @@ public sealed class SpriteRegistry : IDisposable
         return def.Frames[^1];
     }
 
-    private IReadOnlyList<DecodedImageFrame>? LoadOrGetDecodedImage(
+    private static string? ResolveResourceImagePath(
         IVirtualFileSystem vfs,
         string baseDirectory,
         string imageFileName)
@@ -508,29 +647,182 @@ public sealed class SpriteRegistry : IDisposable
             ? VfsPathNormalizer.Normalize(imageFileName)
             : VfsPathNormalizer.Combine(baseDirectory, imageFileName);
 
-        if (!vfs.FileExists(candidate))
+        if (vfs.FileExists(candidate))
         {
-            candidate = GraphicsManager.ResolveImagePath(vfs, imageFileName);
-            if (string.IsNullOrEmpty(candidate))
+            return candidate;
+        }
+
+        candidate = GraphicsManager.ResolveImagePath(vfs, imageFileName);
+        return string.IsNullOrEmpty(candidate) ? null : candidate;
+    }
+
+    private static bool IsPotentiallyAnimatedExtension(string path)
+    {
+        string ext = VfsPathNormalizer.GetExtension(path);
+        return !(ext.Equals(".png", StringComparison.OrdinalIgnoreCase) ||
+                 ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                 ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+                 ext.Equals(".bmp", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void BindFileSource(string resolvedPath, IVirtualFileSystem vfs)
+    {
+        lock (_cacheSync)
+        {
+            if (_primaryVfs is null)
             {
-                return null;
+                _primaryVfs = vfs;
+            }
+            else if (!ReferenceEquals(_primaryVfs, vfs))
+            {
+                _fileVfsOverrides[resolvedPath] = vfs;
+            }
+        }
+    }
+
+    private bool TryPeekOrGetHeader(IVirtualFileSystem vfs, string resolvedPath, out ImageHeaderInfo header)
+    {
+        lock (_cacheSync)
+        {
+            if (_headerCache.TryGetValue(resolvedPath, out header))
+            {
+                return true;
             }
         }
 
-        if (_decodedFiles.TryGetValue(candidate, out IReadOnlyList<DecodedImageFrame>? cached))
+        using Stream stream = vfs.OpenRead(resolvedPath);
+        if (!ImageCodecDecoder.TryPeekHeader(stream, out header))
         {
-            return cached;
+            return false;
         }
 
-        using Stream stream = vfs.OpenRead(candidate);
-        IReadOnlyList<DecodedImageFrame> decoded = ImageCodecDecoder.DecodeFrames(stream);
+        lock (_cacheSync)
+        {
+            _headerCache[resolvedPath] = header;
+        }
+
+        return true;
+    }
+
+    private IReadOnlyList<DecodedImageFrame>? GetOrDecodeFileFrames(string resolvedPath)
+    {
+        IVirtualFileSystem? vfs;
+        lock (_cacheSync)
+        {
+            if (_decodedFileCache.TryGetValue(resolvedPath, out DecodedCacheEntry? cached))
+            {
+                TouchLruLocked(cached);
+                return cached.Frames;
+            }
+
+            if (!_fileVfsOverrides.TryGetValue(resolvedPath, out vfs))
+            {
+                vfs = _primaryVfs;
+            }
+        }
+
+        if (vfs is null || !vfs.FileExists(resolvedPath))
+        {
+            return null;
+        }
+
+        IReadOnlyList<DecodedImageFrame> decoded;
+        using (Stream stream = vfs.OpenRead(resolvedPath))
+        {
+            decoded = ImageCodecDecoder.DecodeFrames(stream);
+        }
+
         if (decoded.Count == 0)
         {
             return null;
         }
 
-        _decodedFiles[candidate] = decoded;
-        return decoded;
+        long byteSize = ComputeFramesByteSize(decoded);
+        lock (_cacheSync)
+        {
+            if (_disposed)
+            {
+                DisposeFrames(decoded);
+                return null;
+            }
+
+            if (_decodedFileCache.TryGetValue(resolvedPath, out DecodedCacheEntry? raced))
+            {
+                DisposeFrames(decoded);
+                TouchLruLocked(raced);
+                return raced.Frames;
+            }
+
+            LinkedListNode<string> node = _lruOrder.AddFirst(resolvedPath);
+            var entry = new DecodedCacheEntry
+            {
+                Path = resolvedPath,
+                Frames = decoded,
+                ByteSize = byteSize,
+                LruNode = node,
+            };
+
+            _decodedFileCache[resolvedPath] = entry;
+            _currentDecodedBytes += byteSize;
+            TrimDecodedCacheLocked(protectedKey: resolvedPath, _maxDecodedCacheBytes);
+            return decoded;
+        }
+    }
+
+    private void TouchLruLocked(DecodedCacheEntry entry)
+    {
+        if (!ReferenceEquals(_lruOrder.First, entry.LruNode))
+        {
+            _lruOrder.Remove(entry.LruNode);
+            _lruOrder.AddFirst(entry.LruNode);
+        }
+    }
+
+    private int TrimDecodedCacheLocked(string? protectedKey, long maxBytes)
+    {
+        int evicted = 0;
+        LinkedListNode<string>? cursor = _lruOrder.Last;
+        while (_currentDecodedBytes > maxBytes && cursor is not null)
+        {
+            LinkedListNode<string>? prev = cursor.Previous;
+            string key = cursor.Value;
+            if (protectedKey is not null && string.Equals(key, protectedKey, StringComparison.OrdinalIgnoreCase))
+            {
+                cursor = prev;
+                continue;
+            }
+
+            _lruOrder.Remove(cursor);
+            if (_decodedFileCache.Remove(key, out DecodedCacheEntry? removed))
+            {
+                _currentDecodedBytes = Math.Max(0L, _currentDecodedBytes - removed.ByteSize);
+                DisposeFrames(removed.Frames);
+                evicted++;
+            }
+
+            cursor = prev;
+        }
+
+        return evicted;
+    }
+
+    private static long ComputeFramesByteSize(IReadOnlyList<DecodedImageFrame> frames)
+    {
+        long total = 0;
+        for (int i = 0; i < frames.Count; i++)
+        {
+            total += Math.Max(0L, frames[i].Bitmap.ByteCount);
+        }
+
+        return total;
+    }
+
+    private static void DisposeFrames(IReadOnlyList<DecodedImageFrame> frames)
+    {
+        for (int i = 0; i < frames.Count; i++)
+        {
+            frames[i].Bitmap.Dispose();
+        }
     }
 
     private static bool TryParseInt(string s, out int value) =>
@@ -538,21 +830,33 @@ public sealed class SpriteRegistry : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        lock (_cacheSync)
         {
-            return;
-        }
-
-        _disposed = true;
-        foreach (IReadOnlyList<DecodedImageFrame> frames in _decodedFiles.Values)
-        {
-            foreach (DecodedImageFrame f in frames)
+            if (_disposed)
             {
-                f.Bitmap.Dispose();
+                return;
             }
+
+            _disposed = true;
+            foreach (DecodedCacheEntry entry in _decodedFileCache.Values)
+            {
+                DisposeFrames(entry.Frames);
+            }
+
+            foreach (IReadOnlyList<DecodedImageFrame> frames in _pinnedMemoryFrames.Values)
+            {
+                DisposeFrames(frames);
+            }
+
+            _decodedFileCache.Clear();
+            _lruOrder.Clear();
+            _headerCache.Clear();
+            _pinnedMemoryFrames.Clear();
+            _fileVfsOverrides.Clear();
+            _primaryVfs = null;
+            _currentDecodedBytes = 0;
         }
 
-        _decodedFiles.Clear();
         _sprites.Clear();
         _animatedSpriteCount = 0;
     }

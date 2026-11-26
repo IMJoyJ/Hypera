@@ -34,8 +34,8 @@ public sealed partial class EmueraEngine : IDisposable
     private readonly List<EventDispatchCursor> _eventStack = [];
     private readonly List<DisplayOperation> _displayOperations = [];
     private readonly List<ButtonDescriptor> _currentCycleButtons = [];
-    private readonly Dictionary<string, int> _functionsByName;
-    private readonly Dictionary<string, EventFunctionGroup> _eventGroupsByName;
+    private readonly IReadOnlyDictionary<string, int> _functionsByName;
+    private readonly IReadOnlyDictionary<string, EventFunctionGroup> _eventGroupsByName;
 
     private long _frameSequence;
     private long _inputGeneration;
@@ -143,31 +143,8 @@ public sealed partial class EmueraEngine : IDisposable
             Options.MaxLog);
         SystemFlow = new SystemFlowController(this);
 
-        StringComparer funcCmp = (module.CompilerOptions.IgnoreCase && !module.CompilerOptions.CompatiFunctionNoIgnoreCase)
-            ? StringComparer.OrdinalIgnoreCase
-            : StringComparer.Ordinal;
-
-        _functionsByName = new Dictionary<string, int>(funcCmp);
-        for (int i = 0; i < module.Functions.Length; i++)
-        {
-            FunctionDescriptor fn = module.Functions[i];
-            if (fn.EventFlags == EventDirectiveFlags.None)
-            {
-                _functionsByName.TryAdd(fn.Name, i);
-            }
-        }
-
-        // Fallback: allow lookup of any function by name if not already mapped
-        for (int i = 0; i < module.Functions.Length; i++)
-        {
-            _functionsByName.TryAdd(module.Functions[i].Name, i);
-        }
-
-        _eventGroupsByName = new Dictionary<string, EventFunctionGroup>(funcCmp);
-        foreach (EventFunctionGroup grp in module.EventGroups)
-        {
-            _eventGroupsByName[grp.EventName] = grp;
-        }
+        _functionsByName = module.GetEngineFunctionNameMap();
+        _eventGroupsByName = module.GetEventGroupMap();
     }
 
     public BytecodeModule Module { get; }

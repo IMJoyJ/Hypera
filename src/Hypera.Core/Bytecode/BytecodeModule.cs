@@ -161,6 +161,8 @@ public sealed class BytecodeModule
 {
     private StaticSlotIndex? _staticSlotIndex;
     private FunctionLookupIndex? _functionLookupIndex;
+    private Dictionary<string, int>? _engineFunctionNameMap;
+    private Dictionary<string, EventFunctionGroup>? _eventGroupMap;
 
     public required BytecodeModuleHeader Header { get; init; }
     public CompilerOptions CompilerOptions { get; init; } = CompilerOptions.Default;
@@ -194,6 +196,60 @@ public sealed class BytecodeModule
 
     internal bool TryGetFunctionByName(string name, out FunctionDescriptor? descriptor) =>
         GetFunctionLookupIndex().TryGetByName(this, name, out descriptor);
+
+    internal IReadOnlyDictionary<string, int> GetEngineFunctionNameMap()
+    {
+        Dictionary<string, int>? map = Volatile.Read(ref _engineFunctionNameMap);
+        if (map is not null)
+        {
+            return map;
+        }
+
+        StringComparer funcCmp = (CompilerOptions.IgnoreCase && !CompilerOptions.CompatiFunctionNoIgnoreCase)
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+
+        var created = new Dictionary<string, int>(Functions.Length, funcCmp);
+        for (int i = 0; i < Functions.Length; i++)
+        {
+            FunctionDescriptor fn = Functions[i];
+            if (fn.EventFlags == EventDirectiveFlags.None)
+            {
+                created.TryAdd(fn.Name, i);
+            }
+        }
+
+        // Fallback: allow lookup of any function by name if not already mapped
+        for (int i = 0; i < Functions.Length; i++)
+        {
+            created.TryAdd(Functions[i].Name, i);
+        }
+
+        Dictionary<string, int>? existing = Interlocked.CompareExchange(ref _engineFunctionNameMap, created, null);
+        return existing ?? created;
+    }
+
+    internal IReadOnlyDictionary<string, EventFunctionGroup> GetEventGroupMap()
+    {
+        Dictionary<string, EventFunctionGroup>? map = Volatile.Read(ref _eventGroupMap);
+        if (map is not null)
+        {
+            return map;
+        }
+
+        StringComparer funcCmp = (CompilerOptions.IgnoreCase && !CompilerOptions.CompatiFunctionNoIgnoreCase)
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+
+        var created = new Dictionary<string, EventFunctionGroup>(EventGroups.Length, funcCmp);
+        foreach (EventFunctionGroup grp in EventGroups)
+        {
+            created[grp.EventName] = grp;
+        }
+
+        Dictionary<string, EventFunctionGroup>? existing = Interlocked.CompareExchange(ref _eventGroupMap, created, null);
+        return existing ?? created;
+    }
 
     private FunctionLookupIndex GetFunctionLookupIndex()
     {
