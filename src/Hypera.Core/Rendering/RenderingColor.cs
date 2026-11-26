@@ -306,13 +306,18 @@ public static class RenderingColor
 
 /// <summary>
 /// Display-only text projection that transforms control characters for rendering without mutating script string data.
-/// Expands '\t' to 8 spaces, strips ETX ('\u0003') and C0/C1 control characters, and optionally replaces '\' with '¥'.
+/// Strips ETX ('\u0003') and C0/C1 control characters, optionally replaces '\' with '¥', and matches Emuera's
+/// drawing interface semantics for '\t': 0px (stripped) under <c>TEXTRENDERER</c> (GDI DrawText without DT_EXPANDTABS),
+/// or expanded to 8 spaces under legacy <c>GRAPHICS</c> mode (<c>StringMeasure</c>).
 /// </summary>
 public static class DisplayTextProjector
 {
     public const int TabSpaces = 8;
 
-    public static string ProjectForDisplay(string? rawText, bool replaceBackslashWithYen = false)
+    public static string ProjectForDisplay(
+        string? rawText,
+        bool replaceBackslashWithYen = false,
+        bool expandTabs = false)
     {
         if (string.IsNullOrEmpty(rawText))
         {
@@ -323,8 +328,7 @@ public static class DisplayTextProjector
         for (int i = 0; i < rawText.Length; i++)
         {
             char c = rawText[i];
-            if (c == '\t' ||
-                c < 0x20 ||
+            if (c < 0x20 ||
                 c == 0x7F ||
                 (c >= 0x80 && c <= 0x9F) ||
                 (replaceBackslashWithYen && c == '\\'))
@@ -339,13 +343,16 @@ public static class DisplayTextProjector
             return rawText;
         }
 
-        var sb = new StringBuilder(rawText.Length + 8);
+        var sb = new StringBuilder(rawText.Length + (expandTabs ? 8 : 0));
         for (int i = 0; i < rawText.Length; i++)
         {
             char c = rawText[i];
             if (c == '\t')
             {
-                sb.Append(' ', TabSpaces);
+                if (expandTabs)
+                {
+                    sb.Append(' ', TabSpaces);
+                }
             }
             else if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F))
             {

@@ -301,6 +301,9 @@ public sealed class ConfigLoader
 
         return new RuntimeOptions
         {
+            TextDrawingMode = values.TryGetValue(ConfigCode.TextDrawingMode, out object? tdmObj) && tdmObj is TextDrawingMode tdm
+                ? tdm
+                : TextDrawingMode.TEXTRENDERER,
             WindowX = GetInt(values, ConfigCode.WindowX, 760),
             WindowY = GetInt(values, ConfigCode.WindowY, 480),
             FontName = GetString(values, ConfigCode.FontName, "ＭＳ ゴシック"),

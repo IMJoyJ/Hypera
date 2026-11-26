@@ -146,6 +146,7 @@ public sealed class VirtualConsoleBuffer
     public PixelSamplingMode SamplingMode { get; set; } = PixelSamplingMode.Auto;
     public bool ReplaceBackslashWithYen { get; set; }
     public bool ButtonWrap { get; set; }
+    public bool ExpandTabs { get; set; }
 
     public long ButtonGeneration => _buttonGeneration;
     public IReadOnlyList<ConsoleLine> PhysicalLines => _physicalLines;
@@ -939,7 +940,8 @@ public sealed class VirtualConsoleBuffer
             FontStyle: FontStyle,
             SamplingMode: SamplingMode,
             ReplaceBackslashWithYen: ReplaceBackslashWithYen,
-            ButtonWrap: ButtonWrap);
+            ButtonWrap: ButtonWrap,
+            ExpandTabs: ExpandTabs);
 
     private void TrimLogIfNeeded()
     {

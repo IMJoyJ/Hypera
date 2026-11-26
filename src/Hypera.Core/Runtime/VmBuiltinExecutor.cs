@@ -1335,7 +1335,9 @@ internal static partial class VmBuiltinExecutor
                     engine.Glyphs,
                     engine.Options.FontSize,
                     engine.CurrentFontName,
-                    engine.Sprites);
+                    engine.Sprites,
+                    expandTabs: engine.ConsoleBuffer.ExpandTabs,
+                    buttonWrap: engine.ConsoleBuffer.ButtonWrap);
 
             case BuiltinMethodKind.SPRITEGETCOLOR:
                 return engine.Sprites.GetColor(

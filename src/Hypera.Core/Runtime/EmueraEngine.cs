@@ -141,6 +141,8 @@ public sealed partial class EmueraEngine : IDisposable
             Options.BackColorRgba,
             Options.FocusColorRgba,
             Options.MaxLog);
+        ConsoleBuffer.ButtonWrap = Options.ButtonWrap;
+        ConsoleBuffer.ExpandTabs = Options.TextDrawingMode == TextDrawingMode.GRAPHICS;
         ConsoleBuffer.AutoButtonDetected = (caption, intValue) => RegisterButtonDescriptor(caption, isInt: true, intValue);
         SystemFlow = new SystemFlowController(this);
 

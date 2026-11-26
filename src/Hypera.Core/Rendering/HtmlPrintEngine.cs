@@ -164,7 +164,8 @@ public sealed record HtmlParseStyle(
     FontStyleFlags FontStyle = FontStyleFlags.Regular,
     PixelSamplingMode SamplingMode = PixelSamplingMode.Auto,
     bool ReplaceBackslashWithYen = false,
-    bool ButtonWrap = false);
+    bool ButtonWrap = false,
+    bool ExpandTabs = false);
 
 /// <summary>
 /// Full Emuera HTML_PRINT / HTML_PRINT_ISLAND parser, layout engine, and HTML_* utility library.
@@ -328,7 +329,8 @@ public static class HtmlPrintEngine
         GlyphMeasurer? measurer = null,
         int fontSize = 18,
         string? fontFamily = null,
-        SpriteRegistry? sprites = null)
+        SpriteRegistry? sprites = null,
+        bool expandTabs = false)
     {
         if (string.IsNullOrEmpty(html))
         {
@@ -337,7 +339,7 @@ public static class HtmlPrintEngine
 
         if (returnPixels && measurer is not null)
         {
-            var style = new HtmlParseStyle(fontFamily ?? "MS Gothic", fontSize, fontSize, 0xC0C0C0FFu, 0xFFFF00FFu);
+            var style = new HtmlParseStyle(fontFamily ?? "MS Gothic", fontSize, fontSize, 0xC0C0C0FFu, 0xFFFF00FFu, ExpandTabs: expandTabs);
             IReadOnlyList<ConsoleLine> lines = ParseToLines(
                 html,
                 logicalLineId: 0,
@@ -381,7 +383,9 @@ public static class HtmlPrintEngine
         GlyphMeasurer measurer,
         int fontSize = 18,
         string? fontFamily = null,
-        SpriteRegistry? sprites = null)
+        SpriteRegistry? sprites = null,
+        bool expandTabs = false,
+        bool buttonWrap = false)
     {
         ArgumentNullException.ThrowIfNull(measurer);
         if (string.IsNullOrEmpty(html))
@@ -389,7 +393,7 @@ public static class HtmlPrintEngine
             return 0;
         }
 
-        var style = new HtmlParseStyle(fontFamily ?? "MS Gothic", fontSize, fontSize, 0xC0C0C0FFu, 0xFFFF00FFu);
+        var style = new HtmlParseStyle(fontFamily ?? "MS Gothic", fontSize, fontSize, 0xC0C0C0FFu, 0xFFFF00FFu, ButtonWrap: buttonWrap, ExpandTabs: expandTabs);
         IReadOnlyList<ConsoleLine> lines = ParseToLines(
             html,
             logicalLineId: 0,
@@ -749,7 +753,7 @@ public static class HtmlPrintEngine
 
             // Plain text segment
             string unescaped = Unescape(token);
-            string display = DisplayTextProjector.ProjectForDisplay(unescaped, baseStyle.ReplaceBackslashWithYen);
+            string display = DisplayTextProjector.ProjectForDisplay(unescaped, baseStyle.ReplaceBackslashWithYen, baseStyle.ExpandTabs);
             if (display.Length == 0)
             {
                 continue;

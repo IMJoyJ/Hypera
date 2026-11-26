@@ -257,6 +257,7 @@ public sealed partial class EmueraEngine
             case ConfigCode.SystemSaveInBinary: return Options.SystemSaveInBinary ? 1L : 0L;
             case ConfigCode.ZipSaveData: return Options.ZipSaveData ? 1L : 0L;
             case ConfigCode.UseDebugCommand: return Options.UseDebugCommand ? 1L : 0L;
+            case ConfigCode.TextDrawingMode: return (long)Options.TextDrawingMode;
             case ConfigCode.ButtonWrap: return Options.ButtonWrap ? 1L : 0L;
             case ConfigCode.AllowLongInputByMouse: return Options.AllowLongInputByMouse ? 1L : 0L;
             case ConfigCode.ForeColor: return (Options.ForeColorRgba >> 8) & 0x00FF_FFFFu;
@@ -326,6 +327,7 @@ public sealed partial class EmueraEngine
         ReplaceConfiguration rep = FastVariables?.ReplaceConfig ?? Module.ReplaceConfig;
         switch (code)
         {
+            case ConfigCode.TextDrawingMode: return Options.TextDrawingMode.ToString();
             case ConfigCode.FontName: return Options.FontName;
             case ConfigCode.MoneyLabel: return rep.MoneyLabel;
             case ConfigCode.LoadLabel: return rep.LoadLabel;

@@ -1,3 +1,5 @@
+using Hypera.Data;
+
 namespace Hypera.Configuration;
 
 /// <summary>
@@ -8,6 +10,7 @@ public sealed record RuntimeOptions
     public static RuntimeOptions Default { get; } = new();
 
     // Authoritative Logical Viewport & Typography
+    public TextDrawingMode TextDrawingMode { get; init; } = TextDrawingMode.TEXTRENDERER;
     public int WindowX { get; init; } = 800;
     public int WindowY { get; init; } = 600;
     public string FontName { get; init; } = "MS Gothic";
