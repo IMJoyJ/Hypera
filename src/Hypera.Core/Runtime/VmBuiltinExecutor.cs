@@ -1794,6 +1794,31 @@ internal static partial class VmBuiltinExecutor
             // Array & Bitwise Instructions
             case BuiltinInstructionKind.VARSET:
             {
+                var (varSlotId, varOrigin, _) = w.GetByRef(0);
+                if (varOrigin is not (VariableSlotOrigin.FrameLocal or VariableSlotOrigin.RefPassthrough))
+                {
+                    VariableSlotStorage targetSlot = vars.GetSlotOrThrow(varSlotId);
+                    if (!targetSlot.IsCharaData && targetSlot.CalcKind == BuiltinCalcKind.None)
+                    {
+                        if (targetSlot.ValueKind == VariableValueKind.Str)
+                        {
+                            string fill = w.HasArg(1) ? w.GetStr(1) : string.Empty;
+                            int start = w.HasArg(2) ? (int)w.GetInt(2) : 0;
+                            int end = w.HasArg(3) ? (int)w.GetInt(3) : targetSlot.TotalLength;
+                            targetSlot.VarSetStr(fill, start, end);
+                        }
+                        else
+                        {
+                            long fill = w.HasArg(1) ? w.GetInt(1) : 0L;
+                            int start = w.HasArg(2) ? (int)w.GetInt(2) : 0;
+                            int end = w.HasArg(3) ? (int)w.GetInt(3) : targetSlot.TotalLength;
+                            targetSlot.VarSetInt(fill, start, end);
+                        }
+
+                        return null;
+                    }
+                }
+
                 if (w.ResolveRefValueKind(0) == VariableValueKind.Str)
                 {
                     Span<string> dst = w.ResolveRefStrSpan(0);

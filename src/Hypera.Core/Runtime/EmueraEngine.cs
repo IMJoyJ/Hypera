@@ -755,7 +755,7 @@ public sealed partial class EmueraEngine : IDisposable
             }
         }
 
-        // Also mirror positional non-declared arguments into ARG@FUNC / ARGS@FUNC when no formal parameters declared
+        // Also mirror positional non-declared arguments into ARG@FUNC / ARGS@FUNC without forcing dense allocation
         if (target.Parameters.IsEmpty && passedCount > 0 && FastVariables is not null)
         {
             for (int i = 0; i < passedCount; i++)
@@ -763,13 +763,17 @@ public sealed partial class EmueraEngine : IDisposable
                 CallArgTag tag = GetArgTag(i);
                 if (tag == CallArgTag.Int && FastVariables.TryResolveSlot($"ARG@{target.Name}", out int argSlot))
                 {
-                    Span<long> span = FastVariables.GetIntSpan(argSlot);
-                    if ((uint)i < (uint)span.Length) span[i] = caller.IntRegisters[intBase + i];
+                    if ((uint)i < (uint)FastVariables.GetSlotDimension0(argSlot))
+                    {
+                        FastVariables.SetInt1D(argSlot, i, caller.IntRegisters[intBase + i]);
+                    }
                 }
                 else if (tag == CallArgTag.Str && FastVariables.TryResolveSlot($"ARGS@{target.Name}", out int argsSlot))
                 {
-                    Span<string> span = FastVariables.GetStrSpan(argsSlot);
-                    if ((uint)i < (uint)span.Length) span[i] = caller.StrRegisters[strBase + i] ?? string.Empty;
+                    if ((uint)i < (uint)FastVariables.GetSlotDimension0(argsSlot))
+                    {
+                        FastVariables.SetStr1D(argsSlot, i, caller.StrRegisters[strBase + i] ?? string.Empty);
+                    }
                 }
             }
         }
@@ -824,15 +828,8 @@ public sealed partial class EmueraEngine : IDisposable
             return;
         }
 
-        if (FastVariables.TryResolveExistingSlot($"ARG@{funcName}", out int argSlot))
-        {
-            FastVariables.GetIntSpan(argSlot).Clear();
-        }
-
-        if (FastVariables.TryResolveExistingSlot($"ARGS@{funcName}", out int argsSlot))
-        {
-            FastVariables.GetStrSpan(argsSlot).Fill(string.Empty);
-        }
+        FastVariables.TryClearMaterializedSlotByName($"ARG@{funcName}");
+        FastVariables.TryClearMaterializedSlotByName($"ARGS@{funcName}");
     }
 
     private void ResetFunctionLocalStatics(string funcName)
@@ -1850,29 +1847,11 @@ public sealed partial class EmueraEngine : IDisposable
             }
         }
 
-        // 2. Non-character SAVEDATA / GLOBAL variables (1D, 2D, 3D)
-        for (int i = 0; i < vars.SlotCount; i++)
+        // 2. Non-character SAVEDATA / GLOBAL variables (1D, 2D, 3D) — iterate only non-default materialized slots
+        bool includeGlobal = fileType == EraSaveFileType.Global;
+        foreach (VariableSlotStorage slot in vars.EnumerateSaveableSlots(includeGlobal))
         {
-            VariableSlotStorage? slot = vars.TryGetSlot(i);
-            if (slot is null || slot.IsConst || slot.IsCharaData || slot.CalcKind != BuiltinCalcKind.None)
-            {
-                continue;
-            }
-
-            bool include = fileType == EraSaveFileType.Global ? slot.IsGlobal : (!slot.IsGlobal && slot.IsSavedata);
-            if (!include)
-            {
-                continue;
-            }
-
-            if (slot.IntData is not null)
-            {
-                snap.Variables[slot.Name] = PackIntSaveValue(slot.IntData, Math.Max(1, slot.Rank), slot.Dim0, slot.Dim1, slot.Dim2);
-            }
-            else if (slot.StrData is not null)
-            {
-                snap.Variables[slot.Name] = PackStrSaveValue(slot.StrData, Math.Max(1, slot.Rank), slot.Dim0, slot.Dim1, slot.Dim2);
-            }
+            snap.Variables[slot.Name] = PackSlotToSaveValue(slot);
         }
 
         // 3. VarExt containers: Map, Xml, DataTable
@@ -2083,15 +2062,216 @@ public sealed partial class EmueraEngine : IDisposable
         return EraSaveValue.FromStrArray3D(arr3);
     }
 
+    private static EraSaveValue PackSlotToSaveValue(VariableSlotStorage slot)
+    {
+        int rank = Math.Max(1, slot.Rank);
+        if (slot.ValueKind == VariableValueKind.Int)
+        {
+            if (rank == 1)
+            {
+                return EraSaveValue.FromIntArray(slot.ExportTrimmedIntArray());
+            }
+
+            if (rank == 2)
+            {
+                var arr2 = new long[slot.Dim0, slot.Dim1];
+                if (slot.FindLastNonDefaultIndex() >= 0)
+                {
+                    for (int i = 0; i < slot.Dim0; i++)
+                    {
+                        for (int j = 0; j < slot.Dim1; j++)
+                        {
+                            arr2[i, j] = slot.ReadIntFlat((i * slot.Dim1) + j);
+                        }
+                    }
+                }
+
+                return EraSaveValue.FromIntArray2D(arr2);
+            }
+
+            var arr3 = new long[slot.Dim0, slot.Dim1, slot.Dim2];
+            if (slot.FindLastNonDefaultIndex() >= 0)
+            {
+                for (int i = 0; i < slot.Dim0; i++)
+                {
+                    for (int j = 0; j < slot.Dim1; j++)
+                    {
+                        for (int k = 0; k < slot.Dim2; k++)
+                        {
+                            arr3[i, j, k] = slot.ReadIntFlat((((i * slot.Dim1) + j) * slot.Dim2) + k);
+                        }
+                    }
+                }
+            }
+
+            return EraSaveValue.FromIntArray3D(arr3);
+        }
+
+        if (rank == 1)
+        {
+            return EraSaveValue.FromStrArray(slot.ExportTrimmedStrArray());
+        }
+
+        if (rank == 2)
+        {
+            var arr2 = new string[slot.Dim0, slot.Dim1];
+            for (int i = 0; i < slot.Dim0; i++)
+            {
+                for (int j = 0; j < slot.Dim1; j++)
+                {
+                    arr2[i, j] = slot.ReadStrFlat((i * slot.Dim1) + j);
+                }
+            }
+
+            return EraSaveValue.FromStrArray2D(arr2);
+        }
+
+        var strArr3 = new string[slot.Dim0, slot.Dim1, slot.Dim2];
+        for (int i = 0; i < slot.Dim0; i++)
+        {
+            for (int j = 0; j < slot.Dim1; j++)
+            {
+                for (int k = 0; k < slot.Dim2; k++)
+                {
+                    strArr3[i, j, k] = slot.ReadStrFlat((((i * slot.Dim1) + j) * slot.Dim2) + k);
+                }
+            }
+        }
+
+        return EraSaveValue.FromStrArray3D(strArr3);
+    }
+
     private static void UnpackSaveValueIntoSlot(VariableSlotStorage slot, EraSaveValue val)
     {
-        if (slot.IntData is not null)
+        if (slot.ValueKind == VariableValueKind.Int)
         {
-            UnpackIntSaveValueIntoFlat(val, slot.IntData, slot.Dim0, slot.Dim1, slot.Dim2);
+            slot.ClearToZeroOrEmpty();
+            switch (val.DataType)
+            {
+                case EraSaveDataType.Int:
+                    if (slot.TotalLength > 0) slot.WriteIntFlat(0, val.AsInt());
+                    break;
+                case EraSaveDataType.IntArray:
+                {
+                    long[] src = val.AsIntArray();
+                    int n = Math.Min(src.Length, slot.TotalLength);
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (src[i] != 0L) slot.WriteIntFlat(i, src[i]);
+                    }
+
+                    break;
+                }
+                case EraSaveDataType.IntArray2D:
+                {
+                    long[,] src = val.AsIntArray2D();
+                    int r0 = Math.Min(slot.Dim0, src.GetLength(0));
+                    int r1 = Math.Min(slot.Dim1, src.GetLength(1));
+                    for (int i = 0; i < r0; i++)
+                    {
+                        for (int j = 0; j < r1; j++)
+                        {
+                            long v = src[i, j];
+                            if (v != 0L)
+                            {
+                                int idx = (i * slot.Dim1) + j;
+                                if ((uint)idx < (uint)slot.TotalLength) slot.WriteIntFlat(idx, v);
+                            }
+                        }
+                    }
+
+                    break;
+                }
+                case EraSaveDataType.IntArray3D:
+                {
+                    long[,,] src = val.AsIntArray3D();
+                    int r0 = Math.Min(slot.Dim0, src.GetLength(0));
+                    int r1 = Math.Min(slot.Dim1, src.GetLength(1));
+                    int r2 = Math.Min(slot.Dim2, src.GetLength(2));
+                    for (int i = 0; i < r0; i++)
+                    {
+                        for (int j = 0; j < r1; j++)
+                        {
+                            for (int k = 0; k < r2; k++)
+                            {
+                                long v = src[i, j, k];
+                                if (v != 0L)
+                                {
+                                    int idx = (((i * slot.Dim1) + j) * slot.Dim2) + k;
+                                    if ((uint)idx < (uint)slot.TotalLength) slot.WriteIntFlat(idx, v);
+                                }
+                            }
+                        }
+                    }
+
+                    break;
+                }
+            }
         }
-        else if (slot.StrData is not null)
+        else
         {
-            UnpackStrSaveValueIntoFlat(val, slot.StrData, slot.Dim0, slot.Dim1, slot.Dim2);
+            slot.ClearToZeroOrEmpty();
+            switch (val.DataType)
+            {
+                case EraSaveDataType.Str:
+                    if (slot.TotalLength > 0) slot.WriteStrFlat(0, val.AsStr());
+                    break;
+                case EraSaveDataType.StrArray:
+                {
+                    string[] src = val.AsStrArray();
+                    int n = Math.Min(src.Length, slot.TotalLength);
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (!string.IsNullOrEmpty(src[i])) slot.WriteStrFlat(i, src[i]);
+                    }
+
+                    break;
+                }
+                case EraSaveDataType.StrArray2D:
+                {
+                    string[,] src = val.AsStrArray2D();
+                    int r0 = Math.Min(slot.Dim0, src.GetLength(0));
+                    int r1 = Math.Min(slot.Dim1, src.GetLength(1));
+                    for (int i = 0; i < r0; i++)
+                    {
+                        for (int j = 0; j < r1; j++)
+                        {
+                            string s = src[i, j];
+                            if (!string.IsNullOrEmpty(s))
+                            {
+                                int idx = (i * slot.Dim1) + j;
+                                if ((uint)idx < (uint)slot.TotalLength) slot.WriteStrFlat(idx, s);
+                            }
+                        }
+                    }
+
+                    break;
+                }
+                case EraSaveDataType.StrArray3D:
+                {
+                    string[,,] src = val.AsStrArray3D();
+                    int r0 = Math.Min(slot.Dim0, src.GetLength(0));
+                    int r1 = Math.Min(slot.Dim1, src.GetLength(1));
+                    int r2 = Math.Min(slot.Dim2, src.GetLength(2));
+                    for (int i = 0; i < r0; i++)
+                    {
+                        for (int j = 0; j < r1; j++)
+                        {
+                            for (int k = 0; k < r2; k++)
+                            {
+                                string s = src[i, j, k];
+                                if (!string.IsNullOrEmpty(s))
+                                {
+                                    int idx = (((i * slot.Dim1) + j) * slot.Dim2) + k;
+                                    if ((uint)idx < (uint)slot.TotalLength) slot.WriteStrFlat(idx, s);
+                                }
+                            }
+                        }
+                    }
+
+                    break;
+                }
+            }
         }
     }
 

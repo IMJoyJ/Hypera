@@ -159,6 +159,8 @@ public sealed record EventFunctionGroup(
 /// </summary>
 public sealed class BytecodeModule
 {
+    private StaticSlotIndex? _staticSlotIndex;
+
     public required BytecodeModuleHeader Header { get; init; }
     public CompilerOptions CompilerOptions { get; init; } = CompilerOptions.Default;
     public ReplaceConfiguration ReplaceConfig { get; init; } = ReplaceConfiguration.Default;
@@ -175,4 +177,107 @@ public sealed class BytecodeModule
     {
         Header = BytecodeModuleHeader.Create(0, 0, 0, 0, 0),
     };
+
+    internal int MaxStaticSlotId => GetStaticSlotIndex().MaxSlotId;
+
+    internal IReadOnlyCollection<string> StaticVariableNames => GetStaticSlotIndex().GetNameToSlot(this).Keys;
+
+    internal VariableSlotDescriptor? TryGetStaticDescriptor(int slotId) =>
+        GetStaticSlotIndex().TryGetBySlotId(this, slotId);
+
+    internal bool TryResolveStaticSlotId(string name, out int slotId) =>
+        GetStaticSlotIndex().GetNameToSlot(this).TryGetValue(name, out slotId);
+
+    private StaticSlotIndex GetStaticSlotIndex()
+    {
+        StaticSlotIndex? idx = Volatile.Read(ref _staticSlotIndex);
+        if (idx is not null)
+        {
+            return idx;
+        }
+
+        var created = new StaticSlotIndex(StaticVariables);
+        StaticSlotIndex? existing = Interlocked.CompareExchange(ref _staticSlotIndex, created, null);
+        return existing ?? created;
+    }
+
+    private sealed class StaticSlotIndex
+    {
+        private readonly bool _isDenseSequential;
+        private readonly Dictionary<int, VariableSlotDescriptor>? _sparseBySlotId;
+        private Dictionary<string, int>? _nameToSlot;
+
+        public StaticSlotIndex(ImmutableArray<VariableSlotDescriptor> vars)
+        {
+            int maxId = -1;
+            bool dense = true;
+            for (int i = 0; i < vars.Length; i++)
+            {
+                int id = vars[i].SlotId;
+                if (id != i)
+                {
+                    dense = false;
+                }
+
+                if (id > maxId)
+                {
+                    maxId = id;
+                }
+            }
+
+            MaxSlotId = maxId;
+            _isDenseSequential = dense;
+            if (!dense && vars.Length > 0)
+            {
+                var map = new Dictionary<int, VariableSlotDescriptor>(vars.Length);
+                for (int i = 0; i < vars.Length; i++)
+                {
+                    map[vars[i].SlotId] = vars[i];
+                }
+
+                _sparseBySlotId = map;
+            }
+        }
+
+        public int MaxSlotId { get; }
+
+        public VariableSlotDescriptor? TryGetBySlotId(BytecodeModule module, int slotId)
+        {
+            if (slotId < 0)
+            {
+                return null;
+            }
+
+            if (_isDenseSequential)
+            {
+                ImmutableArray<VariableSlotDescriptor> vars = module.StaticVariables;
+                return (uint)slotId < (uint)vars.Length ? vars[slotId] : null;
+            }
+
+            return _sparseBySlotId is not null && _sparseBySlotId.TryGetValue(slotId, out VariableSlotDescriptor? desc)
+                ? desc
+                : null;
+        }
+
+        public Dictionary<string, int> GetNameToSlot(BytecodeModule module)
+        {
+            Dictionary<string, int>? map = Volatile.Read(ref _nameToSlot);
+            if (map is not null)
+            {
+                return map;
+            }
+
+            StringComparer cmp = module.CompilerOptions.IgnoreCase ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            ImmutableArray<VariableSlotDescriptor> vars = module.StaticVariables;
+            var created = new Dictionary<string, int>(vars.Length, cmp);
+            for (int i = 0; i < vars.Length; i++)
+            {
+                VariableSlotDescriptor d = vars[i];
+                created.TryAdd(d.Name, d.SlotId);
+            }
+
+            Dictionary<string, int>? existing = Interlocked.CompareExchange(ref _nameToSlot, created, null);
+            return existing ?? created;
+        }
+    }
 }

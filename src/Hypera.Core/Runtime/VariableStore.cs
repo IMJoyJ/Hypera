@@ -42,9 +42,22 @@ internal enum BuiltinCalcKind : byte
 
 /// <summary>
 /// High-locality flattened storage entry for a static, global, CSV-constant, function-static, or pseudo variable slot.
+/// Uses lazy allocation: small/medium slots (&lt;= 4096 elements) use a growable dense array starting at 16 elements,
+/// and giant sparse slots (&gt; 4096 elements) use a 256-element fixed page table (<c>T[]?[]</c>) allocated per touched page.
 /// </summary>
 public sealed class VariableSlotStorage
 {
+    private const int PagedThreshold = 4096;
+    private const int PageShift = 8;
+    private const int PageSize = 1 << PageShift;
+    private const int PageMask = PageSize - 1;
+
+    private long[]? _denseInt;
+    private long[]?[]? _intPages;
+    private string?[]? _denseStr;
+    private string?[]?[]? _strPages;
+    private bool _backingInitialized;
+
     public required int SlotId { get; init; }
     public required string Name { get; init; }
     public required VariableValueKind ValueKind { get; init; }
@@ -64,10 +77,999 @@ public sealed class VariableSlotStorage
     public string? AssociatedCsvNameTable { get; init; }
     internal BuiltinCalcKind CalcKind { get; init; }
 
-    public long[]? IntData { get; set; }
-    public string[]? StrData { get; set; }
     public long[]? InitialIntValues { get; set; }
     public string[]? InitialStrValues { get; set; }
+
+    public bool HasAllocatedStorage =>
+        _denseInt is not null || _intPages is not null || _denseStr is not null || _strPages is not null;
+
+    /// <summary>
+    /// Materializes and returns a contiguous <see cref="long"/> array of length <see cref="TotalLength"/>.
+    /// Prefer sparse accessors (<c>ReadIntFlat</c>/<c>WriteIntFlat</c>) on hot paths to preserve lazy memory savings.
+    /// </summary>
+    public long[]? IntData
+    {
+        get => ValueKind == VariableValueKind.Int && !IsCharaData && CalcKind == BuiltinCalcKind.None
+            ? EnsureContiguousIntArray()
+            : null;
+        set
+        {
+            _denseInt = value;
+            _intPages = null;
+            _backingInitialized = value is not null;
+        }
+    }
+
+    /// <summary>
+    /// Materializes and returns a contiguous non-null <see cref="string"/> array of length <see cref="TotalLength"/>.
+    /// Prefer sparse accessors (<c>ReadStrFlat</c>/<c>WriteStrFlat</c>) on hot paths to preserve lazy memory savings.
+    /// </summary>
+    public string[]? StrData
+    {
+        get => ValueKind == VariableValueKind.Str && !IsCharaData && CalcKind == BuiltinCalcKind.None
+            ? EnsureContiguousStrArray()
+            : null;
+        set
+        {
+            _denseStr = value;
+            _strPages = null;
+            _backingInitialized = value is not null;
+        }
+    }
+
+    internal void ApplyInitialIntValues(long[]? initial)
+    {
+        InitialIntValues = initial;
+        _denseInt = null;
+        _intPages = null;
+        _backingInitialized = false;
+    }
+
+    internal void ApplyInitialStrValues(string[]? initial)
+    {
+        InitialStrValues = initial;
+        _denseStr = null;
+        _strPages = null;
+        _backingInitialized = false;
+    }
+
+    internal void ResizeAndClear(ReadOnlySpan<int> dims)
+    {
+        int rank = dims.Length;
+        int d0 = rank >= 1 ? Math.Max(1, dims[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, dims[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, dims[2]) : 1;
+        int total = Math.Max(1, checked(d0 * d1 * d2));
+
+        Rank = rank;
+        Dim0 = d0;
+        Dim1 = d1;
+        Dim2 = d2;
+        TotalLength = total;
+        _denseInt = null;
+        _intPages = null;
+        _denseStr = null;
+        _strPages = null;
+        _backingInitialized = false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal long ReadIntFlat(int flat)
+    {
+        if (!_backingInitialized)
+        {
+            long[]? init = InitialIntValues;
+            return init is not null && (uint)flat < (uint)init.Length ? init[flat] : 0L;
+        }
+
+        long[]? dense = _denseInt;
+        if (dense is not null)
+        {
+            return (uint)flat < (uint)dense.Length ? dense[flat] : 0L;
+        }
+
+        long[]?[]? pages = _intPages;
+        if (pages is not null)
+        {
+            long[]? page = pages[flat >> PageShift];
+            return page is not null ? page[flat & PageMask] : 0L;
+        }
+
+        return 0L;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void WriteIntFlat(int flat, long value)
+    {
+        if (_backingInitialized)
+        {
+            long[]? dense = _denseInt;
+            if (dense is not null)
+            {
+                if ((uint)flat < (uint)dense.Length)
+                {
+                    dense[flat] = value;
+                    return;
+                }
+
+                if (value == 0L)
+                {
+                    return;
+                }
+
+                GrowDenseInt(flat);
+                _denseInt![flat] = value;
+                return;
+            }
+
+            long[]?[]? pages = _intPages;
+            if (pages is not null)
+            {
+                int pIdx = flat >> PageShift;
+                long[]? page = pages[pIdx];
+                if (page is null)
+                {
+                    if (value == 0L)
+                    {
+                        return;
+                    }
+
+                    int pageLen = Math.Min(PageSize, TotalLength - (pIdx << PageShift));
+                    page = new long[pageLen];
+                    pages[pIdx] = page;
+                }
+
+                page[flat & PageMask] = value;
+                return;
+            }
+
+            if (value == 0L)
+            {
+                return;
+            }
+        }
+
+        WriteIntFlatSlow(flat, value);
+    }
+
+    private void WriteIntFlatSlow(int flat, long value)
+    {
+        if (!_backingInitialized)
+        {
+            long[]? init = InitialIntValues;
+            long existing = init is not null && (uint)flat < (uint)init.Length ? init[flat] : 0L;
+            if (value == existing)
+            {
+                return;
+            }
+
+            _backingInitialized = true;
+            if (init is not null && init.Length > 0)
+            {
+                SeedInitialInts(init, flat);
+            }
+            else if (value == 0L)
+            {
+                return;
+            }
+            else
+            {
+                AllocateIntBackingForIndex(flat);
+            }
+        }
+        else if (_denseInt is null && _intPages is null)
+        {
+            if (value == 0L)
+            {
+                return;
+            }
+
+            AllocateIntBackingForIndex(flat);
+        }
+
+        if (_denseInt is not null)
+        {
+            if (flat >= _denseInt.Length)
+            {
+                GrowDenseInt(flat);
+            }
+
+            _denseInt[flat] = value;
+        }
+        else if (_intPages is not null)
+        {
+            int pIdx = flat >> PageShift;
+            long[]? page = _intPages[pIdx];
+            if (page is null)
+            {
+                int pageLen = Math.Min(PageSize, TotalLength - (pIdx << PageShift));
+                page = new long[pageLen];
+                _intPages[pIdx] = page;
+            }
+
+            page[flat & PageMask] = value;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal string ReadStrFlat(int flat)
+    {
+        if (!_backingInitialized)
+        {
+            string[]? init = InitialStrValues;
+            return init is not null && (uint)flat < (uint)init.Length ? (init[flat] ?? string.Empty) : string.Empty;
+        }
+
+        string?[]? dense = _denseStr;
+        if (dense is not null)
+        {
+            return (uint)flat < (uint)dense.Length ? (dense[flat] ?? string.Empty) : string.Empty;
+        }
+
+        string?[]?[]? pages = _strPages;
+        if (pages is not null)
+        {
+            string?[]? page = pages[flat >> PageShift];
+            return page is not null ? (page[flat & PageMask] ?? string.Empty) : string.Empty;
+        }
+
+        return string.Empty;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void WriteStrFlat(int flat, string? value)
+    {
+        string norm = value ?? string.Empty;
+        if (_backingInitialized)
+        {
+            string?[]? dense = _denseStr;
+            if (dense is not null)
+            {
+                if ((uint)flat < (uint)dense.Length)
+                {
+                    dense[flat] = norm.Length == 0 ? null : norm;
+                    return;
+                }
+
+                if (norm.Length == 0)
+                {
+                    return;
+                }
+
+                GrowDenseStr(flat);
+                _denseStr![flat] = norm;
+                return;
+            }
+
+            string?[]?[]? pages = _strPages;
+            if (pages is not null)
+            {
+                int pIdx = flat >> PageShift;
+                string?[]? page = pages[pIdx];
+                if (page is null)
+                {
+                    if (norm.Length == 0)
+                    {
+                        return;
+                    }
+
+                    int pageLen = Math.Min(PageSize, TotalLength - (pIdx << PageShift));
+                    page = new string?[pageLen];
+                    pages[pIdx] = page;
+                }
+
+                page[flat & PageMask] = norm.Length == 0 ? null : norm;
+                return;
+            }
+
+            if (norm.Length == 0)
+            {
+                return;
+            }
+        }
+
+        WriteStrFlatSlow(flat, norm);
+    }
+
+    private void WriteStrFlatSlow(int flat, string norm)
+    {
+        if (!_backingInitialized)
+        {
+            string[]? init = InitialStrValues;
+            string existing = init is not null && (uint)flat < (uint)init.Length ? (init[flat] ?? string.Empty) : string.Empty;
+            if (string.Equals(norm, existing, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _backingInitialized = true;
+            if (init is not null && init.Length > 0)
+            {
+                SeedInitialStrs(init, flat);
+            }
+            else if (norm.Length == 0)
+            {
+                return;
+            }
+            else
+            {
+                AllocateStrBackingForIndex(flat);
+            }
+        }
+        else if (_denseStr is null && _strPages is null)
+        {
+            if (norm.Length == 0)
+            {
+                return;
+            }
+
+            AllocateStrBackingForIndex(flat);
+        }
+
+        if (_denseStr is not null)
+        {
+            if (flat >= _denseStr.Length)
+            {
+                GrowDenseStr(flat);
+            }
+
+            _denseStr[flat] = norm.Length == 0 ? null : norm;
+        }
+        else if (_strPages is not null)
+        {
+            int pIdx = flat >> PageShift;
+            string?[]? page = _strPages[pIdx];
+            if (page is null)
+            {
+                int pageLen = Math.Min(PageSize, TotalLength - (pIdx << PageShift));
+                page = new string?[pageLen];
+                _strPages[pIdx] = page;
+            }
+
+            page[flat & PageMask] = norm.Length == 0 ? null : norm;
+        }
+    }
+
+    internal void ClearToZeroOrEmpty()
+    {
+        _denseInt = null;
+        _intPages = null;
+        _denseStr = null;
+        _strPages = null;
+        _backingInitialized = true;
+    }
+
+    internal void ResetToInitialValues()
+    {
+        _denseInt = null;
+        _intPages = null;
+        _denseStr = null;
+        _strPages = null;
+        _backingInitialized = false;
+    }
+
+    internal void VarSetInt(long fill, int start, int end)
+    {
+        int lo = Math.Clamp(start, 0, TotalLength);
+        int hi = Math.Clamp(end, lo, TotalLength);
+        if (lo >= hi)
+        {
+            return;
+        }
+
+        if (fill == 0L)
+        {
+            if (lo == 0 && hi == TotalLength)
+            {
+                ClearToZeroOrEmpty();
+                return;
+            }
+
+            if (!_backingInitialized)
+            {
+                if (InitialIntValues is null || InitialIntValues.Length == 0)
+                {
+                    return;
+                }
+
+                int initHi = Math.Min(hi, InitialIntValues.Length);
+                if (lo >= initHi)
+                {
+                    return;
+                }
+
+                for (int i = lo; i < initHi; i++)
+                {
+                    WriteIntFlat(i, 0L);
+                }
+
+                return;
+            }
+
+            if (_denseInt is not null)
+            {
+                int clearEnd = Math.Min(hi, _denseInt.Length);
+                if (lo < clearEnd)
+                {
+                    _denseInt.AsSpan(lo, clearEnd - lo).Clear();
+                }
+
+                return;
+            }
+
+            if (_intPages is not null)
+            {
+                int pStart = lo >> PageShift;
+                int pEnd = (hi - 1) >> PageShift;
+                for (int p = pStart; p <= pEnd; p++)
+                {
+                    long[]? page = _intPages[p];
+                    if (page is null) continue;
+                    int pageBase = p << PageShift;
+                    int segLo = Math.Max(lo, pageBase) - pageBase;
+                    int segHi = Math.Min(hi, pageBase + page.Length) - pageBase;
+                    if (segLo == 0 && segHi == page.Length)
+                    {
+                        _intPages[p] = null;
+                    }
+                    else
+                    {
+                        page.AsSpan(segLo, segHi - segLo).Clear();
+                    }
+                }
+            }
+
+            return;
+        }
+
+        // Non-zero fill
+        if (TotalLength <= PagedThreshold)
+        {
+            EnsureDenseIntCapacity(hi - 1);
+            _denseInt!.AsSpan(lo, hi - lo).Fill(fill);
+            return;
+        }
+
+        if (!_backingInitialized)
+        {
+            _backingInitialized = true;
+            if (InitialIntValues is { Length: > 0 } init)
+            {
+                SeedInitialInts(init, hi - 1);
+            }
+        }
+
+        if (_denseInt is not null)
+        {
+            if (hi > _denseInt.Length)
+            {
+                GrowDenseInt(hi - 1);
+            }
+
+            _denseInt.AsSpan(lo, hi - lo).Fill(fill);
+            return;
+        }
+
+        _intPages ??= new long[(TotalLength + PageSize - 1) >> PageShift][];
+        int fpStart = lo >> PageShift;
+        int fpEnd = (hi - 1) >> PageShift;
+        for (int p = fpStart; p <= fpEnd; p++)
+        {
+            int pageBase = p << PageShift;
+            int pageLen = Math.Min(PageSize, TotalLength - pageBase);
+            long[] page = _intPages[p] ?? (_intPages[p] = new long[pageLen]);
+            int segLo = Math.Max(lo, pageBase) - pageBase;
+            int segHi = Math.Min(hi, pageBase + pageLen) - pageBase;
+            page.AsSpan(segLo, segHi - segLo).Fill(fill);
+        }
+    }
+
+    internal void VarSetStr(string? fill, int start, int end)
+    {
+        string norm = fill ?? string.Empty;
+        int lo = Math.Clamp(start, 0, TotalLength);
+        int hi = Math.Clamp(end, lo, TotalLength);
+        if (lo >= hi)
+        {
+            return;
+        }
+
+        if (norm.Length == 0)
+        {
+            if (lo == 0 && hi == TotalLength)
+            {
+                ClearToZeroOrEmpty();
+                return;
+            }
+
+            if (!_backingInitialized)
+            {
+                if (InitialStrValues is null || InitialStrValues.Length == 0)
+                {
+                    return;
+                }
+
+                int initHi = Math.Min(hi, InitialStrValues.Length);
+                if (lo >= initHi)
+                {
+                    return;
+                }
+
+                for (int i = lo; i < initHi; i++)
+                {
+                    WriteStrFlat(i, string.Empty);
+                }
+
+                return;
+            }
+
+            if (_denseStr is not null)
+            {
+                int clearEnd = Math.Min(hi, _denseStr.Length);
+                if (lo < clearEnd)
+                {
+                    _denseStr.AsSpan(lo, clearEnd - lo).Clear();
+                }
+
+                return;
+            }
+
+            if (_strPages is not null)
+            {
+                int pStart = lo >> PageShift;
+                int pEnd = (hi - 1) >> PageShift;
+                for (int p = pStart; p <= pEnd; p++)
+                {
+                    string?[]? page = _strPages[p];
+                    if (page is null) continue;
+                    int pageBase = p << PageShift;
+                    int segLo = Math.Max(lo, pageBase) - pageBase;
+                    int segHi = Math.Min(hi, pageBase + page.Length) - pageBase;
+                    if (segLo == 0 && segHi == page.Length)
+                    {
+                        _strPages[p] = null;
+                    }
+                    else
+                    {
+                        page.AsSpan(segLo, segHi - segLo).Clear();
+                    }
+                }
+            }
+
+            return;
+        }
+
+        // Non-empty fill
+        if (TotalLength <= PagedThreshold)
+        {
+            EnsureDenseStrCapacity(hi - 1);
+            _denseStr!.AsSpan(lo, hi - lo).Fill(norm);
+            return;
+        }
+
+        if (!_backingInitialized)
+        {
+            _backingInitialized = true;
+            if (InitialStrValues is { Length: > 0 } init)
+            {
+                SeedInitialStrs(init, hi - 1);
+            }
+        }
+
+        if (_denseStr is not null)
+        {
+            if (hi > _denseStr.Length)
+            {
+                GrowDenseStr(hi - 1);
+            }
+
+            _denseStr.AsSpan(lo, hi - lo).Fill(norm);
+            return;
+        }
+
+        _strPages ??= new string?[(TotalLength + PageSize - 1) >> PageShift][];
+        int fpStart = lo >> PageShift;
+        int fpEnd = (hi - 1) >> PageShift;
+        for (int p = fpStart; p <= fpEnd; p++)
+        {
+            int pageBase = p << PageShift;
+            int pageLen = Math.Min(PageSize, TotalLength - pageBase);
+            string?[] page = _strPages[p] ?? (_strPages[p] = new string?[pageLen]);
+            int segLo = Math.Max(lo, pageBase) - pageBase;
+            int segHi = Math.Min(hi, pageBase + pageLen) - pageBase;
+            page.AsSpan(segLo, segHi - segLo).Fill(norm);
+        }
+    }
+
+    internal int FindLastNonDefaultIndex()
+    {
+        if (ValueKind == VariableValueKind.Int)
+        {
+            if (!_backingInitialized)
+            {
+                long[]? init = InitialIntValues;
+                if (init is null) return -1;
+                for (int i = Math.Min(TotalLength, init.Length) - 1; i >= 0; i--)
+                {
+                    if (init[i] != 0L) return i;
+                }
+
+                return -1;
+            }
+
+            if (_denseInt is not null)
+            {
+                for (int i = Math.Min(TotalLength, _denseInt.Length) - 1; i >= 0; i--)
+                {
+                    if (_denseInt[i] != 0L) return i;
+                }
+
+                return -1;
+            }
+
+            if (_intPages is not null)
+            {
+                for (int p = _intPages.Length - 1; p >= 0; p--)
+                {
+                    long[]? page = _intPages[p];
+                    if (page is null) continue;
+                    int pageBase = p << PageShift;
+                    for (int o = page.Length - 1; o >= 0; o--)
+                    {
+                        if (page[o] != 0L) return pageBase + o;
+                    }
+                }
+            }
+
+            return -1;
+        }
+
+        if (!_backingInitialized)
+        {
+            string[]? init = InitialStrValues;
+            if (init is null) return -1;
+            for (int i = Math.Min(TotalLength, init.Length) - 1; i >= 0; i--)
+            {
+                if (!string.IsNullOrEmpty(init[i])) return i;
+            }
+
+            return -1;
+        }
+
+        if (_denseStr is not null)
+        {
+            for (int i = Math.Min(TotalLength, _denseStr.Length) - 1; i >= 0; i--)
+            {
+                if (!string.IsNullOrEmpty(_denseStr[i])) return i;
+            }
+
+            return -1;
+        }
+
+        if (_strPages is not null)
+        {
+            for (int p = _strPages.Length - 1; p >= 0; p--)
+            {
+                string?[]? page = _strPages[p];
+                if (page is null) continue;
+                int pageBase = p << PageShift;
+                for (int o = page.Length - 1; o >= 0; o--)
+                {
+                    if (!string.IsNullOrEmpty(page[o])) return pageBase + o;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    internal long[] ExportTrimmedIntArray()
+    {
+        int last = FindLastNonDefaultIndex();
+        if (last < 0)
+        {
+            return [];
+        }
+
+        var result = new long[last + 1];
+        for (int i = 0; i <= last; i++)
+        {
+            result[i] = ReadIntFlat(i);
+        }
+
+        return result;
+    }
+
+    internal string[] ExportTrimmedStrArray()
+    {
+        int last = FindLastNonDefaultIndex();
+        if (last < 0)
+        {
+            return [];
+        }
+
+        var result = new string[last + 1];
+        for (int i = 0; i <= last; i++)
+        {
+            result[i] = ReadStrFlat(i);
+        }
+
+        return result;
+    }
+
+    internal long[] EnsureContiguousIntArray()
+    {
+        if (_backingInitialized && _denseInt is not null && _denseInt.Length == TotalLength)
+        {
+            return _denseInt;
+        }
+
+        var full = new long[TotalLength];
+        if (!_backingInitialized)
+        {
+            if (InitialIntValues is { Length: > 0 } init)
+            {
+                init.AsSpan(0, Math.Min(init.Length, full.Length)).CopyTo(full);
+            }
+        }
+        else if (_denseInt is not null)
+        {
+            _denseInt.AsSpan(0, Math.Min(_denseInt.Length, full.Length)).CopyTo(full);
+        }
+        else if (_intPages is not null)
+        {
+            for (int p = 0; p < _intPages.Length; p++)
+            {
+                long[]? page = _intPages[p];
+                if (page is not null)
+                {
+                    int pageBase = p << PageShift;
+                    int copyLen = Math.Min(page.Length, full.Length - pageBase);
+                    if (copyLen > 0)
+                    {
+                        page.AsSpan(0, copyLen).CopyTo(full.AsSpan(pageBase, copyLen));
+                    }
+                }
+            }
+        }
+
+        _denseInt = full;
+        _intPages = null;
+        _backingInitialized = true;
+        return full;
+    }
+
+    internal string[] EnsureContiguousStrArray()
+    {
+        if (_backingInitialized && _denseStr is not null && _denseStr.Length == TotalLength)
+        {
+            for (int i = 0; i < _denseStr.Length; i++)
+            {
+                _denseStr[i] ??= string.Empty;
+            }
+
+            return _denseStr!;
+        }
+
+        var full = new string[TotalLength];
+        Array.Fill(full, string.Empty);
+        if (!_backingInitialized)
+        {
+            if (InitialStrValues is { Length: > 0 } init)
+            {
+                int n = Math.Min(init.Length, full.Length);
+                for (int i = 0; i < n; i++)
+                {
+                    full[i] = init[i] ?? string.Empty;
+                }
+            }
+        }
+        else if (_denseStr is not null)
+        {
+            int n = Math.Min(_denseStr.Length, full.Length);
+            for (int i = 0; i < n; i++)
+            {
+                full[i] = _denseStr[i] ?? string.Empty;
+            }
+        }
+        else if (_strPages is not null)
+        {
+            for (int p = 0; p < _strPages.Length; p++)
+            {
+                string?[]? page = _strPages[p];
+                if (page is not null)
+                {
+                    int pageBase = p << PageShift;
+                    int copyLen = Math.Min(page.Length, full.Length - pageBase);
+                    for (int o = 0; o < copyLen; o++)
+                    {
+                        full[pageBase + o] = page[o] ?? string.Empty;
+                    }
+                }
+            }
+        }
+
+        _denseStr = full;
+        _strPages = null;
+        _backingInitialized = true;
+        return full;
+    }
+
+    private void AllocateIntBackingForIndex(int flat)
+    {
+        if (TotalLength <= PagedThreshold)
+        {
+            _denseInt = new long[ComputeInitialCapacity(flat, TotalLength)];
+        }
+        else
+        {
+            _intPages = new long[(TotalLength + PageSize - 1) >> PageShift][];
+        }
+    }
+
+    private void AllocateStrBackingForIndex(int flat)
+    {
+        if (TotalLength <= PagedThreshold)
+        {
+            _denseStr = new string?[ComputeInitialCapacity(flat, TotalLength)];
+        }
+        else
+        {
+            _strPages = new string?[(TotalLength + PageSize - 1) >> PageShift][];
+        }
+    }
+
+    private void SeedInitialInts(long[] init, int targetFlat)
+    {
+        int n = Math.Min(init.Length, TotalLength);
+        if (TotalLength <= PagedThreshold)
+        {
+            int cap = ComputeInitialCapacity(Math.Max(targetFlat, n - 1), TotalLength);
+            _denseInt = new long[cap];
+            init.AsSpan(0, n).CopyTo(_denseInt);
+            return;
+        }
+
+        _intPages = new long[(TotalLength + PageSize - 1) >> PageShift][];
+        for (int i = 0; i < n; i++)
+        {
+            long v = init[i];
+            if (v == 0L) continue;
+            int pIdx = i >> PageShift;
+            int pageLen = Math.Min(PageSize, TotalLength - (pIdx << PageShift));
+            long[] page = _intPages[pIdx] ?? (_intPages[pIdx] = new long[pageLen]);
+            page[i & PageMask] = v;
+        }
+    }
+
+    private void SeedInitialStrs(string[] init, int targetFlat)
+    {
+        int n = Math.Min(init.Length, TotalLength);
+        if (TotalLength <= PagedThreshold)
+        {
+            int cap = ComputeInitialCapacity(Math.Max(targetFlat, n - 1), TotalLength);
+            _denseStr = new string?[cap];
+            for (int i = 0; i < n; i++)
+            {
+                string? s = init[i];
+                _denseStr[i] = string.IsNullOrEmpty(s) ? null : s;
+            }
+
+            return;
+        }
+
+        _strPages = new string?[(TotalLength + PageSize - 1) >> PageShift][];
+        for (int i = 0; i < n; i++)
+        {
+            string? s = init[i];
+            if (string.IsNullOrEmpty(s)) continue;
+            int pIdx = i >> PageShift;
+            int pageLen = Math.Min(PageSize, TotalLength - (pIdx << PageShift));
+            string?[] page = _strPages[pIdx] ?? (_strPages[pIdx] = new string?[pageLen]);
+            page[i & PageMask] = s;
+        }
+    }
+
+    private void EnsureDenseIntCapacity(int maxIndex)
+    {
+        if (!_backingInitialized)
+        {
+            _backingInitialized = true;
+            if (InitialIntValues is { Length: > 0 } init)
+            {
+                SeedInitialInts(init, maxIndex);
+                if (_denseInt is not null && maxIndex >= _denseInt.Length)
+                {
+                    GrowDenseInt(maxIndex);
+                }
+
+                return;
+            }
+
+            _denseInt = new long[ComputeInitialCapacity(maxIndex, TotalLength)];
+            return;
+        }
+
+        if (_denseInt is null)
+        {
+            _denseInt = new long[ComputeInitialCapacity(maxIndex, TotalLength)];
+        }
+        else if (maxIndex >= _denseInt.Length)
+        {
+            GrowDenseInt(maxIndex);
+        }
+    }
+
+    private void EnsureDenseStrCapacity(int maxIndex)
+    {
+        if (!_backingInitialized)
+        {
+            _backingInitialized = true;
+            if (InitialStrValues is { Length: > 0 } init)
+            {
+                SeedInitialStrs(init, maxIndex);
+                if (_denseStr is not null && maxIndex >= _denseStr.Length)
+                {
+                    GrowDenseStr(maxIndex);
+                }
+
+                return;
+            }
+
+            _denseStr = new string?[ComputeInitialCapacity(maxIndex, TotalLength)];
+            return;
+        }
+
+        if (_denseStr is null)
+        {
+            _denseStr = new string?[ComputeInitialCapacity(maxIndex, TotalLength)];
+        }
+        else if (maxIndex >= _denseStr.Length)
+        {
+            GrowDenseStr(maxIndex);
+        }
+    }
+
+    private void GrowDenseInt(int requiredIndex)
+    {
+        int nextCap = ComputeGrowCapacity(_denseInt!.Length, requiredIndex, TotalLength);
+        Array.Resize(ref _denseInt, nextCap);
+    }
+
+    private void GrowDenseStr(int requiredIndex)
+    {
+        int nextCap = ComputeGrowCapacity(_denseStr!.Length, requiredIndex, TotalLength);
+        Array.Resize(ref _denseStr, nextCap);
+    }
+
+    private static int ComputeInitialCapacity(int flat, int totalLength)
+    {
+        if (totalLength <= 16)
+        {
+            return totalLength;
+        }
+
+        int cap = 16;
+        int target = flat + 1;
+        while (cap < target && cap < totalLength)
+        {
+            cap <<= 1;
+        }
+
+        return Math.Min(cap, totalLength);
+    }
+
+    private static int ComputeGrowCapacity(int currentLength, int requiredIndex, int totalLength)
+    {
+        int cap = Math.Max(16, currentLength);
+        int target = requiredIndex + 1;
+        while (cap < target && cap < totalLength)
+        {
+            cap <<= 1;
+        }
+
+        return Math.Min(cap, totalLength);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int ComputeFlatIndex(ReadOnlySpan<long> indices)
@@ -168,10 +1170,15 @@ public sealed class EngineSaveSlotSnapshot
 /// </summary>
 public sealed class VariableStore : IVariableStore
 {
-    private VariableSlotStorage?[] _slots = new VariableSlotStorage?[512];
+    private const int HotSlotCapacity = 4096;
+
+    private readonly BytecodeModule? _module;
+    private readonly VariableSlotStorage?[] _hotSlots = new VariableSlotStorage?[HotSlotCapacity];
+    private readonly Dictionary<int, VariableSlotStorage> _coldSlots = [];
     private int _maxSlotId = -1;
 
-    private readonly Dictionary<string, int> _nameToSlot;
+    // Only stores slots NOT present in _module (built-in fallbacks & runtime dynamic LOCAL@FUNC slots).
+    private readonly Dictionary<string, int> _localNameToSlot;
     private readonly Dictionary<(string VarName, int Dim), Dictionary<string, long>> _erdNameToIndex;
     private readonly Dictionary<(string VarName, int Dim), Dictionary<long, string>> _erdIndexToName = [];
     private readonly Dictionary<string, CsvNameTable> _csvNameTables;
@@ -244,11 +1251,12 @@ public sealed class VariableStore : IVariableStore
         Action<int, int>? slotProgressCallback,
         CancellationToken cancellationToken)
     {
+        _module = module;
         _compilerOptions = module?.CompilerOptions ?? CompilerOptions.Default;
         _replaceConfig = module?.ReplaceConfig ?? ReplaceConfiguration.Default;
         _identComparer = _compilerOptions.IgnoreCase ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
-        _nameToSlot = new Dictionary<string, int>(_identComparer);
+        _localNameToSlot = new Dictionary<string, int>(_identComparer);
         _erdNameToIndex = new Dictionary<(string, int), Dictionary<string, long>>();
         _csvNameTables = new Dictionary<string, CsvNameTable>(StringComparer.OrdinalIgnoreCase);
 
@@ -277,7 +1285,24 @@ public sealed class VariableStore : IVariableStore
     public ReplaceConfiguration ReplaceConfig => _replaceConfig;
     public GameBaseData GameBase => _gameBase;
     public int SlotCount => _maxSlotId + 1;
-    public IEnumerable<string> VariableNames => _nameToSlot.Keys;
+    public int MaterializedSlotCount
+    {
+        get
+        {
+            int count = _coldSlots.Count;
+            for (int i = 0; i < _hotSlots.Length; i++)
+            {
+                if (_hotSlots[i] is not null) count++;
+            }
+
+            return count;
+        }
+    }
+
+    public IEnumerable<string> VariableNames =>
+        _module is null
+            ? _localNameToSlot.Keys
+            : _module.StaticVariableNames.Concat(_localNameToSlot.Keys);
 
     // Runtime calculated state hooks
     public long ContextLineCount { get; set; }
@@ -411,7 +1436,7 @@ public sealed class VariableStore : IVariableStore
             SetCsvNameTable(tableKey, table);
         }
 
-        // Populate ITEMPRICE
+        // Populate ITEMPRICE (store compactly in InitialIntValues without forcing full 1M dense allocation)
         if (ItemPriceSlotId >= 0 && gameData.ItemPrices.Count > 0)
         {
             VariableSlotStorage priceSlot = GetSlotOrThrow(ItemPriceSlotId);
@@ -420,15 +1445,13 @@ public sealed class VariableStore : IVariableStore
                 ResizeSlotStorage(priceSlot, [gameData.ItemPrices.Count]);
             }
 
-            Span<long> dst = priceSlot.IntData.AsSpan();
-            dst.Clear();
-            int n = Math.Min(dst.Length, gameData.ItemPrices.Count);
-            for (int i = 0; i < n; i++)
+            long[] prices = new long[gameData.ItemPrices.Count];
+            for (int i = 0; i < prices.Length; i++)
             {
-                dst[i] = gameData.ItemPrices[i];
+                prices[i] = gameData.ItemPrices[i];
             }
 
-            priceSlot.InitialIntValues = priceSlot.IntData!.ToArray();
+            priceSlot.ApplyInitialIntValues(prices);
         }
 
         // Populate ERD definitions
@@ -484,6 +1507,19 @@ public sealed class VariableStore : IVariableStore
             ? upperKey
             : upperKey + "NAME";
 
+        string[]? compactNames = null;
+        string[] BuildCompactNames()
+        {
+            if (compactNames is not null) return compactNames;
+            compactNames = new string[table.Length];
+            for (int i = 0; i < table.Length; i++)
+            {
+                compactNames[i] = table[i] ?? string.Empty;
+            }
+
+            return compactNames;
+        }
+
         if (TryResolveSlot(targetVarName, out int nameSlotId))
         {
             VariableSlotStorage slot = GetSlotOrThrow(nameSlotId);
@@ -492,14 +1528,7 @@ public sealed class VariableStore : IVariableStore
                 ResizeSlotStorage(slot, [table.Length]);
             }
 
-            Span<string> dst = slot.StrData.AsSpan();
-            Array.Fill(slot.StrData!, string.Empty);
-            for (int i = 0; i < Math.Min(dst.Length, table.Length); i++)
-            {
-                dst[i] = table[i];
-            }
-
-            slot.InitialStrValues = slot.StrData!.ToArray();
+            slot.ApplyInitialStrValues(BuildCompactNames());
         }
 
         // Str.csv also initializes writable STR:0..N!
@@ -511,13 +1540,7 @@ public sealed class VariableStore : IVariableStore
                 ResizeSlotStorage(strSlot, [table.Length]);
             }
 
-            Span<string> dst = strSlot.StrData.AsSpan();
-            for (int i = 0; i < Math.Min(dst.Length, table.Length); i++)
-            {
-                dst[i] = table[i];
-            }
-
-            strSlot.InitialStrValues = strSlot.StrData!.ToArray();
+            strSlot.ApplyInitialStrValues(BuildCompactNames());
         }
     }
 
@@ -559,7 +1582,18 @@ public sealed class VariableStore : IVariableStore
             return false;
         }
 
-        return _nameToSlot.TryGetValue(name, out slotId);
+        if (_localNameToSlot.TryGetValue(name, out slotId))
+        {
+            return true;
+        }
+
+        if (_module is not null && _module.TryResolveStaticSlotId(name, out slotId))
+        {
+            return true;
+        }
+
+        slotId = -1;
+        return false;
     }
 
     public bool TryResolveSlot(string name, out int slotId)
@@ -570,7 +1604,7 @@ public sealed class VariableStore : IVariableStore
             return false;
         }
 
-        if (_nameToSlot.TryGetValue(name, out slotId))
+        if (TryResolveExistingSlot(name, out slotId))
         {
             return true;
         }
@@ -599,17 +1633,100 @@ public sealed class VariableStore : IVariableStore
         return false;
     }
 
-    public VariableSlotStorage? TryGetSlot(int slotId) =>
-        (uint)slotId < (uint)_slots.Length ? _slots[slotId] : null;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public VariableSlotStorage? TryGetMaterializedSlot(int slotId)
+    {
+        if ((uint)slotId < HotSlotCapacity)
+        {
+            return _hotSlots[slotId];
+        }
+
+        return _coldSlots.TryGetValue(slotId, out VariableSlotStorage? slot) ? slot : null;
+    }
+
+    public VariableSlotStorage? TryGetSlot(int slotId)
+    {
+        if (TryGetMaterializedSlot(slotId) is { } existing)
+        {
+            return existing;
+        }
+
+        if (_module?.TryGetStaticDescriptor(slotId) is { } desc)
+        {
+            return MaterializeDescriptorSlot(desc);
+        }
+
+        return null;
+    }
 
     public VariableSlotStorage GetSlotOrThrow(int slotId) =>
-        (uint)slotId < (uint)_slots.Length && _slots[slotId] is VariableSlotStorage s
-            ? s
-            : throw new KeyNotFoundException($"Unknown variable slot ID {slotId}.");
+        TryGetSlot(slotId)
+        ?? throw new KeyNotFoundException($"Unknown variable slot ID {slotId}.");
+
+    internal int GetSlotDimension0(int slotId)
+    {
+        if (TryGetMaterializedSlot(slotId) is { } existing)
+        {
+            return existing.Dim0;
+        }
+
+        if (_module?.TryGetStaticDescriptor(slotId) is { } desc)
+        {
+            return desc.Dimensions.Length >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        }
+
+        return 0;
+    }
+
+    internal void TryClearMaterializedSlotByName(string name)
+    {
+        if (TryResolveExistingSlot(name, out int slotId) && TryGetMaterializedSlot(slotId) is { } slot)
+        {
+            slot.ClearToZeroOrEmpty();
+        }
+    }
+
+    internal IEnumerable<VariableSlotStorage> EnumerateMaterializedSlots()
+    {
+        for (int i = 0; i < _hotSlots.Length; i++)
+        {
+            if (_hotSlots[i] is { } slot)
+            {
+                yield return slot;
+            }
+        }
+
+        foreach (VariableSlotStorage slot in _coldSlots.Values)
+        {
+            yield return slot;
+        }
+    }
+
+    internal IEnumerable<VariableSlotStorage> EnumerateSaveableSlots(bool wantGlobal)
+    {
+        foreach (VariableSlotStorage slot in EnumerateMaterializedSlots())
+        {
+            if (slot.IsConst || slot.IsCharaData || slot.CalcKind != BuiltinCalcKind.None)
+            {
+                continue;
+            }
+
+            bool include = wantGlobal ? slot.IsGlobal : (!slot.IsGlobal && slot.IsSavedata);
+            if (include && slot.FindLastNonDefaultIndex() >= 0)
+            {
+                yield return slot;
+            }
+        }
+    }
 
     public long GetInt(int slotId, ReadOnlySpan<long> indices = default)
     {
-        VariableSlotStorage slot = GetSlotOrThrow(slotId);
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedInt(slotId, indices);
+        }
+
         if (slot.ValueKind != VariableValueKind.Int)
         {
             throw new InvalidOperationException($"Variable '{slot.Name}' is not an integer variable.");
@@ -627,12 +1744,18 @@ public sealed class VariableStore : IVariableStore
         }
 
         int flat = slot.ComputeFlatIndex(indices);
-        return slot.IntData![flat];
+        return slot.ReadIntFlat(flat);
     }
 
     public void SetInt(int slotId, long value, ReadOnlySpan<long> indices = default)
     {
-        VariableSlotStorage slot = GetSlotOrThrow(slotId);
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedInt(slotId, value, indices);
+            return;
+        }
+
         if (slot.ValueKind != VariableValueKind.Int)
         {
             throw new InvalidOperationException($"Variable '{slot.Name}' is not an integer variable.");
@@ -656,12 +1779,17 @@ public sealed class VariableStore : IVariableStore
         }
 
         int flat = slot.ComputeFlatIndex(indices);
-        slot.IntData![flat] = value;
+        slot.WriteIntFlat(flat, value);
     }
 
     public string GetStr(int slotId, ReadOnlySpan<long> indices = default)
     {
-        VariableSlotStorage slot = GetSlotOrThrow(slotId);
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedStr(slotId, indices);
+        }
+
         if (slot.ValueKind != VariableValueKind.Str)
         {
             throw new InvalidOperationException($"Variable '{slot.Name}' is not a string variable.");
@@ -679,12 +1807,18 @@ public sealed class VariableStore : IVariableStore
         }
 
         int flat = slot.ComputeFlatIndex(indices);
-        return slot.StrData![flat];
+        return slot.ReadStrFlat(flat);
     }
 
     public void SetStr(int slotId, string value, ReadOnlySpan<long> indices = default)
     {
-        VariableSlotStorage slot = GetSlotOrThrow(slotId);
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedStr(slotId, value, indices);
+            return;
+        }
+
         if (slot.ValueKind != VariableValueKind.Str)
         {
             throw new InvalidOperationException($"Variable '{slot.Name}' is not a string variable.");
@@ -714,7 +1848,7 @@ public sealed class VariableStore : IVariableStore
         }
 
         int flat = slot.ComputeFlatIndex(indices);
-        slot.StrData![flat] = value ?? string.Empty;
+        slot.WriteStrFlat(flat, value);
     }
 
     public long GetInt(string name, params ReadOnlySpan<long> indices) =>
@@ -748,13 +1882,18 @@ public sealed class VariableStore : IVariableStore
     }
 
     // -------------------------------------------------------------------------
-    // Ultra-Fast Inline VM Direct Slot Accessors (0 Allocation, 0 Span Wrapping)
+    // Ultra-Fast Inline VM Direct Slot Accessors (Lazy Zero-Allocation on Unwritten Slots)
     // -------------------------------------------------------------------------
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public long GetInt0D(int slotId)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedInt0D(slotId);
+        }
+
         if (slot.CalcKind != BuiltinCalcKind.None)
         {
             return EvaluateCalcInt(slot.CalcKind, default);
@@ -765,13 +1904,19 @@ public sealed class VariableStore : IVariableStore
             return _characters.GetInt0D(ResolveImplicitTargetIndex(), slotId);
         }
 
-        return slot.IntData![0];
+        return slot.ReadIntFlat(0);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetInt0D(int slotId, long value)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedInt0D(slotId, value);
+            return;
+        }
+
         if (slot.IsConst || slot.IsReadOnly)
         {
             ThrowReadOnly(slot.Name);
@@ -783,13 +1928,18 @@ public sealed class VariableStore : IVariableStore
             return;
         }
 
-        slot.IntData![0] = value;
+        slot.WriteIntFlat(0, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public long GetInt1D(int slotId, long idx0)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedInt1D(slotId, idx0);
+        }
+
         if (slot.CalcKind != BuiltinCalcKind.None)
         {
             ReadOnlySpan<long> one = new(in idx0);
@@ -806,13 +1956,19 @@ public sealed class VariableStore : IVariableStore
             return _characters.GetInt1D(ResolveImplicitTargetIndex(), slotId, idx0);
         }
 
-        return slot.IntData![slot.ComputeFlatIndex1D(idx0)];
+        return slot.ReadIntFlat(slot.ComputeFlatIndex1D(idx0));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetInt1D(int slotId, long idx0, long value)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedInt1D(slotId, idx0, value);
+            return;
+        }
+
         if (slot.IsConst || slot.IsReadOnly)
         {
             ThrowReadOnly(slot.Name);
@@ -830,25 +1986,36 @@ public sealed class VariableStore : IVariableStore
             return;
         }
 
-        slot.IntData![slot.ComputeFlatIndex1D(idx0)] = value;
+        slot.WriteIntFlat(slot.ComputeFlatIndex1D(idx0), value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public long GetInt2D(int slotId, long idx0, long idx1)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedInt2D(slotId, idx0, idx1);
+        }
+
         if (slot.IsCharaData)
         {
             return _characters.GetInt1D(checked((int)idx0), slotId, idx1);
         }
 
-        return slot.IntData![slot.ComputeFlatIndex2D(idx0, idx1)];
+        return slot.ReadIntFlat(slot.ComputeFlatIndex2D(idx0, idx1));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetInt2D(int slotId, long idx0, long idx1, long value)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedInt2D(slotId, idx0, idx1, value);
+            return;
+        }
+
         if (slot.IsConst || slot.IsReadOnly)
         {
             ThrowReadOnly(slot.Name);
@@ -860,25 +2027,36 @@ public sealed class VariableStore : IVariableStore
             return;
         }
 
-        slot.IntData![slot.ComputeFlatIndex2D(idx0, idx1)] = value;
+        slot.WriteIntFlat(slot.ComputeFlatIndex2D(idx0, idx1), value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public long GetInt3D(int slotId, long idx0, long idx1, long idx2)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedInt3D(slotId, idx0, idx1, idx2);
+        }
+
         if (slot.IsCharaData)
         {
             return _characters.GetInt2D(checked((int)idx0), slotId, idx1, idx2);
         }
 
-        return slot.IntData![slot.ComputeFlatIndex3D(idx0, idx1, idx2)];
+        return slot.ReadIntFlat(slot.ComputeFlatIndex3D(idx0, idx1, idx2));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetInt3D(int slotId, long idx0, long idx1, long idx2, long value)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedInt3D(slotId, idx0, idx1, idx2, value);
+            return;
+        }
+
         if (slot.IsConst || slot.IsReadOnly)
         {
             ThrowReadOnly(slot.Name);
@@ -890,13 +2068,18 @@ public sealed class VariableStore : IVariableStore
             return;
         }
 
-        slot.IntData![slot.ComputeFlatIndex3D(idx0, idx1, idx2)] = value;
+        slot.WriteIntFlat(slot.ComputeFlatIndex3D(idx0, idx1, idx2), value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetStr0D(int slotId)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedStr0D(slotId);
+        }
+
         if (slot.CalcKind != BuiltinCalcKind.None)
         {
             return EvaluateCalcStr(slot.CalcKind);
@@ -907,13 +2090,19 @@ public sealed class VariableStore : IVariableStore
             return _characters.GetStr0D(ResolveImplicitTargetIndex(), slotId);
         }
 
-        return slot.StrData![0];
+        return slot.ReadStrFlat(0);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetStr0D(int slotId, string value)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedStr0D(slotId, value);
+            return;
+        }
+
         if (slot.CalcKind == BuiltinCalcKind.WindowTitle)
         {
             WindowTitle = value ?? string.Empty;
@@ -931,13 +2120,18 @@ public sealed class VariableStore : IVariableStore
             return;
         }
 
-        slot.StrData![0] = value ?? string.Empty;
+        slot.WriteStrFlat(0, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetStr1D(int slotId, long idx0)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedStr1D(slotId, idx0);
+        }
+
         if (slot.CalcKind != BuiltinCalcKind.None)
         {
             return EvaluateCalcStr(slot.CalcKind);
@@ -953,13 +2147,19 @@ public sealed class VariableStore : IVariableStore
             return _characters.GetStr1D(ResolveImplicitTargetIndex(), slotId, idx0);
         }
 
-        return slot.StrData![slot.ComputeFlatIndex1D(idx0)];
+        return slot.ReadStrFlat(slot.ComputeFlatIndex1D(idx0));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetStr1D(int slotId, long idx0, string value)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedStr1D(slotId, idx0, value);
+            return;
+        }
+
         if (slot.CalcKind == BuiltinCalcKind.WindowTitle)
         {
             WindowTitle = value ?? string.Empty;
@@ -983,25 +2183,36 @@ public sealed class VariableStore : IVariableStore
             return;
         }
 
-        slot.StrData![slot.ComputeFlatIndex1D(idx0)] = value ?? string.Empty;
+        slot.WriteStrFlat(slot.ComputeFlatIndex1D(idx0), value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetStr2D(int slotId, long idx0, long idx1)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedStr2D(slotId, idx0, idx1);
+        }
+
         if (slot.IsCharaData)
         {
             return _characters.GetStr1D(checked((int)idx0), slotId, idx1);
         }
 
-        return slot.StrData![slot.ComputeFlatIndex2D(idx0, idx1)];
+        return slot.ReadStrFlat(slot.ComputeFlatIndex2D(idx0, idx1));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetStr2D(int slotId, long idx0, long idx1, string value)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedStr2D(slotId, idx0, idx1, value);
+            return;
+        }
+
         if (slot.IsConst || slot.IsReadOnly)
         {
             ThrowReadOnly(slot.Name);
@@ -1013,25 +2224,36 @@ public sealed class VariableStore : IVariableStore
             return;
         }
 
-        slot.StrData![slot.ComputeFlatIndex2D(idx0, idx1)] = value ?? string.Empty;
+        slot.WriteStrFlat(slot.ComputeFlatIndex2D(idx0, idx1), value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetStr3D(int slotId, long idx0, long idx1, long idx2)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            return ReadUnmaterializedStr3D(slotId, idx0, idx1, idx2);
+        }
+
         if (slot.IsCharaData)
         {
             return _characters.GetStr2D(checked((int)idx0), slotId, idx1, idx2);
         }
 
-        return slot.StrData![slot.ComputeFlatIndex3D(idx0, idx1, idx2)];
+        return slot.ReadStrFlat(slot.ComputeFlatIndex3D(idx0, idx1, idx2));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetStr3D(int slotId, long idx0, long idx1, long idx2, string value)
     {
-        VariableSlotStorage slot = _slots[slotId]!;
+        VariableSlotStorage? slot = TryGetMaterializedSlot(slotId);
+        if (slot is null)
+        {
+            WriteUnmaterializedStr3D(slotId, idx0, idx1, idx2, value);
+            return;
+        }
+
         if (slot.IsConst || slot.IsReadOnly)
         {
             ThrowReadOnly(slot.Name);
@@ -1043,29 +2265,447 @@ public sealed class VariableStore : IVariableStore
             return;
         }
 
-        slot.StrData![slot.ComputeFlatIndex3D(idx0, idx1, idx2)] = value ?? string.Empty;
+        slot.WriteStrFlat(slot.ComputeFlatIndex3D(idx0, idx1, idx2), value);
     }
 
     public Span<long> GetIntSpan(int slotId)
     {
         VariableSlotStorage slot = GetSlotOrThrow(slotId);
-        if (slot.ValueKind != VariableValueKind.Int || slot.IntData is null)
+        if (slot.ValueKind != VariableValueKind.Int || slot.IsCharaData || slot.CalcKind != BuiltinCalcKind.None)
         {
             throw new InvalidOperationException($"Slot '{slot.Name}' does not have a contiguous global Int64 backing array.");
         }
 
-        return slot.IntData.AsSpan();
+        return slot.EnsureContiguousIntArray().AsSpan();
     }
 
     public Span<string> GetStrSpan(int slotId)
     {
         VariableSlotStorage slot = GetSlotOrThrow(slotId);
-        if (slot.ValueKind != VariableValueKind.Str || slot.StrData is null)
+        if (slot.ValueKind != VariableValueKind.Str || slot.IsCharaData || slot.CalcKind != BuiltinCalcKind.None)
         {
             throw new InvalidOperationException($"Slot '{slot.Name}' does not have a contiguous global String backing array.");
         }
 
-        return slot.StrData.AsSpan();
+        return slot.EnsureContiguousStrArray().AsSpan();
+    }
+
+    private VariableSlotDescriptor GetStaticDescriptorOrThrow(int slotId) =>
+        _module?.TryGetStaticDescriptor(slotId)
+        ?? throw new KeyNotFoundException($"Unknown variable slot ID {slotId}.");
+
+    private static int ComputeDescriptorFlatIndex(VariableSlotDescriptor desc, ReadOnlySpan<long> indices)
+    {
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+
+        return indices.Length switch
+        {
+            0 => 0,
+            1 => ComputeDescriptorFlat1D(desc.Name, rank, d0, d1, d2, indices[0]),
+            2 => ComputeDescriptorFlat2D(desc.Name, d0, d1, d2, indices[0], indices[1]),
+            3 => ComputeDescriptorFlat3D(desc.Name, d0, d1, d2, indices[0], indices[1], indices[2]),
+            _ => throw new ArgumentOutOfRangeException(nameof(indices), $"Too many indices for variable '{desc.Name}'."),
+        };
+    }
+
+    private static int ComputeDescriptorFlat1D(string name, int rank, int d0, int d1, int d2, long idx0)
+    {
+        if (rank == 0)
+        {
+            if (idx0 == 0) return 0;
+            throw new IndexOutOfRangeException($"Index {idx0} is out of bounds [0..{d0}) for variable '{name}'.");
+        }
+
+        if ((ulong)idx0 >= (ulong)d0)
+        {
+            throw new IndexOutOfRangeException($"Index {idx0} is out of bounds [0..{d0}) for variable '{name}'.");
+        }
+
+        return (int)idx0 * d1 * d2;
+    }
+
+    private static int ComputeDescriptorFlat2D(string name, int d0, int d1, int d2, long idx0, long idx1)
+    {
+        if ((ulong)idx0 >= (ulong)d0 || (ulong)idx1 >= (ulong)d1)
+        {
+            throw new IndexOutOfRangeException($"Index ({idx0}, {idx1}) is out of bounds ({d0}, {d1}) for variable '{name}'.");
+        }
+
+        return (((int)idx0 * d1) + (int)idx1) * d2;
+    }
+
+    private static int ComputeDescriptorFlat3D(string name, int d0, int d1, int d2, long idx0, long idx1, long idx2)
+    {
+        if ((ulong)idx0 >= (ulong)d0 || (ulong)idx1 >= (ulong)d1 || (ulong)idx2 >= (ulong)d2)
+        {
+            throw new IndexOutOfRangeException($"Index ({idx0}, {idx1}, {idx2}) is out of bounds ({d0}, {d1}, {d2}) for variable '{name}'.");
+        }
+
+        return ((((int)idx0 * d1) + (int)idx1) * d2) + (int)idx2;
+    }
+
+    private long ReadUnmaterializedInt(int slotId, ReadOnlySpan<long> indices)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.ValueKind != VariableValueKind.Int)
+        {
+            throw new InvalidOperationException($"Variable '{desc.Name}' is not an integer variable.");
+        }
+
+        int flat = ComputeDescriptorFlatIndex(desc, indices);
+        return !desc.DefaultIntValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultIntValues.Length
+            ? desc.DefaultIntValues[flat]
+            : 0L;
+    }
+
+    private long ReadUnmaterializedInt0D(int slotId)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        return !desc.DefaultIntValues.IsDefaultOrEmpty ? desc.DefaultIntValues[0] : 0L;
+    }
+
+    private long ReadUnmaterializedInt1D(int slotId, long idx0)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat1D(desc.Name, rank, d0, d1, d2, idx0);
+        return !desc.DefaultIntValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultIntValues.Length
+            ? desc.DefaultIntValues[flat]
+            : 0L;
+    }
+
+    private long ReadUnmaterializedInt2D(int slotId, long idx0, long idx1)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat2D(desc.Name, d0, d1, d2, idx0, idx1);
+        return !desc.DefaultIntValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultIntValues.Length
+            ? desc.DefaultIntValues[flat]
+            : 0L;
+    }
+
+    private long ReadUnmaterializedInt3D(int slotId, long idx0, long idx1, long idx2)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat3D(desc.Name, d0, d1, d2, idx0, idx1, idx2);
+        return !desc.DefaultIntValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultIntValues.Length
+            ? desc.DefaultIntValues[flat]
+            : 0L;
+    }
+
+    private void WriteUnmaterializedInt(int slotId, long value, ReadOnlySpan<long> indices)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.ValueKind != VariableValueKind.Int)
+        {
+            throw new InvalidOperationException($"Variable '{desc.Name}' is not an integer variable.");
+        }
+
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        int flat = ComputeDescriptorFlatIndex(desc, indices);
+        long def = !desc.DefaultIntValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultIntValues.Length
+            ? desc.DefaultIntValues[flat]
+            : 0L;
+        if (value == def)
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteIntFlat(flat, value);
+    }
+
+    private void WriteUnmaterializedInt0D(int slotId, long value)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        long def = !desc.DefaultIntValues.IsDefaultOrEmpty ? desc.DefaultIntValues[0] : 0L;
+        if (value == def)
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteIntFlat(0, value);
+    }
+
+    private void WriteUnmaterializedInt1D(int slotId, long idx0, long value)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat1D(desc.Name, rank, d0, d1, d2, idx0);
+        long def = !desc.DefaultIntValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultIntValues.Length
+            ? desc.DefaultIntValues[flat]
+            : 0L;
+        if (value == def)
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteIntFlat(flat, value);
+    }
+
+    private void WriteUnmaterializedInt2D(int slotId, long idx0, long idx1, long value)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat2D(desc.Name, d0, d1, d2, idx0, idx1);
+        long def = !desc.DefaultIntValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultIntValues.Length
+            ? desc.DefaultIntValues[flat]
+            : 0L;
+        if (value == def)
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteIntFlat(flat, value);
+    }
+
+    private void WriteUnmaterializedInt3D(int slotId, long idx0, long idx1, long idx2, long value)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat3D(desc.Name, d0, d1, d2, idx0, idx1, idx2);
+        long def = !desc.DefaultIntValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultIntValues.Length
+            ? desc.DefaultIntValues[flat]
+            : 0L;
+        if (value == def)
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteIntFlat(flat, value);
+    }
+
+    private string ReadUnmaterializedStr(int slotId, ReadOnlySpan<long> indices)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.ValueKind != VariableValueKind.Str)
+        {
+            throw new InvalidOperationException($"Variable '{desc.Name}' is not a string variable.");
+        }
+
+        int flat = ComputeDescriptorFlatIndex(desc, indices);
+        return !desc.DefaultStrValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultStrValues.Length
+            ? (desc.DefaultStrValues[flat] ?? string.Empty)
+            : string.Empty;
+    }
+
+    private string ReadUnmaterializedStr0D(int slotId)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        return !desc.DefaultStrValues.IsDefaultOrEmpty ? (desc.DefaultStrValues[0] ?? string.Empty) : string.Empty;
+    }
+
+    private string ReadUnmaterializedStr1D(int slotId, long idx0)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat1D(desc.Name, rank, d0, d1, d2, idx0);
+        return !desc.DefaultStrValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultStrValues.Length
+            ? (desc.DefaultStrValues[flat] ?? string.Empty)
+            : string.Empty;
+    }
+
+    private string ReadUnmaterializedStr2D(int slotId, long idx0, long idx1)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat2D(desc.Name, d0, d1, d2, idx0, idx1);
+        return !desc.DefaultStrValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultStrValues.Length
+            ? (desc.DefaultStrValues[flat] ?? string.Empty)
+            : string.Empty;
+    }
+
+    private string ReadUnmaterializedStr3D(int slotId, long idx0, long idx1, long idx2)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat3D(desc.Name, d0, d1, d2, idx0, idx1, idx2);
+        return !desc.DefaultStrValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultStrValues.Length
+            ? (desc.DefaultStrValues[flat] ?? string.Empty)
+            : string.Empty;
+    }
+
+    private void WriteUnmaterializedStr(int slotId, string? value, ReadOnlySpan<long> indices)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.ValueKind != VariableValueKind.Str)
+        {
+            throw new InvalidOperationException($"Variable '{desc.Name}' is not a string variable.");
+        }
+
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        int flat = ComputeDescriptorFlatIndex(desc, indices);
+        string norm = value ?? string.Empty;
+        string def = !desc.DefaultStrValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultStrValues.Length
+            ? (desc.DefaultStrValues[flat] ?? string.Empty)
+            : string.Empty;
+        if (string.Equals(norm, def, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteStrFlat(flat, norm);
+    }
+
+    private void WriteUnmaterializedStr0D(int slotId, string? value)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        string norm = value ?? string.Empty;
+        string def = !desc.DefaultStrValues.IsDefaultOrEmpty ? (desc.DefaultStrValues[0] ?? string.Empty) : string.Empty;
+        if (string.Equals(norm, def, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteStrFlat(0, norm);
+    }
+
+    private void WriteUnmaterializedStr1D(int slotId, long idx0, string? value)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat1D(desc.Name, rank, d0, d1, d2, idx0);
+        string norm = value ?? string.Empty;
+        string def = !desc.DefaultStrValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultStrValues.Length
+            ? (desc.DefaultStrValues[flat] ?? string.Empty)
+            : string.Empty;
+        if (string.Equals(norm, def, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteStrFlat(flat, norm);
+    }
+
+    private void WriteUnmaterializedStr2D(int slotId, long idx0, long idx1, string? value)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat2D(desc.Name, d0, d1, d2, idx0, idx1);
+        string norm = value ?? string.Empty;
+        string def = !desc.DefaultStrValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultStrValues.Length
+            ? (desc.DefaultStrValues[flat] ?? string.Empty)
+            : string.Empty;
+        if (string.Equals(norm, def, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteStrFlat(flat, norm);
+    }
+
+    private void WriteUnmaterializedStr3D(int slotId, long idx0, long idx1, long idx2, string? value)
+    {
+        VariableSlotDescriptor desc = GetStaticDescriptorOrThrow(slotId);
+        if (desc.IsConst)
+        {
+            ThrowReadOnly(desc.Name);
+        }
+
+        int rank = desc.Dimensions.Length;
+        int d0 = rank >= 1 ? Math.Max(1, desc.Dimensions[0]) : 1;
+        int d1 = rank >= 2 ? Math.Max(1, desc.Dimensions[1]) : 1;
+        int d2 = rank >= 3 ? Math.Max(1, desc.Dimensions[2]) : 1;
+        int flat = ComputeDescriptorFlat3D(desc.Name, d0, d1, d2, idx0, idx1, idx2);
+        string norm = value ?? string.Empty;
+        string def = !desc.DefaultStrValues.IsDefaultOrEmpty && (uint)flat < (uint)desc.DefaultStrValues.Length
+            ? (desc.DefaultStrValues[flat] ?? string.Empty)
+            : string.Empty;
+        if (string.Equals(norm, def, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        VariableSlotStorage slot = MaterializeDescriptorSlot(desc);
+        slot.WriteStrFlat(flat, norm);
     }
 
     // -------------------------------------------------------------------------
@@ -1193,9 +2833,11 @@ public sealed class VariableStore : IVariableStore
 
     public void ResetNonGlobalVariables()
     {
-        for (int i = 0; i <= _maxSlotId; i++)
+        List<int>? coldNonGlobalToDrop = null;
+
+        for (int i = 0; i < _hotSlots.Length; i++)
         {
-            VariableSlotStorage? slot = _slots[i];
+            VariableSlotStorage? slot = _hotSlots[i];
             if (slot is null || slot.IsGlobal || slot.IsCharaData || slot.CalcKind != BuiltinCalcKind.None)
             {
                 continue;
@@ -1206,30 +2848,34 @@ public sealed class VariableStore : IVariableStore
                 continue;
             }
 
-            if (slot.IntData is not null)
+            slot.ResetToInitialValues();
+        }
+
+        foreach ((int slotId, VariableSlotStorage slot) in _coldSlots)
+        {
+            if (slot.IsGlobal || slot.IsCharaData || slot.CalcKind != BuiltinCalcKind.None)
             {
-                if (slot.InitialIntValues is not null)
-                {
-                    slot.IntData.AsSpan().Clear();
-                    slot.InitialIntValues.AsSpan(0, Math.Min(slot.IntData.Length, slot.InitialIntValues.Length)).CopyTo(slot.IntData);
-                }
-                else
-                {
-                    slot.IntData.AsSpan().Clear();
-                }
+                continue;
             }
 
-            if (slot.StrData is not null)
+            if ((slot.IsConst || slot.IsReadOnly) && !string.Equals(slot.Name, "STR", StringComparison.OrdinalIgnoreCase))
             {
-                if (slot.InitialStrValues is not null)
-                {
-                    Array.Fill(slot.StrData, string.Empty);
-                    slot.InitialStrValues.AsSpan(0, Math.Min(slot.StrData.Length, slot.InitialStrValues.Length)).CopyTo(slot.StrData);
-                }
-                else
-                {
-                    Array.Fill(slot.StrData, string.Empty);
-                }
+                continue;
+            }
+
+            slot.ResetToInitialValues();
+            if (_module?.TryGetStaticDescriptor(slotId) is not null && slot.Scope == VariableScopeKind.FunctionStatic)
+            {
+                coldNonGlobalToDrop ??= [];
+                coldNonGlobalToDrop.Add(slotId);
+            }
+        }
+
+        if (coldNonGlobalToDrop is not null)
+        {
+            for (int i = 0; i < coldNonGlobalToDrop.Count; i++)
+            {
+                _coldSlots.Remove(coldNonGlobalToDrop[i]);
             }
         }
 
@@ -1242,19 +2888,14 @@ public sealed class VariableStore : IVariableStore
 
     public void ResetGlobalVariables()
     {
-        for (int i = 0; i <= _maxSlotId; i++)
+        foreach (VariableSlotStorage slot in EnumerateMaterializedSlots())
         {
-            VariableSlotStorage? slot = _slots[i];
-            if (slot is null || !slot.IsGlobal)
+            if (!slot.IsGlobal)
             {
                 continue;
             }
 
-            slot.IntData?.AsSpan().Clear();
-            if (slot.StrData is not null)
-            {
-                Array.Fill(slot.StrData, string.Empty);
-            }
+            slot.ClearToZeroOrEmpty();
         }
     }
 
@@ -1320,26 +2961,23 @@ public sealed class VariableStore : IVariableStore
         var savedInts = new Dictionary<int, long[]>();
         var savedStrs = new Dictionary<int, string[]>();
 
-        for (int i = 0; i <= _maxSlotId; i++)
+        foreach (VariableSlotStorage slot in EnumerateSaveableSlots(wantGlobal: false))
         {
-            VariableSlotStorage? slot = _slots[i];
-            if (slot is null || slot.IsGlobal || slot.IsConst || slot.IsCharaData || slot.CalcKind != BuiltinCalcKind.None)
+            if (slot.ValueKind == VariableValueKind.Int)
             {
-                continue;
+                long[] trimmed = slot.ExportTrimmedIntArray();
+                if (trimmed.Length > 0)
+                {
+                    savedInts[slot.SlotId] = trimmed;
+                }
             }
-
-            if (!slot.IsSavedata)
+            else
             {
-                continue;
-            }
-
-            if (slot.IntData is not null)
-            {
-                savedInts[i] = (long[])slot.IntData.Clone();
-            }
-            else if (slot.StrData is not null)
-            {
-                savedStrs[i] = (string[])slot.StrData.Clone();
+                string[] trimmed = slot.ExportTrimmedStrArray();
+                if (trimmed.Length > 0)
+                {
+                    savedStrs[slot.SlotId] = trimmed;
+                }
             }
         }
 
@@ -1372,19 +3010,35 @@ public sealed class VariableStore : IVariableStore
 
         foreach ((int slotId, long[] src) in snapshot.SavedIntArrays)
         {
-            if (TryGetSlot(slotId) is { IntData: { } dst })
+            if (TryGetSlot(slotId) is { ValueKind: VariableValueKind.Int } slot)
             {
-                dst.AsSpan().Clear();
-                src.AsSpan(0, Math.Min(src.Length, dst.Length)).CopyTo(dst);
+                slot.ClearToZeroOrEmpty();
+                int n = Math.Min(src.Length, slot.TotalLength);
+                for (int i = 0; i < n; i++)
+                {
+                    long v = src[i];
+                    if (v != 0L)
+                    {
+                        slot.WriteIntFlat(i, v);
+                    }
+                }
             }
         }
 
         foreach ((int slotId, string[] src) in snapshot.SavedStrArrays)
         {
-            if (TryGetSlot(slotId) is { StrData: { } dst })
+            if (TryGetSlot(slotId) is { ValueKind: VariableValueKind.Str } slot)
             {
-                Array.Fill(dst, string.Empty);
-                src.AsSpan(0, Math.Min(src.Length, dst.Length)).CopyTo(dst);
+                slot.ClearToZeroOrEmpty();
+                int n = Math.Min(src.Length, slot.TotalLength);
+                for (int i = 0; i < n; i++)
+                {
+                    string s = src[i];
+                    if (!string.IsNullOrEmpty(s))
+                    {
+                        slot.WriteStrFlat(i, s);
+                    }
+                }
             }
         }
 
@@ -1413,19 +3067,27 @@ public sealed class VariableStore : IVariableStore
         Action<int, int>? slotProgressCallback,
         CancellationToken cancellationToken)
     {
-        // 1. Register explicit static/chara/function-static slots from BytecodeModule first, preserving exact SlotIds
+        // 1. Scan module static descriptors without eagerly allocating FunctionStatic/GlobalDim arrays.
+        //    Only character schemas (~29) and BuiltinStatic slots (~125) are materialized immediately (with lazy backing arrays).
         if (module is not null)
         {
             int totalStatic = module.StaticVariables.Length;
-            int reportStep = Math.Max(1, totalStatic / 24);
+            _maxSlotId = Math.Max(_maxSlotId, module.MaxStaticSlotId);
+            int reportStep = Math.Max(1, totalStatic / 16);
             for (int i = 0; i < totalStatic; i++)
             {
-                if ((i & 31) == 0)
+                if ((i & 1023) == 0)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                 }
 
-                RegisterDescriptorSlot(module.StaticVariables[i]);
+                VariableSlotDescriptor desc = module.StaticVariables[i];
+                bool isChara = desc.IsCharaData || desc.Scope == VariableScopeKind.CharacterDim;
+                if (isChara || desc.Scope == VariableScopeKind.BuiltinStatic)
+                {
+                    MaterializeDescriptorSlot(desc);
+                }
+
                 if (slotProgressCallback is not null && ((i + 1) % reportStep == 0 || i + 1 == totalStatic))
                 {
                     slotProgressCallback(i + 1, totalStatic);
@@ -1444,12 +3106,20 @@ public sealed class VariableStore : IVariableStore
                 continue;
             }
 
-            if (_nameToSlot.ContainsKey(spec.Name))
+            if (TryResolveExistingSlot(spec.Name, out int existingId))
             {
+                // Ensure built-in specs that came from module as Constant/CharaData still get hot-ID cached & schema registered
+                if (TryGetMaterializedSlot(existingId) is null &&
+                    (spec.IsCharaData || spec.Name.Equals("STR", StringComparison.OrdinalIgnoreCase) || spec.AssociatedCsvNameTable is not null))
+                {
+                    TryGetSlot(existingId);
+                }
+
+                CacheHotSlotId(spec.Name, existingId);
                 continue;
             }
 
-            while ((uint)nextAutoSlotId < (uint)_slots.Length && _slots[nextAutoSlotId] is not null)
+            while (IsSlotOccupied(nextAutoSlotId))
             {
                 nextAutoSlotId++;
             }
@@ -1458,8 +3128,17 @@ public sealed class VariableStore : IVariableStore
         }
     }
 
-    private void RegisterDescriptorSlot(VariableSlotDescriptor desc)
+    private bool IsSlotOccupied(int slotId) =>
+        TryGetMaterializedSlot(slotId) is not null ||
+        (_module?.TryGetStaticDescriptor(slotId) is not null);
+
+    private VariableSlotStorage MaterializeDescriptorSlot(VariableSlotDescriptor desc)
     {
+        if (TryGetMaterializedSlot(desc.SlotId) is { } existing)
+        {
+            return existing;
+        }
+
         BuiltinVariableCatalog.TryGet(desc.Name, ignoreCase: true, out BuiltinVariableSpec? builtinSpec);
         BuiltinCalcKind calcKind = ResolveCalcKind(desc.Name);
 
@@ -1472,34 +3151,12 @@ public sealed class VariableStore : IVariableStore
         bool isChara = desc.IsCharaData || desc.Scope == VariableScopeKind.CharacterDim || (builtinSpec?.IsCharaData ?? false);
         bool isReadOnly = desc.IsConst || (builtinSpec?.IsReadOnly ?? false);
 
-        long[]? intData = null;
-        string[]? strData = null;
-        long[]? initialInts = null;
-        string[]? initialStrs = null;
-        if (!isChara && calcKind == BuiltinCalcKind.None)
-        {
-            if (desc.ValueKind == VariableValueKind.Int)
-            {
-                intData = new long[total];
-                if (!desc.DefaultIntValues.IsDefaultOrEmpty)
-                {
-                    initialInts = [.. desc.DefaultIntValues];
-                    int n = Math.Min(initialInts.Length, intData.Length);
-                    initialInts.AsSpan(0, n).CopyTo(intData);
-                }
-            }
-            else
-            {
-                strData = new string[total];
-                Array.Fill(strData, string.Empty);
-                if (!desc.DefaultStrValues.IsDefaultOrEmpty)
-                {
-                    initialStrs = [.. desc.DefaultStrValues];
-                    int n = Math.Min(initialStrs.Length, strData.Length);
-                    initialStrs.AsSpan(0, n).CopyTo(strData);
-                }
-            }
-        }
+        long[]? initialInts = !isChara && calcKind == BuiltinCalcKind.None && desc.ValueKind == VariableValueKind.Int && !desc.DefaultIntValues.IsDefaultOrEmpty
+            ? [.. desc.DefaultIntValues]
+            : null;
+        string[]? initialStrs = !isChara && calcKind == BuiltinCalcKind.None && desc.ValueKind == VariableValueKind.Str && !desc.DefaultStrValues.IsDefaultOrEmpty
+            ? [.. desc.DefaultStrValues]
+            : null;
 
         var storage = new VariableSlotStorage
         {
@@ -1519,19 +3176,19 @@ public sealed class VariableStore : IVariableStore
             IsReadOnly = isReadOnly,
             AssociatedCsvNameTable = builtinSpec?.AssociatedCsvNameTable,
             CalcKind = calcKind,
-            IntData = intData,
-            StrData = strData,
             InitialIntValues = initialInts,
             InitialStrValues = initialStrs,
         };
 
-        StoreSlotAt(desc.SlotId, storage);
+        StoreSlotAt(desc.SlotId, storage, registerLocalName: false);
 
         if (isChara)
         {
             bool isUserChara = builtinSpec is null;
             _characters.RegisterSlotSchema(desc.SlotId, desc.Name, desc.ValueKind, desc.Dimensions, storage.IsSavedata, isUserChara);
         }
+
+        return storage;
     }
 
     private void RegisterBuiltinSpecSlot(int slotId, BuiltinVariableSpec spec)
@@ -1542,21 +3199,6 @@ public sealed class VariableStore : IVariableStore
         int d1 = rank >= 2 && spec.DefaultDimensions.Length >= 2 ? Math.Max(1, spec.DefaultDimensions[1]) : 1;
         int d2 = rank >= 3 && spec.DefaultDimensions.Length >= 3 ? Math.Max(1, spec.DefaultDimensions[2]) : 1;
         int total = Math.Max(1, checked(d0 * d1 * d2));
-
-        long[]? intData = null;
-        string[]? strData = null;
-        if (!spec.IsCharaData && calcKind == BuiltinCalcKind.None)
-        {
-            if (spec.ValueKind == VariableValueKind.Int)
-            {
-                intData = new long[total];
-            }
-            else
-            {
-                strData = new string[total];
-                Array.Fill(strData, string.Empty);
-            }
-        }
 
         var storage = new VariableSlotStorage
         {
@@ -1576,11 +3218,9 @@ public sealed class VariableStore : IVariableStore
             IsReadOnly = spec.IsReadOnly,
             AssociatedCsvNameTable = spec.AssociatedCsvNameTable,
             CalcKind = calcKind,
-            IntData = intData,
-            StrData = strData,
         };
 
-        StoreSlotAt(slotId, storage);
+        StoreSlotAt(slotId, storage, registerLocalName: true);
 
         if (spec.IsCharaData)
         {
@@ -1592,13 +3232,6 @@ public sealed class VariableStore : IVariableStore
     private int RegisterDynamicFunctionStaticSlot(string scopedName, VariableValueKind kind, int length)
     {
         int slotId = _maxSlotId + 1;
-        long[]? ints = kind == VariableValueKind.Int ? new long[length] : null;
-        string[]? strs = kind == VariableValueKind.Str ? new string[length] : null;
-        if (strs is not null)
-        {
-            Array.Fill(strs, string.Empty);
-        }
-
         var storage = new VariableSlotStorage
         {
             SlotId = slotId,
@@ -1610,54 +3243,36 @@ public sealed class VariableStore : IVariableStore
             Dim1 = 1,
             Dim2 = 1,
             TotalLength = length,
-            IntData = ints,
-            StrData = strs,
         };
 
-        StoreSlotAt(slotId, storage);
+        StoreSlotAt(slotId, storage, registerLocalName: true);
         return slotId;
     }
 
-    private static void ResizeSlotStorage(VariableSlotStorage slot, ReadOnlySpan<int> dims)
+    private static void ResizeSlotStorage(VariableSlotStorage slot, ReadOnlySpan<int> dims) =>
+        slot.ResizeAndClear(dims);
+
+    private void StoreSlotAt(int slotId, VariableSlotStorage storage, bool registerLocalName)
     {
-        int rank = dims.Length;
-        int d0 = rank >= 1 ? Math.Max(1, dims[0]) : 1;
-        int d1 = rank >= 2 ? Math.Max(1, dims[1]) : 1;
-        int d2 = rank >= 3 ? Math.Max(1, dims[2]) : 1;
-        int total = Math.Max(1, checked(d0 * d1 * d2));
-
-        slot.Rank = rank;
-        slot.Dim0 = d0;
-        slot.Dim1 = d1;
-        slot.Dim2 = d2;
-        slot.TotalLength = total;
-
-        if (slot.ValueKind == VariableValueKind.Int)
+        if ((uint)slotId < HotSlotCapacity)
         {
-            slot.IntData = new long[total];
+            _hotSlots[slotId] = storage;
         }
         else
         {
-            slot.StrData = new string[total];
-            Array.Fill(slot.StrData, string.Empty);
-        }
-    }
-
-    private void StoreSlotAt(int slotId, VariableSlotStorage storage)
-    {
-        if (slotId >= _slots.Length)
-        {
-            int nextLen = Math.Max(_slots.Length * 2, slotId + 64);
-            Array.Resize(ref _slots, nextLen);
+            _coldSlots[slotId] = storage;
         }
 
-        _slots[slotId] = storage;
         if (slotId > _maxSlotId)
         {
             _maxSlotId = slotId;
         }
 
-        _nameToSlot.TryAdd(storage.Name, slotId);
+        if (registerLocalName)
+        {
+            _localNameToSlot.TryAdd(storage.Name, slotId);
+        }
+
         CacheHotSlotId(storage.Name, slotId);
     }
 

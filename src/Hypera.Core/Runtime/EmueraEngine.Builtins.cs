@@ -477,14 +477,7 @@ public sealed partial class EmueraEngine
                 throw new InvalidOperationException($"SAVEVAR: variable '{slot.Name}' cannot be saved with SAVEVAR.");
             }
 
-            if (slot.IntData is not null)
-            {
-                snap.Variables[slot.Name] = PackIntSaveValue(slot.IntData, Math.Max(1, slot.Rank), slot.Dim0, slot.Dim1, slot.Dim2);
-            }
-            else if (slot.StrData is not null)
-            {
-                snap.Variables[slot.Name] = PackStrSaveValue(slot.StrData, Math.Max(1, slot.Rank), slot.Dim0, slot.Dim1, slot.Dim2);
-            }
+            snap.Variables[slot.Name] = PackSlotToSaveValue(slot);
         }
 
         byte[] payload = EraSaveSerializer.Save(snap, fmt);

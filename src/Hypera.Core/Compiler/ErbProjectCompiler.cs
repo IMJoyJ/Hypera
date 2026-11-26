@@ -34,24 +34,12 @@ public sealed record CompilationResult(
             if (rv.ValueKind == VariableValueKind.Int && !rv.DefaultIntValues.IsEmpty)
             {
                 VariableSlotStorage slot = store.GetSlotOrThrow(rv.SlotId);
-                long[] init = [.. rv.DefaultIntValues];
-                slot.InitialIntValues = init;
-                if (slot.IntData is not null)
-                {
-                    int n = Math.Min(init.Length, slot.IntData.Length);
-                    init.AsSpan(0, n).CopyTo(slot.IntData);
-                }
+                slot.ApplyInitialIntValues([.. rv.DefaultIntValues]);
             }
             else if (rv.ValueKind == VariableValueKind.Str && !rv.DefaultStrValues.IsEmpty)
             {
                 VariableSlotStorage slot = store.GetSlotOrThrow(rv.SlotId);
-                string[] init = [.. rv.DefaultStrValues];
-                slot.InitialStrValues = init;
-                if (slot.StrData is not null)
-                {
-                    int n = Math.Min(init.Length, slot.StrData.Length);
-                    init.AsSpan(0, n).CopyTo(slot.StrData);
-                }
+                slot.ApplyInitialStrValues([.. rv.DefaultStrValues]);
             }
         }
     }
