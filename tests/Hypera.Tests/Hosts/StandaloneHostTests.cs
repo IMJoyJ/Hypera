@@ -670,6 +670,216 @@ public sealed class StandaloneHostTests
         }
     }
 
+    [Fact]
+    public void ResetColorAndResetFont_AreNotSwallowedByDebugOnlyFlag()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_resetcolor_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "emuera.config"),
+                "文字色:192,192,192\n選択中文字色:255,255,0\nフォント名:MS Gothic\n");
+
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                SETCOLOR 0x00FF00
+                PRINTL GreenLine
+                RESETCOLOR
+                PRINTL SilverLine
+                SETCOLOR 0xFFFF00
+                FONTBOLD
+                SETFONT "Arial"
+                PRINTL StyledLine
+                RESETCOLOR
+                FONTREGULAR
+                SETFONT
+                PRINTL RestoredLine
+                INPUT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+
+            Assert.Equal(EngineStepStatus.WaitingInput, host.Engine.Step());
+            ConsoleScene scene = host.Engine.ConsoleBuffer.CaptureScene();
+            Assert.Equal(4, scene.VisibleLines.Count);
+
+            ConsoleRenderPart greenPart = scene.VisibleLines[0].Parts[0];
+            ConsoleRenderPart silverPart = scene.VisibleLines[1].Parts[0];
+            ConsoleRenderPart styledPart = scene.VisibleLines[2].Parts[0];
+            ConsoleRenderPart restoredPart = scene.VisibleLines[3].Parts[0];
+
+            Assert.Equal(0x00FF00FFu, greenPart.ColorRgba);
+            Assert.Equal(0xC0C0C0FFu, silverPart.ColorRgba);
+            Assert.Equal(0xFFFF00FFu, styledPart.ColorRgba);
+            Assert.True((styledPart.FontStyle & FontStyleFlags.Bold) != 0);
+            Assert.Equal("Arial", styledPart.FontFamily);
+
+            Assert.Equal(0xC0C0C0FFu, restoredPart.ColorRgba);
+            Assert.Equal(FontStyleFlags.Regular, restoredPart.FontStyle);
+            Assert.Equal("MS Gothic", restoredPart.FontFamily);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void LineCount_ClearLine_And_GetDisplayLine_StayAlignedPastMaxLogLikeCardTextCache()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_maxlog_cache_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "emuera.config"),
+                "履歴ログの行数:100\n");
+
+            // Mirrors eraOCG2 @CARD_TEXT_CACHE: once MaxLog (100) is exceeded, LINECOUNT must still advance
+            // monotonically so CLEARLINE deletes every printed card line, and GETDISPLAYLINE(100..100-N)
+            // reads every card's lines cleanly across repeated print+clear iterations.
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                #DIM DYNAMIC LSTART
+                #DIM DYNAMIC LEND
+                #DIM DYNAMIC USED
+                #DIM DYNAMIC I
+                #DIM DYNAMIC J
+                FOR I, 0, 120
+                    PRINTFORML PREFILL_{I}
+                NEXT
+                REDRAW 0
+                FOR I, 0, 5
+                    LSTART = LINECOUNT
+                    PRINTFORML CARD_{I}_ALPHA
+                    PRINTFORML CARD_{I}_BETA
+                    PRINTFORML CARD_{I}_GAMMA
+                    LEND = LINECOUNT
+                    USED = LEND - LSTART
+                    LOCALS:I =
+                    FOR J, 100, (100 - (USED + 1)), -1
+                        LOCALS:I += GETDISPLAYLINE(J) + " "
+                    NEXT
+                    CLEARLINE USED
+                NEXT
+                REDRAW 1
+                RESULTS:0 = %LOCALS:0%
+                RESULTS:1 = %LOCALS:4%
+                PRINTL FINAL_VISIBLE_MARKER
+                INPUT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+
+            Assert.Equal(EngineStepStatus.WaitingInput, host.Engine.Step());
+            VariableStore vars = host.Engine.FastVariables!;
+            Assert.Contains("CARD_0_ALPHA", vars.ResultsSpan[0]);
+            Assert.Contains("CARD_0_BETA", vars.ResultsSpan[0]);
+            Assert.Contains("CARD_0_GAMMA", vars.ResultsSpan[0]);
+            Assert.Contains("CARD_4_ALPHA", vars.ResultsSpan[1]);
+            Assert.Contains("CARD_4_BETA", vars.ResultsSpan[1]);
+            Assert.Contains("CARD_4_GAMMA", vars.ResultsSpan[1]);
+
+            IReadOnlyList<string> lines = host.Engine.ConsoleBuffer.GetAllPlainTextLines();
+            Assert.DoesNotContain(lines, static l => l.Contains("CARD_", StringComparison.Ordinal));
+            Assert.Equal("FINAL_VISIBLE_MARKER", lines[^1]);
+            Assert.Equal(121, host.Engine.ConsoleBuffer.LineCount);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RedrawZeroAndAwait_TrackRedrawFlushSequenceAndPreservePendingButtonIdentity()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_redraw_hover_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                REDRAW 0
+                PRINTL Progress 50%
+                AWAIT 1
+                CLEARLINE 1
+                REDRAW 1
+                PRINTFORM %"移動[400]",25,RIGHT%
+                PRINTFORM %"外出する[460]",25,RIGHT%
+                PRINTL
+                PRINTC オプション[810]
+                PRINTC 決闘者辞典[456]
+                PRINTL
+                PRINTBUTTON "[PendingBtn]", 999
+                INPUT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+
+            // 1. First yield is AWAIT 1 while REDRAW 0 is active -> RedrawFlushSequence increments so host presents banner!
+            long initialFlush = host.Engine.RedrawFlushSequence;
+            EngineStepStatus st1 = host.Engine.Step();
+            Assert.Equal(EngineStepStatus.Yielded, st1);
+            Assert.Equal(0, host.Engine.CurrentRedrawMode);
+            Assert.True(host.Engine.RedrawFlushSequence > initialFlush);
+
+            // 2. Continue to INPUT -> REDRAW 1 restored, progress line cleared, full suffix buttons & pending button work!
+            EngineStepStatus st2 = host.Engine.Step();
+            Assert.Equal(EngineStepStatus.WaitingInput, st2);
+            Assert.Equal(1, host.Engine.CurrentRedrawMode);
+
+            ConsoleScene scene1 = host.Engine.ConsoleBuffer.CaptureScene();
+            ConsoleScene scene2 = host.Engine.ConsoleBuffer.CaptureScene();
+
+            Assert.DoesNotContain(scene1.VisibleLines, static l => l.PlainText.Contains("Progress 50%", StringComparison.Ordinal));
+
+            // Suffix bracket buttons ("移動[400]", "外出する[460]") and PRINTC ("オプション[810]") must cover full label!
+            List<ConsoleRenderPart> line0Btns = scene1.VisibleLines[0].Parts.Where(static p => p.Button is { IsButton: true }).ToList();
+            Assert.Equal(2, line0Btns.Count);
+            Assert.Equal("移動[400]", line0Btns[0].Text);
+            Assert.Equal(400L, line0Btns[0].Button!.IntValue);
+            Assert.Equal("外出する[460]", line0Btns[1].Text);
+            Assert.Equal(460L, line0Btns[1].Button!.IntValue);
+
+            List<ConsoleRenderPart> line1Btns = scene1.VisibleLines[1].Parts.Where(static p => p.Button is { IsButton: true }).ToList();
+            Assert.Equal(2, line1Btns.Count);
+            Assert.Equal("オプション[810]", line1Btns[0].Text);
+            Assert.Equal(810L, line1Btns[0].Button!.IntValue);
+            Assert.Equal("決闘者辞典[456]", line1Btns[1].Text);
+            Assert.Equal(456L, line1Btns[1].Button!.IntValue);
+
+            // Pending uncommitted line button must preserve ReferenceEquals across repeated CaptureScene() calls!
+            ConsoleRenderPart pendingBtn1 = scene1.VisibleLines[2].Parts.Single(static p => p.Button is { IsButton: true });
+            ConsoleRenderPart pendingBtn2 = scene2.VisibleLines[2].Parts.Single(static p => p.Button is { IsButton: true });
+            Assert.True(ReferenceEquals(pendingBtn1.Button, pendingBtn2.Button),
+                "Pending line HtmlButtonContext should keep reference identity across repaints so hover never drops.");
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
     private static string LocateProjectBinDirectory(string projectName, string probeFile)
     {
         string testsBin = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);

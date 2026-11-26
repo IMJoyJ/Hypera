@@ -45,6 +45,7 @@ public sealed class MainForm : Form
         _initialOptions = initialOptions;
 
         Text = "Hypera Standalone";
+        AutoScaleMode = AutoScaleMode.None;
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.Black;
         ForeColor = Color.FromArgb(192, 192, 192);
@@ -207,6 +208,7 @@ public sealed class MainForm : Form
 
         _inputBarPanel.Controls.Add(_inputTextBox);
         _inputBarPanel.Controls.Add(_statusLabel);
+        UpdateInputBarHeight();
 
         // Dock order matters in WinForms: Fill added first, then Top/Bottom
         Controls.Add(_viewportHostPanel);
@@ -215,6 +217,7 @@ public sealed class MainForm : Form
         MainMenuStrip = _menuStrip;
 
         Load += OnFormLoad;
+        Shown += OnFormShown;
         Activated += (_, _) => { if (_session is not null) _session.Engine.IsWindowActive = true; };
         Deactivate += (_, _) => { if (_session is not null) _session.Engine.IsWindowActive = false; };
         KeyDown += OnGlobalKeyDown;
@@ -235,6 +238,19 @@ public sealed class MainForm : Form
             _statusLabel.Text = "No game loaded (Ctrl+O)";
             PromptOpenInitialGame();
         }
+    }
+
+    private void OnFormShown(object? sender, EventArgs e)
+    {
+        UpdateInputBarHeight();
+        EnsureClientInsideWorkingArea();
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        UpdateInputBarHeight();
+        EnsureClientInsideWorkingArea();
     }
 
     private void PromptOpenInitialGame()
@@ -348,21 +364,28 @@ public sealed class MainForm : Form
             // Fall back to default font if system font isn't installed for GDI.
         }
 
+        UpdateInputBarHeight();
+
         if (!_isFullscreen)
         {
-            FitWindowToLogicalViewport();
-
             bool setPos = session.GetConfigBool(ConfigCode.SetWindowPos, false);
+            int posX = session.GetConfigInt(ConfigCode.WindowPosX, 0);
+            int posY = session.GetConfigInt(ConfigCode.WindowPosY, 0);
+            Rectangle targetWorkArea = setPos
+                ? Screen.FromPoint(new Point(posX, posY)).WorkingArea
+                : Screen.FromControl(this).WorkingArea;
+
+            FitWindowToLogicalViewport(targetWorkArea);
+
             if (setPos)
             {
-                int posX = session.GetConfigInt(ConfigCode.WindowPosX, 0);
-                int posY = session.GetConfigInt(ConfigCode.WindowPosY, 0);
-                Rectangle workArea = Screen.FromControl(this).WorkingArea;
-                int clampedX = Math.Clamp(posX, workArea.Left, Math.Max(workArea.Left, workArea.Right - Width));
-                int clampedY = Math.Clamp(posY, workArea.Top, Math.Max(workArea.Top, workArea.Bottom - Height));
+                int clampedX = Math.Clamp(posX, targetWorkArea.Left, Math.Max(targetWorkArea.Left, targetWorkArea.Right - Width));
+                int clampedY = Math.Clamp(posY, targetWorkArea.Top, Math.Max(targetWorkArea.Top, targetWorkArea.Bottom - Height));
                 StartPosition = FormStartPosition.Manual;
                 Location = new Point(clampedX, clampedY);
             }
+
+            EnsureClientInsideWorkingArea(targetWorkArea);
 
             if (session.GetConfigBool(ConfigCode.WindowMaximixed, false))
             {
@@ -373,7 +396,17 @@ public sealed class MainForm : Form
         _muteMenuItem.Checked = session.AudioDriver?.IsMuted == true;
     }
 
-    private void FitWindowToLogicalViewport()
+    private void UpdateInputBarHeight()
+    {
+        int preferred = _inputTextBox.PreferredHeight;
+        int targetHeight = Math.Max(28, preferred + _inputBarPanel.Padding.Vertical + 2);
+        if (_inputBarPanel.Height != targetHeight)
+        {
+            _inputBarPanel.Height = targetHeight;
+        }
+    }
+
+    private void FitWindowToLogicalViewport(Rectangle? explicitWorkArea = null)
     {
         if (_session is null || _isFullscreen)
         {
@@ -385,6 +418,8 @@ public sealed class MainForm : Form
             WindowState = FormWindowState.Normal;
         }
 
+        UpdateInputBarHeight();
+
         LogicalViewport vp = _session.Engine.Viewport;
         int extraWidth = _scrollBar.Width;
         int extraHeight = (_menuStrip.Visible ? _menuStrip.Height : 0) + _inputBarPanel.Height;
@@ -392,11 +427,85 @@ public sealed class MainForm : Form
         int desiredClientH = vp.LogicalHeight + extraHeight;
 
         Size frameDelta = Size - ClientSize;
-        Rectangle workArea = Screen.FromControl(this).WorkingArea;
+        Rectangle workArea = explicitWorkArea ?? Screen.FromControl(this).WorkingArea;
 
         int targetW = Math.Min(desiredClientW + frameDelta.Width, workArea.Width);
         int targetH = Math.Min(desiredClientH + frameDelta.Height, workArea.Height);
         Size = new Size(Math.Max(MinimumSize.Width, targetW), Math.Max(MinimumSize.Height, targetH));
+        EnsureClientInsideWorkingArea(workArea);
+    }
+
+    /// <summary>
+    /// Guarantees the window and its entire client area (especially the bottom input bar) remain
+    /// strictly above the Windows taskbar and inside the monitor's <see cref="Screen.WorkingArea"/>
+    /// across all PerMonitorV2 DPI scales and DWM non-client border metrics.
+    /// </summary>
+    private void EnsureClientInsideWorkingArea(Rectangle? explicitWorkArea = null)
+    {
+        if (_isFullscreen || WindowState != FormWindowState.Normal)
+        {
+            return;
+        }
+
+        Rectangle workArea = explicitWorkArea ?? Screen.FromRectangle(Bounds).WorkingArea;
+        if (workArea.Width <= 0 || workArea.Height <= 0)
+        {
+            return;
+        }
+
+        int newW = Math.Clamp(Width, Math.Min(MinimumSize.Width, workArea.Width), workArea.Width);
+        int newH = Math.Clamp(Height, Math.Min(MinimumSize.Height, workArea.Height), workArea.Height);
+        if (newW != Width || newH != Height)
+        {
+            Size = new Size(newW, newH);
+        }
+
+        int newX = Math.Clamp(Left, workArea.Left, Math.Max(workArea.Left, workArea.Right - Width));
+        int newY = Math.Clamp(Top, workArea.Top, Math.Max(workArea.Top, workArea.Bottom - Height));
+        if (newX != Left || newY != Top)
+        {
+            Location = new Point(newX, newY);
+        }
+
+        if (!IsHandleCreated)
+        {
+            return;
+        }
+
+        // Verify actual physical screen position of the bottom-right client corner (bottom of _inputBarPanel),
+        // keeping a 1px buffer above the Windows taskbar edge.
+        Point clientBottomRight = PointToScreen(new Point(ClientSize.Width, ClientSize.Height));
+        int bottomOverflow = clientBottomRight.Y - (workArea.Bottom - 1);
+        if (bottomOverflow > 0)
+        {
+            int lift = Math.Min(bottomOverflow, Math.Max(0, Top - workArea.Top));
+            if (lift > 0)
+            {
+                Top -= lift;
+                bottomOverflow -= lift;
+            }
+
+            if (bottomOverflow > 0)
+            {
+                Height = Math.Max(Math.Min(MinimumSize.Height, workArea.Height), Height - bottomOverflow);
+            }
+        }
+
+        int rightOverflow = clientBottomRight.X - workArea.Right;
+        if (rightOverflow > 0)
+        {
+            int shift = Math.Min(rightOverflow, Math.Max(0, Left - workArea.Left));
+            if (shift > 0)
+            {
+                Left -= shift;
+                rightOverflow -= shift;
+            }
+
+            if (rightOverflow > 0)
+            {
+                Width = Math.Max(Math.Min(MinimumSize.Width, workArea.Width), Width - rightOverflow);
+            }
+        }
     }
 
     private void RestartCurrentTarget()

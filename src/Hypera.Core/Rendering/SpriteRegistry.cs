@@ -67,9 +67,40 @@ public sealed class SpriteRegistry : IDisposable
 {
     private readonly Dictionary<string, SpriteDefinition> _sprites = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, IReadOnlyList<DecodedImageFrame>> _decodedFiles = new(StringComparer.OrdinalIgnoreCase);
+    private int _animatedSpriteCount;
     private bool _disposed;
 
     public int Count => _sprites.Count;
+    public bool HasAnimatedSprites => _animatedSpriteCount > 0;
+
+    private void SetSpriteInternal(string key, SpriteDefinition def)
+    {
+        if (_sprites.TryGetValue(key, out SpriteDefinition? previous) && previous.IsAnimated)
+        {
+            _animatedSpriteCount = Math.Max(0, _animatedSpriteCount - 1);
+        }
+
+        _sprites[key] = def;
+        if (def.IsAnimated)
+        {
+            _animatedSpriteCount++;
+        }
+    }
+
+    private bool RemoveSpriteInternal(string key)
+    {
+        if (_sprites.Remove(key, out SpriteDefinition? removed))
+        {
+            if (removed.IsAnimated)
+            {
+                _animatedSpriteCount = Math.Max(0, _animatedSpriteCount - 1);
+            }
+
+            return true;
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// Loads all sprite definitions from <c>resources/*.csv</c> in the provided <see cref="IVirtualFileSystem"/>.
@@ -140,7 +171,7 @@ public sealed class SpriteRegistry : IDisposable
                 int w = tokens.Length >= 3 && TryParseInt(tokens[2], out int pw) ? pw : 0;
                 int h = tokens.Length >= 4 && TryParseInt(tokens[3], out int ph) ? ph : 0;
                 var anime = new SpriteDefinition(name, w, h, 0, 0, isAnimated: true, isDynamic: false);
-                _sprites[name] = anime;
+                SetSpriteInternal(name, anime);
                 count++;
                 continue;
             }
@@ -184,14 +215,14 @@ public sealed class SpriteRegistry : IDisposable
                         f.DurationMs > 0 ? f.DurationMs : 100));
                 }
 
-                _sprites[name] = animDef;
+                SetSpriteInternal(name, animDef);
                 count++;
             }
             else
             {
                 var def = new SpriteDefinition(name, srcRect.Width, srcRect.Height, posX, posY, isAnimated: false, isDynamic: false);
                 def.AddFrame(new SpriteFrameSpec(firstBmp, null, srcRect, posX, posY, 0));
-                _sprites[name] = def;
+                SetSpriteInternal(name, def);
                 count++;
             }
         }
@@ -226,7 +257,7 @@ public sealed class SpriteRegistry : IDisposable
 
         var def = new SpriteDefinition(name.Trim(), w, h, posX, posY, isAnimated: false, isDynamic: true);
         def.AddFrame(new SpriteFrameSpec(null, graphicsId, SKRectI.Create(x, y, w, h), posX, posY, 0));
-        _sprites[def.Name] = def;
+        SetSpriteInternal(def.Name, def);
         return true;
     }
 
@@ -239,7 +270,7 @@ public sealed class SpriteRegistry : IDisposable
         }
 
         string key = name.Trim();
-        _sprites[key] = new SpriteDefinition(key, width, height, 0, 0, isAnimated: true, isDynamic: true);
+        SetSpriteInternal(key, new SpriteDefinition(key, width, height, 0, 0, isAnimated: true, isDynamic: true));
         return true;
     }
 
@@ -292,7 +323,7 @@ public sealed class SpriteRegistry : IDisposable
                 frame.DurationMs));
         }
 
-        _sprites[key] = def;
+        SetSpriteInternal(key, def);
         return true;
     }
 
@@ -315,7 +346,7 @@ public sealed class SpriteRegistry : IDisposable
     public bool DisposeSprite(string name)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        return !string.IsNullOrWhiteSpace(name) && _sprites.Remove(name.Trim());
+        return !string.IsNullOrWhiteSpace(name) && RemoveSpriteInternal(name.Trim());
     }
 
     public void DisposeAll(bool onlyDynamic = true)
@@ -324,6 +355,7 @@ public sealed class SpriteRegistry : IDisposable
         if (!onlyDynamic)
         {
             _sprites.Clear();
+            _animatedSpriteCount = 0;
             return;
         }
 
@@ -338,7 +370,7 @@ public sealed class SpriteRegistry : IDisposable
 
         foreach (string key in toRemove)
         {
-            _sprites.Remove(key);
+            RemoveSpriteInternal(key);
         }
     }
 
@@ -522,5 +554,6 @@ public sealed class SpriteRegistry : IDisposable
 
         _decodedFiles.Clear();
         _sprites.Clear();
+        _animatedSpriteCount = 0;
     }
 }

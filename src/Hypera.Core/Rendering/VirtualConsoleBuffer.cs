@@ -84,11 +84,20 @@ public sealed class VirtualConsoleBuffer
 
     private long _nextLogicalLineId = 1;
     private long _buttonGeneration = 1;
+    private int _logicalLineCount;
+    private long _totalPhysicalLineNo;
     private int _maxLogLines;
     private int _scrollOffsetLines;
     private bool _pendingInPlaceReplacement;
     private int? _cbgButtonMapGraphicsId;
     private TooltipState _tooltip = new();
+
+    private ConsoleLine? _cachedPendingLine;
+    private long _cachedPendingVersion = -1;
+    private long _pendingVersion;
+    private long _cachedPendingGeneration = -1;
+    private LogicalViewport _cachedPendingViewport;
+    private HtmlParseStyle? _cachedPendingStyle;
 
     public VirtualConsoleBuffer(
         LogicalViewport viewport,
@@ -161,24 +170,10 @@ public sealed class VirtualConsoleBuffer
     }
 
     /// <summary>
-    /// Emuera LINECOUNT: counts logical lines (wrapping into multiple physical lines still counts as 1 logical line).
+    /// Emuera LINECOUNT: monotonic count of logical lines (wrapping into multiple physical lines still counts as 1 logical line,
+    /// decremented by CLEARLINE and reset by ClearAll, and NOT decremented when MaxLog trims old history lines).
     /// </summary>
-    public int LineCount
-    {
-        get
-        {
-            int count = 0;
-            for (int i = 0; i < _physicalLines.Count; i++)
-            {
-                if (_physicalLines[i].IsLogicalLine)
-                {
-                    count++;
-                }
-            }
-
-            return count;
-        }
-    }
+    public int LineCount => _logicalLineCount;
 
     public long AdvanceButtonGeneration() => ++_buttonGeneration;
 
@@ -216,6 +211,7 @@ public sealed class VirtualConsoleBuffer
     {
         string html = _pendingHtmlBuffer.ToString();
         _pendingHtmlBuffer.Clear();
+        InvalidatePendingCache();
         CommitHtmlLine(html, noWrapOverride: false);
     }
 
@@ -231,6 +227,7 @@ public sealed class VirtualConsoleBuffer
             if (!string.IsNullOrEmpty(html))
             {
                 _pendingHtmlBuffer.Append(html);
+                InvalidatePendingCache();
             }
 
             return;
@@ -251,6 +248,7 @@ public sealed class VirtualConsoleBuffer
     {
         string pending = _pendingHtmlBuffer.ToString();
         _pendingHtmlBuffer.Clear();
+        InvalidatePendingCache();
         return pending;
     }
 
@@ -330,20 +328,51 @@ public sealed class VirtualConsoleBuffer
 
         // Discard unflushed pending buffer if clearing.
         _pendingHtmlBuffer.Clear();
+        InvalidatePendingCache();
 
         int remainingLogicalToDelete = logicalLineCount;
         int removedPhysical = 0;
 
         while (_physicalLines.Count > 0 && remainingLogicalToDelete > 0)
         {
-            long targetLogicalId = _physicalLines[^1].LogicalLineId;
+            ConsoleLine last = _physicalLines[^1];
+            if (!last.IsLogicalLine && last.LogicalLineId <= 0)
+            {
+                // Top-inserted MaxLog padding line: stop deleting real logical lines.
+                break;
+            }
+
+            long targetLogicalId = last.LogicalLineId;
             while (_physicalLines.Count > 0 && _physicalLines[^1].LogicalLineId == targetLogicalId)
             {
                 _physicalLines.RemoveAt(_physicalLines.Count - 1);
                 removedPhysical++;
+                if (_totalPhysicalLineNo > 0)
+                {
+                    _totalPhysicalLineNo--;
+                }
+
+                // Match EmueraConsole.deleteLine: once the console has overflowed MaxLog,
+                // keep displayLineList anchored at MaxLog - 1 by inserting blank lines at index 0
+                // so scripts indexing from MaxLog downward via GETDISPLAYLINE(MaxLog - k) stay aligned.
+                if (_maxLogLines >= 2 &&
+                    _physicalLines.Count == _maxLogLines - 2 &&
+                    _totalPhysicalLineNo > _physicalLines.Count)
+                {
+                    _physicalLines.Insert(0, CreateBlankPaddingLine());
+                }
             }
 
             remainingLogicalToDelete--;
+            if (_logicalLineCount > 0)
+            {
+                _logicalLineCount--;
+            }
+        }
+
+        if (remainingLogicalToDelete > 0)
+        {
+            _logicalLineCount = Math.Max(0, _logicalLineCount - remainingLogicalToDelete);
         }
 
         _pendingInPlaceReplacement = logicalLineCount == 1 && removedPhysical > 0;
@@ -354,6 +383,9 @@ public sealed class VirtualConsoleBuffer
     {
         _physicalLines.Clear();
         _pendingHtmlBuffer.Clear();
+        InvalidatePendingCache();
+        _logicalLineCount = 0;
+        _totalPhysicalLineNo = 0;
         _pendingInPlaceReplacement = false;
         _scrollOffsetLines = 0;
     }
@@ -465,22 +497,7 @@ public sealed class VirtualConsoleBuffer
         int maxVisible = Math.Max(1, (Viewport.LogicalHeight / effLineH) + 2);
 
         List<ConsoleLine> allLines = _physicalLines;
-        ConsoleLine? pendingLine = null;
-        if (_pendingHtmlBuffer.Length > 0)
-        {
-            IReadOnlyList<ConsoleLine> parsedPending = HtmlPrintEngine.ParseToLines(
-                _pendingHtmlBuffer.ToString(),
-                logicalLineId: _nextLogicalLineId,
-                maxWidth: Viewport.LogicalWidth,
-                buttonGeneration: _buttonGeneration,
-                BuildCurrentParseStyle(),
-                _measurer,
-                _sprites);
-            if (parsedPending.Count > 0)
-            {
-                pendingLine = parsedPending[^1];
-            }
-        }
+        ConsoleLine? pendingLine = GetOrBuildPendingLine();
 
         int totalCount = allLines.Count + (pendingLine is not null ? 1 : 0);
         int endExclusive = Math.Clamp(totalCount - _scrollOffsetLines, 0, totalCount);
@@ -540,6 +557,8 @@ public sealed class VirtualConsoleBuffer
             _physicalLines.Add(line);
         }
 
+        _logicalLineCount++;
+        _totalPhysicalLineNo += parsed.Count;
         TrimLogIfNeeded();
     }
 
@@ -558,6 +577,66 @@ public sealed class VirtualConsoleBuffer
         if ((FontStyle & FontStyleFlags.Strikeout) != 0) wrapped = $"<s>{wrapped}</s>";
 
         _pendingHtmlBuffer.Append(wrapped);
+        InvalidatePendingCache();
+    }
+
+    private ConsoleLine? GetOrBuildPendingLine()
+    {
+        if (_pendingHtmlBuffer.Length == 0)
+        {
+            return null;
+        }
+
+        HtmlParseStyle style = BuildCurrentParseStyle();
+        if (_cachedPendingLine is not null &&
+            _cachedPendingVersion == _pendingVersion &&
+            _cachedPendingGeneration == _buttonGeneration &&
+            _cachedPendingViewport == Viewport &&
+            style.Equals(_cachedPendingStyle))
+        {
+            return _cachedPendingLine;
+        }
+
+        IReadOnlyList<ConsoleLine> parsedPending = HtmlPrintEngine.ParseToLines(
+            _pendingHtmlBuffer.ToString(),
+            logicalLineId: _nextLogicalLineId,
+            maxWidth: Viewport.LogicalWidth,
+            buttonGeneration: _buttonGeneration,
+            style,
+            _measurer,
+            _sprites);
+
+        _cachedPendingLine = parsedPending.Count > 0 ? parsedPending[^1] : null;
+        _cachedPendingVersion = _pendingVersion;
+        _cachedPendingGeneration = _buttonGeneration;
+        _cachedPendingViewport = Viewport;
+        _cachedPendingStyle = style;
+        return _cachedPendingLine;
+    }
+
+    private void InvalidatePendingCache()
+    {
+        _pendingVersion++;
+        _cachedPendingLine = null;
+    }
+
+    private ConsoleLine CreateBlankPaddingLine()
+    {
+        int effLineH = _measurer.GetEffectiveLineHeight(
+            CurrentFontFamily,
+            Viewport.FontSize,
+            Viewport.LineHeight,
+            SamplingMode);
+        return new ConsoleLine(
+            LogicalLineId: 0,
+            IsLogicalLine: false,
+            Alignment: TextAlignment.Left,
+            NoWrap: false,
+            RawHtml: string.Empty,
+            PlainText: string.Empty,
+            ContentWidth: 0f,
+            LineHeight: effLineH,
+            Parts: []);
     }
 
     private HtmlParseStyle BuildCurrentParseStyle() =>

@@ -37,18 +37,21 @@ public class HyperaSkiaControl : SKControl
     private SkiaFrameCompositor? _engineCompositor;
     private DisplaySnapshot? _currentSnapshot;
     private ConsoleScene? _lastRenderedScene;
+    private ConsoleScene? _frozenRedrawScene;
     private HtmlButtonContext? _hoveredButton;
     private int? _hoveredCbgButtonValue;
     private int _lastSurfaceWidth;
     private int _lastSurfaceHeight;
     private int _scrollbackOffset;
     private long _trackedGenerationId = -1;
+    private long _lastObservedFlushSeq = -1;
     private long _timeoutDeadlineTimestamp;
     private long _lastAnimationRedrawMs;
     private bool _autoSubmitEngineInput = true;
     private bool _isTicking;
     private bool _faultRaised;
     private bool _completionRaised;
+    private bool _pendingHoverRefresh;
     private int _frameIntervalMs = 16;
     private int _maxStepSliceMs = 12;
 
@@ -78,12 +81,15 @@ public class HyperaSkiaControl : SKControl
 
             _engine = value;
             _lastRenderedScene = null;
+            _frozenRedrawScene = null;
             _hoveredButton = null;
             _hoveredCbgButtonValue = null;
             _trackedGenerationId = -1;
+            _lastObservedFlushSeq = _engine?.RedrawFlushSequence ?? -1;
             _timeoutDeadlineTimestamp = 0;
             _faultRaised = false;
             _completionRaised = false;
+            _pendingHoverRefresh = false;
             _scrollbackOffset = 0;
             _inputBuffer.Clear();
 
@@ -358,11 +364,60 @@ public class HyperaSkiaControl : SKControl
         if (_engine is { } engine)
         {
             engine.ElapsedAnimationMs = _animationStopwatch.ElapsedMilliseconds;
-            ConsoleScene scene = engine.ConsoleBuffer.CaptureScene(
-                hoveredCbgButtonValue: _hoveredCbgButtonValue,
-                hoveredButton: _hoveredButton,
-                elapsedAnimationMs: engine.ElapsedAnimationMs);
-            _lastRenderedScene = scene;
+            bool isRedrawFrozen = _frozenRedrawScene is not null &&
+                                  engine.CurrentRedrawMode == 0 &&
+                                  engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded &&
+                                  engine.RedrawFlushSequence == _lastObservedFlushSeq;
+
+            ConsoleScene scene;
+            if (isRedrawFrozen)
+            {
+                scene = _frozenRedrawScene!;
+            }
+            else
+            {
+                scene = engine.ConsoleBuffer.CaptureScene(
+                    hoveredCbgButtonValue: _hoveredCbgButtonValue,
+                    hoveredButton: _hoveredButton,
+                    elapsedAnimationMs: engine.ElapsedAnimationMs);
+                _lastRenderedScene = scene;
+
+                // When freshly entering WaitingInput while the cursor is already resting over a button,
+                // evaluate hover immediately so the button highlights without requiring mouse jitter.
+                if (_pendingHoverRefresh && engine.Status == EngineStepStatus.WaitingInput && engine.Options.UseMouse)
+                {
+                    _pendingHoverRefresh = false;
+                    Point clientPt = PointToClient(MousePosition);
+                    if (ClientRectangle.Contains(clientPt))
+                    {
+                        LogicalPoint logicalPt = MapScreenToLogical(clientPt.X, clientPt.Y, out bool inside);
+                        if (inside)
+                        {
+                            ConsoleHitTestResult hit = ConsoleHitTester.HitTestLogicalPoint(
+                                scene,
+                                logicalPt.X,
+                                logicalPt.Y,
+                                engine.Graphics,
+                                engine.Sprites);
+                            _hoveredButton = hit.ActiveButton;
+                            _hoveredCbgButtonValue = hit.ActiveCbgButton?.ButtonValue;
+                            engine.HoveredButtonValue = _hoveredButton is not null
+                                ? _hoveredButton.StringValue
+                                : _hoveredCbgButtonValue.HasValue
+                                    ? _hoveredCbgButtonValue.Value.ToString(CultureInfo.InvariantCulture)
+                                    : string.Empty;
+                            bool interactive = hit.HasActiveButton || hit.ActiveCbgButton is not null || hit.HasCbgButtonMapHit || hit.HasSrcMapHit;
+                            Cursor = interactive ? Cursors.Hand : Cursors.Default;
+                            scene = scene with
+                            {
+                                HoveredButton = _hoveredButton,
+                                HoveredCbgButtonValue = _hoveredCbgButtonValue,
+                            };
+                            _lastRenderedScene = scene;
+                        }
+                    }
+                }
+            }
 
             _engineCompositor ??= new SkiaFrameCompositor(engine.Fonts, engine.Glyphs);
             _engineCompositor.RenderScene(
@@ -537,6 +592,14 @@ public class HyperaSkiaControl : SKControl
                 {
                     engine.Step();
                     batches++;
+
+                    // Yield immediately when AWAIT / REDRAW 2 explicitly requests a frame flush so
+                    // progress bars (e.g. CARD_TEXT_CACHE "初回検索中 XX%") actually present on screen.
+                    if (engine.Status == EngineStepStatus.Yielded &&
+                        engine.RedrawFlushSequence != _lastObservedFlushSeq)
+                    {
+                        break;
+                    }
                 }
                 while (engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded &&
                        Stopwatch.GetTimestamp() < sliceDeadline &&
@@ -545,7 +608,27 @@ public class HyperaSkiaControl : SKControl
                 _scrollbackOffset = 0;
                 engine.ConsoleBuffer.ScrollOffsetLines = 0;
                 ClearHoverState();
-                needsRepaint = true;
+
+                bool flushRequested = engine.RedrawFlushSequence != _lastObservedFlushSeq;
+                bool redrawAllowed = engine.CurrentRedrawMode != 0 ||
+                                     flushRequested ||
+                                     engine.Status is EngineStepStatus.WaitingInput or EngineStepStatus.Faulted or EngineStepStatus.Completed;
+                if (redrawAllowed)
+                {
+                    _lastObservedFlushSeq = engine.RedrawFlushSequence;
+                    _frozenRedrawScene = null;
+                    needsRepaint = true;
+                    if (engine.Status == EngineStepStatus.WaitingInput)
+                    {
+                        _pendingHoverRefresh = true;
+                    }
+                }
+                else
+                {
+                    // Honor REDRAW 0: keep the last committed visual frame frozen while offscreen work runs.
+                    _frozenRedrawScene ??= _lastRenderedScene;
+                }
+
                 contentChanged = true;
             }
 
@@ -557,6 +640,9 @@ public class HyperaSkiaControl : SKControl
                     _timeoutDeadlineTimestamp = req.TimeoutMilliseconds is > 0
                         ? Stopwatch.GetTimestamp() + (long)(req.TimeoutMilliseconds.Value * (Stopwatch.Frequency / 1000.0))
                         : 0;
+                    _frozenRedrawScene = null;
+                    _lastObservedFlushSeq = engine.RedrawFlushSequence;
+                    _pendingHoverRefresh = true;
                     contentChanged = true;
                     needsRepaint = true;
                 }
@@ -587,7 +673,10 @@ public class HyperaSkiaControl : SKControl
             }
 
             int animeInterval = Math.Max(33, engine.AnimeTimerIntervalMs);
-            if (!needsRepaint && elapsedMs - _lastAnimationRedrawMs >= animeInterval && HasPotentialAnimation(engine))
+            if (!needsRepaint &&
+                engine.CurrentRedrawMode != 0 &&
+                elapsedMs - _lastAnimationRedrawMs >= animeInterval &&
+                HasPotentialAnimation(engine))
             {
                 needsRepaint = true;
             }
@@ -628,7 +717,7 @@ public class HyperaSkiaControl : SKControl
     }
 
     private static bool HasPotentialAnimation(EmueraEngine engine) =>
-        engine.Sprites.Count > 0;
+        engine.Sprites.HasAnimatedSprites;
 
     private void UpdateHoverState(EmueraEngine engine, LogicalPoint pt, bool inside)
     {

@@ -730,6 +730,7 @@ internal static class VmDispatcher
                         engine.LastAwaitMilliseconds = insn.A < intRegs.Length && (insn.Aux & 1) != 0
                             ? Math.Max(0L, intRegs[insn.A])
                             : Math.Max(0L, insn.Immediate != 0 ? insn.Immediate : (insn.A < intRegs.Length ? intRegs[insn.A] : 0L));
+                        engine.NotifyRedrawFlush();
                         engine.EmitSnapshotInternal();
                         return EngineStepStatus.Yielded;
 

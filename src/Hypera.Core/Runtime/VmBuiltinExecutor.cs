@@ -166,7 +166,8 @@ internal static partial class VmBuiltinExecutor
     public static bool ExecuteConsoleOp(EmueraEngine engine, CallFrame frame, Instruction insn)
     {
         var flags = (PrintModifierFlags)insn.Aux;
-        if ((flags & PrintModifierFlags.DebugOnly) != 0)
+        bool isPrintOpcode = insn.Op is OpCode.Print or OpCode.PrintLine or OpCode.PrintWait or OpCode.PrintSingle or OpCode.PrintColumn;
+        if (isPrintOpcode && (flags & PrintModifierFlags.DebugOnly) != 0)
         {
             if ((engine.Options.UseDebugCommand || engine.AlwaysCaptureDebugPrint) &&
                 insn.Op is OpCode.Print or OpCode.PrintLine)
@@ -2066,7 +2067,7 @@ internal static partial class VmBuiltinExecutor
                 return null;
 
             case BuiltinInstructionKind.REDRAW:
-                engine.CurrentRedrawMode = (int)w.GetInt(0, 1L);
+                engine.SetRedrawMode((int)w.GetInt(0, 1L));
                 return null;
 
             case BuiltinInstructionKind.BREAKBUTTON:
@@ -2131,6 +2132,7 @@ internal static partial class VmBuiltinExecutor
 
             case BuiltinInstructionKind.AWAIT:
                 engine.LastAwaitMilliseconds = Math.Max(1L, w.GetInt(0, 1L));
+                engine.NotifyRedrawFlush();
                 engine.EmitSnapshotInternal();
                 return EngineStepStatus.Yielded;
 

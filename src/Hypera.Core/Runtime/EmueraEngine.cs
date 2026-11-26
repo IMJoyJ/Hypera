@@ -227,9 +227,22 @@ public sealed partial class EmueraEngine : IDisposable
     public IReadOnlyList<CallFrame> CallStack => _callStack;
 
     public long LastAwaitMilliseconds { get; internal set; }
+    public long RedrawFlushSequence { get; private set; }
     public bool RestartRequested { get; private set; }
     public bool IsSkipDisplay { get; internal set; }
     public int CurrentRedrawMode { get; internal set; } = 1;
+
+    internal void SetRedrawMode(int rawMode)
+    {
+        // Emuera REDRAW flags: bit 0 controls automatic redraw (0=off, 1=on), bit 1 forces an immediate refresh.
+        CurrentRedrawMode = (rawMode & 1) != 0 ? 1 : 0;
+        if ((rawMode & 2) != 0 || CurrentRedrawMode != 0)
+        {
+            NotifyRedrawFlush();
+        }
+    }
+
+    internal void NotifyRedrawFlush() => RedrawFlushSequence++;
     public uint CurrentForeColorRgba { get; private set; }
     public uint CurrentBackColorRgba { get; private set; }
     public int CurrentFontStyle { get; internal set; }
@@ -360,9 +373,14 @@ public sealed partial class EmueraEngine : IDisposable
             return;
         }
 
+        bool shouldAdvanceGeneration = _pendingScriptInputMeta?.Kind != InputRequestKind.TimedWait;
         PendingInputRequest = null;
         _pendingScriptInputMeta = null;
-        AdvanceButtonGeneration();
+        if (shouldAdvanceGeneration)
+        {
+            AdvanceButtonGeneration();
+        }
+
         Status = EngineStepStatus.Running;
     }
 
@@ -995,6 +1013,7 @@ public sealed partial class EmueraEngine : IDisposable
             AllowMouseHitTest: Options.UseMouse,
             ActiveButtons: SnapshotActiveButtonsForGeneration());
         Status = EngineStepStatus.WaitingInput;
+        NotifyRedrawFlush();
         EmitSnapshotInternal();
     }
 
@@ -1084,6 +1103,7 @@ public sealed partial class EmueraEngine : IDisposable
             AllowMouseHitTest: Options.UseMouse && (flags & WaitInputFlags.DisableMouseHitTest) == 0,
             ActiveButtons: activeButtons);
         Status = EngineStepStatus.WaitingInput;
+        NotifyRedrawFlush();
         EmitSnapshotInternal();
         return true;
     }
@@ -1422,8 +1442,92 @@ public sealed partial class EmueraEngine : IDisposable
         int widthCols = Math.Max(1, Options.PrintCLength);
         int textBytes = EastAsianStringOps.GetStrlenS(text, Options.LanguageCodePage);
         int pad = Math.Max(0, widthCols - textBytes);
+
+        // Emuera PRINTC / PRINTLC turns the entire cell caption into a single button when it contains [N],
+        // keeping only the column alignment padding outside the clickable span.
+        bool isPlainText = (flags & PrintModifierFlags.PlainText) != 0;
+        if (!isPlainText && TryExtractSingleBracketInt(text, out long btnVal))
+        {
+            bool useDefaultColor = (flags & PrintModifierFlags.DefaultColor) != 0;
+            string projected = (flags & PrintModifierFlags.ForceKana) != 0
+                ? ForceKanaMode switch
+                {
+                    1 => EastAsianStringOps.ToKatakana(text),
+                    2 => EastAsianStringOps.ToHiragana(text, widenHalfwidth: false),
+                    3 => EastAsianStringOps.ToHalf(EastAsianStringOps.ToKatakana(text)),
+                    _ => text,
+                }
+                : text;
+
+            if (rightAlign && pad > 0)
+            {
+                PrintStyled(new string(' ', pad), flags | PrintModifierFlags.PlainText);
+            }
+
+            RegisterButtonDescriptor(projected, isInt: true, btnVal);
+            _displayOperations.Add(new DisplayOperation(
+                DisplayOperationKind.PrintButtonSpan,
+                default,
+                projected,
+                useDefaultColor ? Options.ForeColorRgba : CurrentForeColorRgba,
+                CurrentFontName,
+                Options.FontSize,
+                ButtonGeneration: _buttonGeneration,
+                ButtonIntValue: btnVal));
+            ConsoleBuffer.CurrentFontFamily = CurrentFontName;
+            ConsoleBuffer.FontStyle = (FontStyleFlags)(CurrentFontStyle & 0xF);
+            ConsoleBuffer.PrintButton(projected, btnVal.ToString(CultureInfo.InvariantCulture), useDefaultColor: useDefaultColor);
+
+            if (!rightAlign && pad > 0)
+            {
+                PrintStyled(new string(' ', pad), flags | PrintModifierFlags.PlainText);
+            }
+
+            if ((flags & PrintModifierFlags.NewLine) != 0)
+            {
+                PrintNewLine();
+            }
+
+            return;
+        }
+
         string padded = rightAlign ? new string(' ', pad) + text : text + new string(' ', pad);
         PrintStyled(padded, flags);
+    }
+
+    private static bool TryExtractSingleBracketInt(string text, out long value)
+    {
+        value = 0L;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        int found = 0;
+        int open = text.IndexOf('[');
+        while (open >= 0)
+        {
+            int close = text.IndexOf(']', open + 1);
+            if (close < 0)
+            {
+                break;
+            }
+
+            ReadOnlySpan<char> inner = text.AsSpan(open + 1, close - open - 1).Trim();
+            if (!inner.IsEmpty && long.TryParse(inner, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long parsed))
+            {
+                value = parsed;
+                found++;
+                if (found > 1)
+                {
+                    return false;
+                }
+            }
+
+            open = text.IndexOf('[', close + 1);
+        }
+
+        return found == 1;
     }
 
     internal void PrintButtonSpan(string label, bool isInt, long intVal, string? strVal)
@@ -2098,8 +2202,9 @@ public sealed partial class EmueraEngine : IDisposable
             return;
         }
 
-        // Emuera automatically turns "[123] Choice" patterns in non-plain PRINT lines into clickable integer buttons.
-        List<(int Start, long Value)>? buttons = null;
+        // Emuera automatically turns both prefix "[123] Choice" and suffix "Choice[123]" patterns
+        // in non-plain PRINT lines into clickable integer buttons.
+        List<(int Open, int Close, long Value)>? tokens = null;
         int open = text.IndexOf('[');
         while (open >= 0)
         {
@@ -2112,45 +2217,92 @@ public sealed partial class EmueraEngine : IDisposable
             ReadOnlySpan<char> inner = text.AsSpan(open + 1, close - open - 1).Trim();
             if (!inner.IsEmpty && long.TryParse(inner, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long btnVal))
             {
-                RegisterButtonDescriptor(text[open..(close + 1)], isInt: true, btnVal);
-                buttons ??= [];
-                buttons.Add((open, btnVal));
+                tokens ??= [];
+                tokens.Add((open, close, btnVal));
             }
 
             open = text.IndexOf('[', close + 1);
         }
 
-        if (buttons is null)
+        if (tokens is null)
         {
             ConsoleBuffer.Print(text, useDefaultColor: useDefaultColor);
             return;
         }
 
-        int cursor = 0;
-        for (int i = 0; i < buttons.Count; i++)
+        // Resolve exact (Start, End, Value) button spans right-to-left so suffix labels ("移動[400]"),
+        // prefix labels ("[0] 最初からはじめる"), and back-to-back prefix labels ("[9999] - 戻る[9998] - 更新")
+        // all receive their exact clickable caption without bleeding into adjacent buttons.
+        var spans = new (int Start, int End, long Value)[tokens.Count];
+        int nextBtnStart = text.Length;
+        for (int i = tokens.Count - 1; i >= 0; i--)
         {
-            (int start, long val) = buttons[i];
+            (int tokOpen, int tokClose, long val) = tokens[i];
+            int afterStart = tokClose + 1;
+            bool hasTrailingLabel = HasNonWhitespace(text, afterStart, nextBtnStart);
+            int prevLimit = i > 0 ? tokens[i - 1].Close + 1 : 0;
+            bool hasImmediatePrefix = tokOpen > prevLimit && !char.IsWhiteSpace(text[tokOpen - 1]);
+
+            int btnStart;
+            int btnEnd;
+            if (hasImmediatePrefix && !hasTrailingLabel)
+            {
+                // Suffix-bracket button: e.g. "                移動[400]" -> caption "移動[400]"
+                btnStart = tokOpen;
+                while (btnStart > prevLimit && !char.IsWhiteSpace(text[btnStart - 1]))
+                {
+                    btnStart--;
+                }
+
+                btnEnd = tokClose + 1;
+            }
+            else
+            {
+                // Prefix-bracket button: e.g. "[0] Start Game" -> caption "[0] Start Game"
+                btnStart = tokOpen;
+                btnEnd = nextBtnStart;
+                while (btnEnd > tokClose + 1 && char.IsWhiteSpace(text[btnEnd - 1]))
+                {
+                    btnEnd--;
+                }
+            }
+
+            spans[i] = (btnStart, btnEnd, val);
+            nextBtnStart = btnStart;
+        }
+
+        int cursor = 0;
+        for (int i = 0; i < spans.Length; i++)
+        {
+            (int start, int end, long val) = spans[i];
             if (start > cursor)
             {
                 ConsoleBuffer.Print(text[cursor..start], useDefaultColor: useDefaultColor);
             }
 
-            int nextStart = i + 1 < buttons.Count ? buttons[i + 1].Start : text.Length;
-            int segEnd = nextStart;
-            while (segEnd > start && char.IsWhiteSpace(text[segEnd - 1]))
-            {
-                segEnd--;
-            }
-
-            string caption = text[start..segEnd];
+            string caption = text[start..end];
+            RegisterButtonDescriptor(caption, isInt: true, val);
             ConsoleBuffer.PrintButton(caption, val.ToString(CultureInfo.InvariantCulture), useDefaultColor: useDefaultColor);
-            if (segEnd < nextStart)
-            {
-                ConsoleBuffer.Print(text[segEnd..nextStart], useDefaultColor: useDefaultColor);
-            }
-
-            cursor = nextStart;
+            cursor = end;
         }
+
+        if (cursor < text.Length)
+        {
+            ConsoleBuffer.Print(text[cursor..], useDefaultColor: useDefaultColor);
+        }
+    }
+
+    private static bool HasNonWhitespace(string text, int start, int end)
+    {
+        for (int i = start; i < end; i++)
+        {
+            if (!char.IsWhiteSpace(text[i]))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void ExtractHtmlButtons(string html)

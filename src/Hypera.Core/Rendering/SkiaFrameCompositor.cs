@@ -346,6 +346,21 @@ public sealed class SkiaFrameCompositor : IDisposable
             case ConsolePartKind.Text:
                 if (!string.IsNullOrEmpty(part.Text))
                 {
+                    if (isHoveredButton &&
+                        part.ColorRgba == part.FocusColorRgba &&
+                        part.Width > 0f &&
+                        part.Height > 0f &&
+                        !string.IsNullOrWhiteSpace(part.Text))
+                    {
+                        using var focusBgPaint = new SKPaint
+                        {
+                            Color = new SKColor(128, 128, 128, 104),
+                            Style = SKPaintStyle.Fill,
+                            IsAntialias = false,
+                        };
+                        canvas.DrawRect(originOffsetX + part.X, lineTopY + part.YOffset, part.Width, part.Height, focusBgPaint);
+                    }
+
                     uint rgba = isHoveredButton ? part.FocusColorRgba : part.ColorRgba;
                     _glyphMeasurer.DrawText(
                         canvas,
