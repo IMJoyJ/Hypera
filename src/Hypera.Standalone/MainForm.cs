@@ -26,6 +26,7 @@ public sealed class MainForm : Form
     private readonly HyperaSkiaControl _skiaView;
     private readonly VScrollBar _scrollBar;
     private readonly Panel _loadingOverlayPanel;
+    private readonly Panel _loadingCardPanel;
     private readonly Label _loadingTitleLabel;
     private readonly Label _loadingStageLabel;
     private readonly SmoothProgressBar _loadingProgressBar;
@@ -221,82 +222,61 @@ public sealed class MainForm : Form
             BackColor = Color.FromArgb(10, 12, 16),
             Visible = false,
         };
+        _loadingOverlayPanel.Resize += (_, _) => UpdateLoadingOverlayLayout();
 
-        var loadingCenterGrid = new TableLayoutPanel
+        _loadingCardPanel = new Panel
         {
-            Dock = DockStyle.Fill,
-            ColumnCount = 3,
-            RowCount = 3,
-            BackColor = Color.Transparent,
-        };
-        loadingCenterGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
-        loadingCenterGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 460f));
-        loadingCenterGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
-        loadingCenterGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
-        loadingCenterGrid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        loadingCenterGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
-
-        var loadingCard = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            AutoSize = true,
-            ColumnCount = 1,
-            RowCount = 4,
-            Padding = new Padding(24, 20, 24, 20),
             BackColor = Color.FromArgb(18, 21, 28),
         };
-        loadingCard.Paint += (_, pe) =>
+        _loadingCardPanel.Paint += (_, pe) =>
         {
-            using var borderPen = new Pen(Color.FromArgb(46, 54, 70), 1f);
-            pe.Graphics.DrawRectangle(borderPen, 0, 0, loadingCard.Width - 1, loadingCard.Height - 1);
+            using var borderPen = new Pen(Color.FromArgb(52, 62, 82), 1f);
+            pe.Graphics.DrawRectangle(borderPen, 0, 0, _loadingCardPanel.Width - 1, _loadingCardPanel.Height - 1);
         };
 
         _loadingTitleLabel = new Label
         {
-            Dock = DockStyle.Fill,
-            AutoSize = true,
+            AutoSize = false,
+            AutoEllipsis = true,
+            UseMnemonic = false,
             ForeColor = Color.FromArgb(238, 242, 248),
             BackColor = Color.Transparent,
-            Font = new Font("Segoe UI", 12.5f, FontStyle.Bold),
-            Margin = new Padding(0, 0, 0, 8),
+            Font = new Font("Segoe UI", 13.5f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
             Text = "Loading Hypera...",
         };
 
         _loadingStageLabel = new Label
         {
-            Dock = DockStyle.Fill,
-            AutoSize = true,
-            ForeColor = Color.FromArgb(174, 186, 204),
+            AutoSize = false,
+            AutoEllipsis = true,
+            UseMnemonic = false,
+            ForeColor = Color.FromArgb(178, 190, 208),
             BackColor = Color.Transparent,
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Regular),
-            Margin = new Padding(0, 0, 0, 10),
+            Font = new Font("Segoe UI", 10f, FontStyle.Regular),
+            TextAlign = ContentAlignment.MiddleLeft,
             Text = "Preparing runtime...",
         };
 
-        _loadingProgressBar = new SmoothProgressBar
-        {
-            Dock = DockStyle.Fill,
-            Height = 14,
-            Margin = new Padding(0, 0, 0, 8),
-        };
+        _loadingProgressBar = new SmoothProgressBar();
 
         _loadingDetailLabel = new Label
         {
-            Dock = DockStyle.Fill,
-            AutoSize = true,
-            ForeColor = Color.FromArgb(128, 142, 164),
+            AutoSize = false,
+            AutoEllipsis = true,
+            UseMnemonic = false,
+            ForeColor = Color.FromArgb(132, 146, 168),
             BackColor = Color.Transparent,
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
-            Margin = new Padding(0),
+            Font = new Font("Segoe UI", 9f, FontStyle.Regular),
+            TextAlign = ContentAlignment.MiddleLeft,
             Text = "0%  •  0.0s",
         };
 
-        loadingCard.Controls.Add(_loadingTitleLabel, 0, 0);
-        loadingCard.Controls.Add(_loadingStageLabel, 0, 1);
-        loadingCard.Controls.Add(_loadingProgressBar, 0, 2);
-        loadingCard.Controls.Add(_loadingDetailLabel, 0, 3);
-        loadingCenterGrid.Controls.Add(loadingCard, 1, 1);
-        _loadingOverlayPanel.Controls.Add(loadingCenterGrid);
+        _loadingCardPanel.Controls.Add(_loadingTitleLabel);
+        _loadingCardPanel.Controls.Add(_loadingStageLabel);
+        _loadingCardPanel.Controls.Add(_loadingProgressBar);
+        _loadingCardPanel.Controls.Add(_loadingDetailLabel);
+        _loadingOverlayPanel.Controls.Add(_loadingCardPanel);
 
         _loadingAnimTimer = new System.Windows.Forms.Timer { Interval = 33 };
         _loadingAnimTimer.Tick += OnLoadingAnimTick;
@@ -514,6 +494,7 @@ public sealed class MainForm : Form
     {
         base.OnDpiChanged(e);
         UpdateInputBarHeight();
+        UpdateLoadingOverlayLayout();
         EnsureClientInsideWorkingArea();
     }
 
@@ -556,7 +537,63 @@ public sealed class MainForm : Form
         Text = $"{displayName} - Loading...";
         _loadingOverlayPanel.Visible = true;
         _loadingOverlayPanel.BringToFront();
+        UpdateLoadingOverlayLayout();
         _loadingAnimTimer.Start();
+    }
+
+    private void UpdateLoadingOverlayLayout()
+    {
+        float dpiScale = MathF.Max(1f, DeviceDpi / 96f);
+        int padX = (int)MathF.Round(40f * dpiScale);
+        int padY = (int)MathF.Round(30f * dpiScale);
+        int gapTitle = (int)MathF.Round(12f * dpiScale);
+        int gapStage = (int)MathF.Round(16f * dpiScale);
+        int gapBar = (int)MathF.Round(12f * dpiScale);
+        int barHeight = Math.Max(14, (int)MathF.Round(18f * dpiScale));
+
+        const TextFormatFlags measureFlags = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+        Size maxProbe = new(int.MaxValue, int.MaxValue);
+        Size titleSize = TextRenderer.MeasureText(_loadingTitleLabel.Text, _loadingTitleLabel.Font, maxProbe, measureFlags);
+        Size stageSize = TextRenderer.MeasureText(_loadingStageLabel.Text, _loadingStageLabel.Font, maxProbe, measureFlags);
+        Size detailSize = TextRenderer.MeasureText(_loadingDetailLabel.Text, _loadingDetailLabel.Font, maxProbe, measureFlags);
+
+        int hostW = _loadingOverlayPanel.ClientSize.Width > 0 ? _loadingOverlayPanel.ClientSize.Width : ClientSize.Width;
+        int hostH = _loadingOverlayPanel.ClientSize.Height > 0 ? _loadingOverlayPanel.ClientSize.Height : ClientSize.Height;
+        if (hostW <= 0 || hostH <= 0)
+        {
+            return;
+        }
+
+        int outerMargin = (int)MathF.Round(48f * dpiScale);
+        int maxCardW = Math.Max(360, hostW - (outerMargin * 2));
+        int minCardW = (int)MathF.Round(680f * dpiScale);
+        int ratioCardW = (int)MathF.Round(hostW * 0.56f);
+        int contentCardW = Math.Max(titleSize.Width, Math.Max(stageSize.Width, detailSize.Width))
+                           + (padX * 2)
+                           + (int)MathF.Round(40f * dpiScale);
+
+        int cardW = Math.Min(maxCardW, Math.Max(Math.Max(minCardW, ratioCardW), contentCardW));
+        int innerW = Math.Max(200, cardW - (padX * 2));
+
+        int titleH = titleSize.Height + (int)MathF.Round(6f * dpiScale);
+        int stageH = stageSize.Height + (int)MathF.Round(4f * dpiScale);
+        int detailH = detailSize.Height + (int)MathF.Round(4f * dpiScale);
+
+        int y = padY;
+        _loadingTitleLabel.Bounds = new Rectangle(padX, y, innerW, titleH);
+        y += titleH + gapTitle;
+        _loadingStageLabel.Bounds = new Rectangle(padX, y, innerW, stageH);
+        y += stageH + gapStage;
+        _loadingProgressBar.Bounds = new Rectangle(padX, y, innerW, barHeight);
+        y += barHeight + gapBar;
+        _loadingDetailLabel.Bounds = new Rectangle(padX, y, innerW, detailH);
+        y += detailH + padY;
+
+        int cardH = y;
+        int cardX = Math.Max(0, (hostW - cardW) / 2);
+        int cardY = Math.Max(0, (hostH - cardH) / 2);
+        _loadingCardPanel.Bounds = new Rectangle(cardX, cardY, cardW, cardH);
+        _loadingCardPanel.Invalidate();
     }
 
     private void HideLoadingOverlay()
@@ -575,6 +612,7 @@ public sealed class MainForm : Form
         _loadingProgressBar.Value = _currentLoadPercent;
         _statusLabel.Text = $"Loading {_currentLoadPercent}%";
         RefreshLoadingDetailText();
+        UpdateLoadingOverlayLayout();
     }
 
     private void OnLoadingAnimTick(object? sender, EventArgs e)
@@ -838,8 +876,22 @@ public sealed class MainForm : Form
 
     private void UpdateInputBarHeight()
     {
+        float dpiScale = MathF.Max(1f, DeviceDpi / 96f);
+        int statusW = (int)MathF.Round(190f * dpiScale);
+        if (_statusLabel.Width != statusW)
+        {
+            _statusLabel.Width = statusW;
+        }
+
+        int padX = Math.Max(4, (int)MathF.Round(4f * dpiScale));
+        int padY = Math.Max(3, (int)MathF.Round(3f * dpiScale));
+        if (_inputBarPanel.Padding.Left != padX || _inputBarPanel.Padding.Top != padY)
+        {
+            _inputBarPanel.Padding = new Padding(padX, padY, padX, padY);
+        }
+
         int preferred = _inputTextBox.PreferredHeight;
-        int targetHeight = Math.Max(28, preferred + _inputBarPanel.Padding.Vertical + 2);
+        int targetHeight = Math.Max((int)MathF.Round(28f * dpiScale), preferred + _inputBarPanel.Padding.Vertical + 2);
         if (_inputBarPanel.Height != targetHeight)
         {
             _inputBarPanel.Height = targetHeight;
