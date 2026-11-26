@@ -662,4 +662,39 @@ public sealed class EmueraCompatibilityFixesTests
         Assert.Equal(largeSlotId, syntheticRoundTrip.Functions[0].Parameters[0].RegisterOrSlotIndex);
         Assert.Equal<long>([7L, 8L], syntheticRoundTrip.StaticVariables[0].DefaultIntValues);
     }
+
+    [Fact]
+    public void StringAssignment_TrimsOuterAsciiSpacesAndTabs_WhilePreservingFullWidthAndAtFormSpaces()
+    {
+        // Reproduces eraOCG2 `31.情報更新(Loadup) （新）.ERB:268`:
+        // `非ターンプレイヤー = %対面者% ` (trailing space after `%対面者%`) followed by
+        // `GETVAR(@"%非ターンプレイヤー%_戦場:0")`. Original Emuera trims leading & trailing
+        // ASCII spaces/tabs in `STR = ...` (SP_SET_ArgumentBuilder: SkipHalfSpace + trim=true),
+        // while keeping full-width spaces (U+3000) and preserving spaces inside @"..." / PRINTFORM.
+        string erh = """
+            #DIM 相手_戦場, 6
+            """;
+
+        string erb =
+            "@MAIN\n" +
+            "#DIMS DYNAMIC 対面者 = \"相手\"\n" +
+            "#DIMS DYNAMIC 非ターンプレイヤー\n" +
+            "相手_戦場:0 = 777\n" +
+            "非ターンプレイヤー = %対面者% \n" +
+            "A:0 = GETVAR(@\"%非ターンプレイヤー%_戦場:0\")\n" +
+            "STR:0 =   \t%対面者%\t   \n" +
+            "STR:1 = \u3000全角保持\u3000  \n" +
+            "STR:2 =    \t  \n" +
+            "STR:3 '= @\" %対面者% \"\n" +
+            "STR:4 '= STRFORM(\" %対面者% \")\n";
+
+        ExecutedRun run = CompilerTestHarness.CompileAndRun(erb, erhSource: erh);
+
+        Assert.Equal(777L, run.GetInt("A", 0));
+        Assert.Equal("相手", run.GetStr("STR", 0));
+        Assert.Equal("\u3000全角保持\u3000", run.GetStr("STR", 1));
+        Assert.Equal(string.Empty, run.GetStr("STR", 2));
+        Assert.Equal(" 相手 ", run.GetStr("STR", 3));
+        Assert.Equal(" 相手 ", run.GetStr("STR", 4));
+    }
 }

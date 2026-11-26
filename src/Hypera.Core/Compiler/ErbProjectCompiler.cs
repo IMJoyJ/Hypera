@@ -1482,14 +1482,19 @@ public sealed class ErbProjectCompiler
             return new TokenStream(tokens, fallbackSpan);
         }
 
-        private StrFormExpr ParseFormString(string rawFormText, PreprocessedLine line, int col1Based, SourceSpan wholeSpan)
+        private StrFormExpr ParseFormString(
+            string rawFormText,
+            PreprocessedLine line,
+            int col1Based,
+            SourceSpan wholeSpan,
+            bool trimOuterSpaces = false)
         {
             int pos = 0;
             ImmutableArray<RawFormPart> parts = _lexer.ScanFormattedString(
                 rawFormText,
                 ref pos,
                 FormTerminator.EndOfLine,
-                trimOuterSpaces: false,
+                trimOuterSpaces: trimOuterSpaces,
                 line.FileId,
                 _fn.FilePath,
                 line.LineNo,
@@ -1832,13 +1837,18 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            if (!rawRhs.IsEmpty && (rawRhs[0] == ' ' || rawRhs[0] == '\t'))
+            // Match Emuera SP_SET_ArgumentBuilder: SkipHalfSpace + AnalyseFormattedString(EoL, trim: true)
+            // trims ASCII spaces/tabs at both ends while preserving full-width spaces (U+3000) and inner spaces.
+            int leadingWs = 0;
+            while (leadingWs < rawRhs.Length && (rawRhs[leadingWs] == ' ' || rawRhs[leadingWs] == '\t'))
             {
-                rawRhs = rawRhs[1..];
+                leadingWs++;
             }
 
+            rawRhs = rawRhs[leadingWs..];
+
             int rhsCol = col1Based + (fullLineText.Length - rawRhs.Length);
-            StrFormExpr formExpr = ParseFormString(rawRhs.ToString(), line, rhsCol, lineSpan);
+            StrFormExpr formExpr = ParseFormString(rawRhs.ToString(), line, rhsCol, lineSpan, trimOuterSpaces: true);
             var mark = _emitter.MarkTempRegs();
             ushort valReg = _emitter.EmitExprToStrReg(formExpr);
             _emitter.EmitVariableStoreStr(lhs, valReg);
@@ -4093,7 +4103,7 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            StrFormExpr nameForm = ParseFormString(rawFormTarget, line, argCol, lineSpan);
+            StrFormExpr nameForm = ParseFormString(rawFormTarget, line, argCol, lineSpan, trimOuterSpaces: true);
             ImmutableArray<ExprNode?> callArgs = ParseCallRawArgsList(line, rawArgs, argCol + argsOffset, targetFn: null, lineSpan);
 
             if (isTryC)
@@ -4230,7 +4240,7 @@ public sealed class ErbProjectCompiler
                         _isDebugMode,
                         _options.SystemAllowFullSpace);
                     ReadOnlySpan<char> gSpan = !cleanGoto.IsEmpty && cleanGoto[0] == '$' ? cleanGoto[1..] : cleanGoto;
-                    StrFormExpr form = ParseFormString(gSpan.ToString(), fl, fArgCol, fSpan);
+                    StrFormExpr form = ParseFormString(gSpan.ToString(), fl, fArgCol, fSpan, trimOuterSpaces: true);
                     items.Add((form, [], fSpan));
                 }
                 else if (TrySplitCallTargetAndArgs(
@@ -4243,7 +4253,7 @@ public sealed class ErbProjectCompiler
                     out string rawArgs,
                     out int argsOff))
                 {
-                    StrFormExpr form = ParseFormString(rawFormTarget, fl, fArgCol, fSpan);
+                    StrFormExpr form = ParseFormString(rawFormTarget, fl, fArgCol, fSpan, trimOuterSpaces: true);
                     ImmutableArray<ExprNode?> callArgs = ParseCallRawArgsList(fl, rawArgs, fArgCol + argsOff, targetFn: null, fSpan);
                     items.Add((form, callArgs, fSpan));
                 }
@@ -4321,7 +4331,7 @@ public sealed class ErbProjectCompiler
                 return;
             }
 
-            StrFormExpr nameForm = ParseFormString(rawFormTarget, line, argCol, lineSpan);
+            StrFormExpr nameForm = ParseFormString(rawFormTarget, line, argCol, lineSpan, trimOuterSpaces: true);
             ImmutableArray<ExprNode?> callArgs = ParseCallRawArgsList(line, rawArgs, argCol + argsOffset, targetFn: null, lineSpan);
 
             var mark = _emitter.MarkTempRegs();

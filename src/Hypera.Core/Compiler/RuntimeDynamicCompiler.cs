@@ -149,7 +149,10 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         return EvalStrNode(node, engine, activeFrame);
     }
 
-    public string EvaluateStrForm(EmueraEngine engine, CallFrame? activeFrame, string formTemplate)
+    public string EvaluateStrForm(EmueraEngine engine, CallFrame? activeFrame, string formTemplate) =>
+        EvaluateStrFormCore(engine, activeFrame, formTemplate, trimOuterSpaces: false);
+
+    private string EvaluateStrFormCore(EmueraEngine engine, CallFrame? activeFrame, string formTemplate, bool trimOuterSpaces)
     {
         ArgumentNullException.ThrowIfNull(engine);
         if (string.IsNullOrEmpty(formTemplate))
@@ -165,7 +168,7 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
             formTemplate,
             ref pos,
             FormTerminator.EndOfLine,
-            trimOuterSpaces: false,
+            trimOuterSpaces: trimOuterSpaces,
             fileId: 0,
             filePath: "<dynamic>",
             lineNo: 1,
@@ -319,7 +322,7 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
                 if (lhs.ValueKind == VariableValueKind.Str)
                 {
                     string rhsVal = op == OperatorKind.Assign
-                        ? EvaluateStrForm(engine, frame, ExtractAfterEquals(trimmed))
+                        ? EvaluateStrFormCore(engine, frame, ExtractAfterEquals(trimmed), trimOuterSpaces: true)
                         : EvalStrNode(_exprParser.ParseStrExpression(rhsStream, fnSym, "<@debug>", diagnostics), engine, frame);
                     diagnostics.ThrowIfErrors();
                     string finalStr = op == OperatorKind.AddAssign
