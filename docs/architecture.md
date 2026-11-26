@@ -25,6 +25,10 @@ flowchart TD
     Platform --> Shim["Hypera.LegacyPluginShim (AssemblyName: Emuera, net10.0)"]
     CLI["Hypera.Cli (hypera, net10.0)"] --> Core
     CLI --> Shim
+    Standalone["Hypera.Standalone (WinForms Desktop Runner)"] --> Core
+    Standalone --> Audio
+    Standalone --> Shim
+    Standalone --> WinForms
     Audio["Hypera.Audio (net10.0)"] --> Core
     Shim --> Core
     WinForms["Hypera.Views.WinForms (net10.0-windows10.0.19041.0)"] --> Core
@@ -44,6 +48,7 @@ flowchart TD
 | `src/Hypera.Views.WinForms` | `net10.0-windows10.0.19041.0` | 超薄 `SKControl` 宿主控件 `HyperaSkiaControl`，转发绘制与逻辑视口鼠标坐标 |
 | `src/Hypera.Views.Wpf` | `net10.0-windows10.0.19041.0` | 超薄 `SKElement` 宿主控件 `HyperaSkiaElement`，处理 WPF DPI 换算并转发逻辑视口输入 |
 | `src/Hypera.Cli` | `net10.0` (**`hypera`**) | 命令行入口，承载 `run`、`compile`、`pack`、`bundle` 四大子命令 |
+| `src/Hypera.Standalone` | `net10.0-windows10.0.19041.0` | Windows 独立桌面执行器，支持双击自动识别 `.hep`/`.heb`/目录、外部 Overlay 覆盖、`config.json` 窗口状态持久化与 F12 实时调试台 |
 | `src/Hypera.Platform` | `net10.0` (`Hypera.Platform.dll`) | 多租户/本地共用平台服务层：SQLite WAL 持久化、鉴权与首位自动管理员、并行 `.zip`→`.hep` 编译审核流水线、二进制 `(SHA-256, Size)` 信誉库、智能选版、沙箱存档与共享字节码会话托管 |
 | `src/Hypera.Web.UI` | `net10.0` (`Hypera.Web.UI.dll`) | 共享 MudBlazor RCL：Slate & Teal 主题、多语言即时切换、目录/详情/管理后台、存档管理与富媒体 `PlayStage` 舞台组件 |
 | `src/Hypera.Server` | `net10.0` (`Hypera.Server.dll`) | ASP.NET Core Blazor Interactive Server 宿主（默认 `http://0.0.0.0:5080`），承载 Cookie 认证、源码/存档流式端点与空闲会话回收 |

@@ -1,8 +1,13 @@
+**简体中文** | [日本語](README.ja.md)
+
 # Hypera —— 面向 .NET 10 的现代化跨平台 Emuera 编译与运行时引擎
 
 **Hypera** 是从零设计的 `.NET 10` 跨平台、100% 实例隔离的 Emuera（eramaker / EM+EE / Emuera.NET 派生脚本）静态编译器、寄存器虚拟机、Skia 渲染合成器与资源打包工具链。
 
-它既可作为桌面端（WinForms / WPF / MAUI）与终端（`hypera` CLI）的独立执行内核，也可作为高并发多租户 Web 宿主（如 CloudEmuera）的无阻塞嵌入式引擎。
+它既可作为桌面端（`Hypera.Standalone` / WinForms / WPF / MAUI）与终端（`hypera` CLI）的独立执行内核，也可作为高并发多租户 Web 宿主（`Hypera.Server` / CloudEmuera）的无阻塞嵌入式引擎。
+
+> [!NOTE]
+> **中立引擎声明**：本仓库及 GitHub Releases 仅提供中立的编译器、打包工具、桌面/移动/命令行执行器与 Web 托管框架，**不包含、不打包、也不分发任何第三方游戏脚本或游戏资产**。请使用您合法持有的游戏脚本目录、`.hep` 资源包、`.heb` 字节码或 `.zip` 压缩包配合本引擎运行。
 
 ---
 
@@ -14,13 +19,28 @@
   - 所有字节码采用固定 16 字节 blittable `Instruction` 布局，配合 `long[]` / `string[]` 双类型分离寄存器组实现零装箱执行。
   - 内置 `ForInit`/`ForStep`、`RepeatInit`/`RepeatStep` 循环超指令与 `Span<T>` / `Vector<long>` SIMD 数组运算：**1,000,000 次紧密循环在 Release 下约 ~25 ms**。
   - **无栈协程挂起**：执行 `INPUT` / `ONEINPUT` / `TINPUT` / `BINPUT` / `INPUTMOUSEKEY` / `WAIT` / `AWAIT` 时零阻塞 OS 线程，立即返回 `EngineStepStatus.WaitingInput` 或 `Yielded`，并通过代数校验（`GenerationId`）安全过滤过期输入。
+  - **惰性内存分配**：变量表、角色数组、符号表与精灵解码均按需惰性物化，配合有界 LRU 缓存，大幅降低大型工程的内存占用与冷启动耗时。
 - **权威逻辑视口与 Skia + HarfBuzz 合成渲染**：
   - 实例级 VFS `font/*.ttf` 加载，针对像素瓦片字体启用 `SKFontEdging.Alias`、整数像素对齐与 `LineHeight == FontSize` 零像素接缝渲染。
   - 原生 `SKCodec` 静态与多帧动画 **WebP** / PNG / BMP / GIF 解码；完整实现 `GCREATE` / `GDRAWG`（5×5 ColorMatrix）/ `GDRAWGWITHMASK` / `GROTATE` / `HTML_PRINT`（含任意 `<div depth>`、`HTML_PRINT_ISLAND`）/ `CBGSETBMAPG` 与 `<img srcm>` 拾色命中测试（`RESULT:3/4/6`）。
 - **只读虚拟文件系统与兼容存档持久化**：
-  - 统一通过 `IVirtualFileSystem` 挂载散装目录（`PhysicalDirectoryVfs`）、单文件索引资源包 `.hep`（`HepArchiveVfs` / `HepPackageWriter`，支持 Deflate 与 CRC32 校验）以及 `.zip`（`ZipArchiveVfs`）。
-  - 支持传统文本 `.sav`、二进制 `.sav`（Ebdb RLE 压缩）与 GZip 压缩二进制 `.sav`（完整持久化角色表、`#DIM SAVEDATA`/`CHARADATA` 以及 `DataTable` / `XML` / `MAP` VarExt 容器），写入隔离的 `WritableSaveDirectory` 沙箱。
+  - 统一通过 `IVirtualFileSystem` 挂载散装目录（`PhysicalDirectoryVfs`）、单文件索引资源包 `.hep`（`HepArchiveVfs` / `HepPackageWriter`，支持 Deflate 与 CRC32 校验）以及 `.zip`（`ZipArchiveVfs`），并支持运行期外部目录 Overlay 覆盖。
+  - 支持传统文本 `.sav`、二进制 `.sav`（Ebdb RLE 压缩）与 GZip 压缩二进制 `.sav`（完整持久化角色表、`#DIM SAVEDATA`/`CHARADATA` 以及 `DataTable` / `XML` / `MAP` VarExt 容器），写入隔离的可写用户存储目录。
 - **旧版 `CALLSHARP` 插件二进制兼容**：`Hypera.LegacyPluginShim`（输出 `Emuera.dll`）通过可回收 `AssemblyLoadContext` 与 `AsyncLocal` 引擎作用域，确保旧版 C# 插件在多实例并发下零串扰运行并支持卸载。
+
+---
+
+## 预编译发布包（GitHub Releases）
+
+在 [Releases](../../releases) 页面提供以下自包含（无需预装 .NET 10 运行时）的中立二进制产物与 `SHA256SUMS.txt` 校验清单：
+
+| 发布包 | 适用平台 | 包含内容与用途 |
+| --- | --- | --- |
+| `hypera-standalone-<ver>-win-x64.zip` | Windows x64 | 独立桌面执行器 `Hypera.Standalone.exe`，解压即用，支持直接运行 `.hep` / `.heb` / `.zip` 或散装游戏目录，也可作为 `hypera bundle --host` 模板 |
+| `hypera-cli-<ver>-<rid>.zip` / `.tar.gz` | Windows (`x64`/`arm64`)、Linux (`x64`/`arm64`)、macOS (`arm64`/`x64`) | `hypera` 命令行编译器、`.hep` 资源打包器、单文件 `HYPRBNDL` 封装器与 24-bit TrueColor ANSI 终端运行器 |
+| `hypera-server-<ver>-<rid>.zip` / `.tar.gz` | Windows (`x64`)、Linux (`x64`/`arm64`)、macOS (`arm64`) | `Hypera.Server` 多用户 Web 托管服务端（默认监听 `0.0.0.0:5080`，SQLite 持久化） |
+| `hypera-maui-<ver>-win-x64.zip` | Windows x64 | `Hypera.Maui` 本地跨平台桌面客户端（Unpackaged，免登录本地库管理与游玩） |
+| `hypera-maui-<ver>-android.apk` | Android 7.0+ (API 24+) | `Hypera.Maui` Android 本地客户端安装包 |
 
 ---
 
@@ -28,10 +48,11 @@
 
 | 项目 | 目标框架 / 输出 | 职责说明 |
 | --- | --- | --- |
-| [`src/Hypera.Core`](src/Hypera.Core) | `net10.0` (`Hypera.Core.dll`) | 编译器、多语言诊断与 `HyperaLocalizer`、16B 寄存器 VM、CSV/Config/Save 持久化、VFS（目录 / `.hep` / `.zip`）、Skia 渲染与 `HyperaGameHost` |
+| [`src/Hypera.Core`](src/Hypera.Core) | `net10.0` (`Hypera.Core.dll`) | 编译器、多语言诊断与 `HyperaLocalizer`、16B 寄存器 VM、CSV/Config/Save 持久化、VFS（目录 / `.hep` / `.zip` / Overlay）、Skia 渲染与 `HyperaGameHost` |
 | [`src/Hypera.Audio`](src/Hypera.Audio) | `net10.0` (`Hypera.Audio.dll`) | 跨平台 10 路音效（SE `0..9`）+ 1 路循环 BGM 软件混音器 `CrossPlatformAudioMixer` |
 | [`src/Hypera.LegacyPluginShim`](src/Hypera.LegacyPluginShim) | `net10.0` (`Emuera.dll`) | 兼容 `MinorShift.Emuera.Runtime.Utils.PluginSystem` 的 `CALLSHARP` 插件垫片（实现 `ISharpPluginHost`） |
 | [`src/Hypera.Cli`](src/Hypera.Cli) | `net10.0` (`hypera`) | 命令行工具：交互式 24-bit TrueColor ANSI 终端运行、无头 PNG 帧导出、`.heb` 编译、`.hep` 打包与单文件 `HYPRBNDL` 封装 |
+| [`src/Hypera.Standalone`](src/Hypera.Standalone) | `net10.0-windows10.0.19041.0` (`Hypera.Standalone.exe`) | Windows 独立桌面执行器：双击自动发现 `.hep`/`.heb`/目录、拖放加载、外部资源与配置 Overlay 覆盖、`config.json` 窗口状态持久化、实时 Debug 控制台 |
 | [`src/Hypera.Views.WinForms`](src/Hypera.Views.WinForms) | `net10.0-windows10.0.19041.0` | DPI 感知 WinForms `HyperaSkiaControl` 宿主控件 |
 | [`src/Hypera.Views.Wpf`](src/Hypera.Views.Wpf) | `net10.0-windows10.0.19041.0` | DPI 感知 WPF `HyperaSkiaElement` 宿主控件 |
 | [`src/Hypera.Platform`](src/Hypera.Platform) | `net10.0` (`Hypera.Platform.dll`) | 应用目录、版本链与算法 β 智能选版、并行 `.zip`→`.hep` 编译审核流水线、二进制哈希信誉、隔离存档库与共享字节码会话管理器（EF Core SQLite） |
@@ -47,14 +68,15 @@
 
 ## 快速构建与测试
 
-需要安装 **.NET 10 SDK**：
+需要安装 **.NET 10 SDK**（构建 `Hypera.Maui` 还需安装对应平台的 MAUI workload）：
 
 ```powershell
-# 编译整个解决方案（Release）
-dotnet build Hypera.slnx -c Release
+# 编译并运行核心与平台全量测试（无需 MAUI workload）
+dotnet test tests/Hypera.Tests/Hypera.Tests.csproj -c Release
+dotnet test tests/Hypera.Platform.Tests/Hypera.Platform.Tests.csproj -c Release
 
-# 运行全部测试套件
-dotnet test Hypera.slnx -c Release
+# 已安装 MAUI workload 时，编译整个解决方案
+dotnet build Hypera.slnx -c Release
 ```
 
 ---
@@ -64,18 +86,42 @@ dotnet test Hypera.slnx -c Release
 `hypera` 统一复用 `Hypera.Core` 的权威编译器与二进制编解码器，生成的 `.heb` 与 `.hep` 与内核 100% 二进制一致：
 
 ```powershell
+# 查看版本号
+hypera --version
+
 # 1. 直接运行散装游戏目录、.heb 字节码、.hep 资源包或 .zip 压缩包
-dotnet run --project src/Hypera.Cli -c Release -- run <path> [--headless-frames <png_dir>] [--input <val>]
+hypera run <path> [--headless-frames <png_dir>] [--input <val>]
 
 # 2. 将 ERH/ERB 静态编译为 .heb 字节码（魔数 "HEBC"）
-dotnet run --project src/Hypera.Cli -c Release -- compile <game_dir> -o game.heb
+hypera compile <game_dir> -o game.heb
 
 # 3. 将资产、配置、字体与预编译 .heb 字节码打包为单文件 .hep（魔数 "HEPK"）
-dotnet run --project src/Hypera.Cli -c Release -- pack <game_dir> -o game.hep [--no-compress]
+#    --compiled-only 可剥离原始 ERB/ERH 源码仅保留预编译字节码与资源；--exclude 可排除指定目录/文件
+hypera pack <game_dir> -o game.hep [--no-compress] [--compiled-only] [--exclude <path>]
 
 # 4. 追加 24 字节 HYPRBNDL 尾部生成独立可执行单文件包（启动时自动识别并挂载）
-dotnet run --project src/Hypera.Cli -c Release -- bundle game.hep --host path/to/hypera.exe -o Game.exe
+hypera bundle game.hep --host path/to/Hypera.Standalone.exe -o Game.exe
 ```
+
+> 从源码直接运行 CLI 时，可将上方 `hypera` 替换为 `dotnet run --project src/Hypera.Cli -c Release --`。
+
+---
+
+## `Hypera.Standalone` 独立桌面执行器（Windows）
+
+`Hypera.Standalone` 复刻并现代化了经典 Emuera 零配置双击启动体验，并优先使用预编译二进制格式：
+
+1. **自动发现优先级**：
+   - 若可执行文件末尾附带 `HYPRBNDL` 尾部载荷，直接挂载内嵌 `.hep`/`.heb`。
+   - 若通过命令行传参或从文件资源管理器拖拽 `.hep` / `.heb` / `.zip` / 目录至窗口，直接加载该目标。
+   - 无参数启动时，自动扫描同目录：`<ExeName>.hep` → `game.hep` → 唯一 `*.hep` → 同序 `.heb` → 经典 `ERB/` 或 `CSV/` 目录。
+2. **外部 Overlay 覆盖**：挂载 `.hep` 或 `.zip` 时无需解包，直接在同目录放置自定义 `emuera.config` 或 `resources/` 差分文件即可自动覆盖合并（可通过 `--no-overlay` 关闭）。
+3. **宿主配置与存档**：窗口最大化状态与尺寸自动持久化到 `config.json`；存档默认保存在同目录 `sav/`（支持 `--save-dir <dir>` 自定义）。
+4. **常用快捷键**：`F11` 全屏、`F12` 实时 Debug 控制台、`Ctrl+O` 打开游戏包、`Ctrl+R` 重启、`Ctrl+S` 导出日志、`Ctrl+M` 静音、按住鼠标右键快进。
+5. **无头烟雾验帧（CI / 回归测试）**：
+   ```powershell
+   Hypera.Standalone.exe <target> --headless-smoke output.png [--input 0] [--debug]
+   ```
 
 ---
 
@@ -203,3 +249,11 @@ dotnet run --project src/Hypera.Maui -f net10.0-windows10.0.19041.0 -c Release
   "diag.ERA1426": "정의되지 않은 변수 또는 식별자 '{0}'입니다."
 }
 ```
+
+---
+
+## 许可证（License）
+
+`Copyright (c) 2026 JoyJ. All rights reserved.`
+
+本项目当前采用 **All Rights Reserved**（保留所有权利），暂未授予任何开源复制、修改或再分发许可。详见 [`LICENSE`](LICENSE)。
