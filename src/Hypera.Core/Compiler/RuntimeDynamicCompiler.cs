@@ -28,17 +28,27 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         ArgumentNullException.ThrowIfNull(module);
         _module = module;
         _options = module.CompilerOptions;
-        _symbols = symbols ?? RebuildSymbolTableFromModule(module, _funcSymbolsById);
+        _symbols = symbols ?? CreateSharedSymbolTable(module);
         _lexer = new ErbLexer(_options, isDebugMode: true, _symbols.TryGetMacroTokens);
         _exprParser = new ExpressionParser(_symbols);
 
-        if (symbols is not null)
+        if (symbols is not null && symbols.LazyFunctionHydrator is null)
         {
             foreach (UserFunctionSymbol fn in symbols.AllFunctions)
             {
                 _funcSymbolsById[fn.FunctionId] = fn;
             }
         }
+    }
+
+    /// <summary>
+    /// Builds a lightweight, shareable <see cref="SymbolTable"/> containing global variables and an
+    /// on-demand function hydrator backed by <paramref name="module"/> (avoiding eager allocation of 100k+ function symbols).
+    /// </summary>
+    public static SymbolTable CreateSharedSymbolTable(BytecodeModule module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        return RebuildSymbolTableFromModule(module);
     }
 
     public BytecodeModule Module => _module;
@@ -1023,21 +1033,25 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
             return byId;
         }
 
+        if (_module.TryGetFunctionById(frame.FunctionId, out FunctionDescriptor? fd) && fd is not null)
+        {
+            UserFunctionSymbol hydrated = EnsureFunctionHydrated(_module, _symbols, fd);
+            _funcSymbolsById[frame.FunctionId] = hydrated;
+            return hydrated;
+        }
+
         return _symbols.TryResolveCallableFunction(frame.FunctionName);
     }
 
-    private static SymbolTable RebuildSymbolTableFromModule(BytecodeModule module, Dictionary<int, UserFunctionSymbol> outById)
+    private static SymbolTable RebuildSymbolTableFromModule(BytecodeModule module)
     {
         var external = new CompilerExternalContext { ReplaceConfig = module.ReplaceConfig };
         var st = new SymbolTable(module.CompilerOptions, external);
         var dummyDiag = new DiagnosticBag();
 
-        var globalByName = new Dictionary<string, VariableSlotDescriptor>(
-            module.CompilerOptions.IgnoreCase ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
         foreach (VariableSlotDescriptor g in module.StaticVariables)
         {
-            globalByName[g.Name] = g;
-            if (g.Name.Contains('@', StringComparison.Ordinal))
+            if (g.Scope == VariableScopeKind.FunctionStatic || g.Name.Contains('@', StringComparison.Ordinal))
             {
                 continue;
             }
@@ -1055,7 +1069,7 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
                     Name = g.Name,
                     ValueKind = g.ValueKind,
                     Scope = g.Scope,
-                    ArrayRank = g.IsConst || (g.Dimensions is [1] && g.Scope is VariableScopeKind.GlobalDim or VariableScopeKind.GlobalDimSavedata) ? g.Dimensions.Length : g.Dimensions.Length,
+                    ArrayRank = g.Dimensions.Length,
                     Dimensions = g.Dimensions,
                     IsCharaData = g.IsCharaData,
                     IsSavedata = g.IsSavedata,
@@ -1067,66 +1081,105 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
             }
         }
 
-        foreach (FunctionDescriptor fd in module.Functions)
+        st.LazyFunctionHydrator = name =>
         {
-            UserFunctionSymbol fn = st.RegisterFunction(fd.Name, default, "<module>", [], dummyDiag);
-            fn.EntryPc = fd.EntryPc;
-            fn.InstructionCount = fd.InstructionCount;
-            fn.IntRegisterCount = fd.IntRegisterCount;
-            fn.StrRegisterCount = fd.StrRegisterCount;
-            fn.IsMethod = fd.IsMethodFunction;
-            fn.MethodReturnKind = fd.MethodReturnKind;
-            fn.EventFlags = fd.EventFlags;
-
-            foreach (VariableSlotDescriptor lv in fd.LocalVariables)
+            if (module.TryGetFunctionByName(name, out FunctionDescriptor? fd) && fd is not null)
             {
-                string shortName = lv.Name.Contains('@', StringComparison.Ordinal) ? lv.Name[..lv.Name.IndexOf('@')] : lv.Name;
-                fn.PrivateVariables[shortName] = new ResolvedVariable
-                {
-                    SlotId = lv.SlotId,
-                    Name = shortName,
-                    ValueKind = lv.ValueKind,
-                    Scope = lv.Scope,
-                    ArrayRank = Math.Max(1, lv.Dimensions.Length),
-                    Dimensions = lv.Dimensions,
-                    IsByRef = lv.Scope == VariableScopeKind.Reference,
-                    IsConst = lv.IsConst,
-                    OwnerFunctionName = fd.Name,
-                };
+                return HydrateFunctionDescriptorLocked(module, st, fd);
             }
 
-            fn.LocalArray = BuildFuncStaticFromModule(fn.Name, "LOCAL", VariableValueKind.Int, globalByName);
-            fn.LocalsArray = BuildFuncStaticFromModule(fn.Name, "LOCALS", VariableValueKind.Str, globalByName);
-            fn.ArgArray = BuildFuncStaticFromModule(fn.Name, "ARG", VariableValueKind.Int, globalByName);
-            fn.ArgsArray = BuildFuncStaticFromModule(fn.Name, "ARGS", VariableValueKind.Str, globalByName);
-
-            foreach (FunctionParameterDescriptor p in fd.Parameters)
-            {
-                string baseName = p.Name.Contains(':', StringComparison.Ordinal) ? p.Name[..p.Name.IndexOf(':')] : p.Name;
-                if (st.TryResolveVariable(baseName, null, fn, out ResolvedVariable? pv) && pv is not null)
-                {
-                    fn.Parameters.Add(new ParsedFunctionParameter(
-                        new VariableAccessExpr(pv, [], IsBareArrayReference: p.IsByRef, default),
-                        p.HasDefaultValue,
-                        p.DefaultIntValue,
-                        p.DefaultStrValue ?? string.Empty,
-                        default));
-                }
-            }
-
-            outById[fd.FunctionId] = fn;
-        }
+            return null;
+        };
 
         return st;
     }
 
+    private static UserFunctionSymbol EnsureFunctionHydrated(
+        BytecodeModule module,
+        SymbolTable st,
+        FunctionDescriptor fd)
+    {
+        lock (st.LazySyncRoot)
+        {
+            if (st.TryGetFunctionsByName(fd.Name, out IReadOnlyList<UserFunctionSymbol> existing) && existing.Count > 0)
+            {
+                for (int i = 0; i < existing.Count; i++)
+                {
+                    if (existing[i].FunctionId == fd.FunctionId)
+                    {
+                        return existing[i];
+                    }
+                }
+
+                return existing[0];
+            }
+
+            return HydrateFunctionDescriptorLocked(module, st, fd);
+        }
+    }
+
+    private static UserFunctionSymbol HydrateFunctionDescriptorLocked(
+        BytecodeModule module,
+        SymbolTable st,
+        FunctionDescriptor fd)
+    {
+        var dummyDiag = new DiagnosticBag();
+        UserFunctionSymbol fn = st.RegisterFunction(fd.Name, default, "<module>", [], dummyDiag);
+        fn.EntryPc = fd.EntryPc;
+        fn.InstructionCount = fd.InstructionCount;
+        fn.IntRegisterCount = fd.IntRegisterCount;
+        fn.StrRegisterCount = fd.StrRegisterCount;
+        fn.IsMethod = fd.IsMethodFunction;
+        fn.MethodReturnKind = fd.MethodReturnKind;
+        fn.EventFlags = fd.EventFlags;
+
+        foreach (VariableSlotDescriptor lv in fd.LocalVariables)
+        {
+            string shortName = lv.Name.Contains('@', StringComparison.Ordinal) ? lv.Name[..lv.Name.IndexOf('@')] : lv.Name;
+            fn.PrivateVariables[shortName] = new ResolvedVariable
+            {
+                SlotId = lv.SlotId,
+                Name = shortName,
+                ValueKind = lv.ValueKind,
+                Scope = lv.Scope,
+                ArrayRank = Math.Max(1, lv.Dimensions.Length),
+                Dimensions = lv.Dimensions,
+                IsByRef = lv.Scope == VariableScopeKind.Reference,
+                IsConst = lv.IsConst,
+                OwnerFunctionName = fd.Name,
+            };
+        }
+
+        fn.LocalArray = BuildFuncStaticFromModule(module, fn.Name, "LOCAL", VariableValueKind.Int);
+        fn.LocalsArray = BuildFuncStaticFromModule(module, fn.Name, "LOCALS", VariableValueKind.Str);
+        fn.ArgArray = BuildFuncStaticFromModule(module, fn.Name, "ARG", VariableValueKind.Int);
+        fn.ArgsArray = BuildFuncStaticFromModule(module, fn.Name, "ARGS", VariableValueKind.Str);
+
+        foreach (FunctionParameterDescriptor p in fd.Parameters)
+        {
+            string baseName = p.Name.Contains(':', StringComparison.Ordinal) ? p.Name[..p.Name.IndexOf(':')] : p.Name;
+            if (st.TryResolveVariable(baseName, null, fn, out ResolvedVariable? pv) && pv is not null)
+            {
+                fn.Parameters.Add(new ParsedFunctionParameter(
+                    new VariableAccessExpr(pv, [], IsBareArrayReference: p.IsByRef, default),
+                    p.HasDefaultValue,
+                    p.DefaultIntValue,
+                    p.DefaultStrValue ?? string.Empty,
+                    default));
+            }
+        }
+
+        return fn;
+    }
+
     private static ResolvedVariable? BuildFuncStaticFromModule(
+        BytecodeModule module,
         string fnName,
         string baseName,
-        VariableValueKind valKind,
-        Dictionary<string, VariableSlotDescriptor> globalByName)
+        VariableValueKind valKind)
     {
-        if (!globalByName.TryGetValue($"{baseName}@{fnName}", out VariableSlotDescriptor? desc))
+        if (!module.TryResolveStaticSlotId($"{baseName}@{fnName}", out int slotId) ||
+            module.TryGetStaticDescriptor(slotId) is not { } desc)
         {
             return null;
         }

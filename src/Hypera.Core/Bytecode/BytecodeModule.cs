@@ -160,6 +160,7 @@ public sealed record EventFunctionGroup(
 public sealed class BytecodeModule
 {
     private StaticSlotIndex? _staticSlotIndex;
+    private FunctionLookupIndex? _functionLookupIndex;
 
     public required BytecodeModuleHeader Header { get; init; }
     public CompilerOptions CompilerOptions { get; init; } = CompilerOptions.Default;
@@ -187,6 +188,117 @@ public sealed class BytecodeModule
 
     internal bool TryResolveStaticSlotId(string name, out int slotId) =>
         GetStaticSlotIndex().GetNameToSlot(this).TryGetValue(name, out slotId);
+
+    internal bool TryGetFunctionById(int functionId, out FunctionDescriptor? descriptor) =>
+        GetFunctionLookupIndex().TryGetById(this, functionId, out descriptor);
+
+    internal bool TryGetFunctionByName(string name, out FunctionDescriptor? descriptor) =>
+        GetFunctionLookupIndex().TryGetByName(this, name, out descriptor);
+
+    private FunctionLookupIndex GetFunctionLookupIndex()
+    {
+        FunctionLookupIndex? idx = Volatile.Read(ref _functionLookupIndex);
+        if (idx is not null)
+        {
+            return idx;
+        }
+
+        var created = new FunctionLookupIndex(Functions);
+        FunctionLookupIndex? existing = Interlocked.CompareExchange(ref _functionLookupIndex, created, null);
+        return existing ?? created;
+    }
+
+    private sealed class FunctionLookupIndex
+    {
+        private readonly bool _isDenseById;
+        private readonly Dictionary<int, FunctionDescriptor>? _byId;
+        private Dictionary<string, FunctionDescriptor>? _byName;
+
+        public FunctionLookupIndex(ImmutableArray<FunctionDescriptor> funcs)
+        {
+            bool dense = true;
+            for (int i = 0; i < funcs.Length; i++)
+            {
+                if (funcs[i].FunctionId != i)
+                {
+                    dense = false;
+                    break;
+                }
+            }
+
+            _isDenseById = dense;
+            if (!dense && funcs.Length > 0)
+            {
+                var map = new Dictionary<int, FunctionDescriptor>(funcs.Length);
+                for (int i = 0; i < funcs.Length; i++)
+                {
+                    map[funcs[i].FunctionId] = funcs[i];
+                }
+
+                _byId = map;
+            }
+        }
+
+        public bool TryGetById(BytecodeModule module, int functionId, out FunctionDescriptor? descriptor)
+        {
+            if (functionId < 0)
+            {
+                descriptor = null;
+                return false;
+            }
+
+            if (_isDenseById)
+            {
+                ImmutableArray<FunctionDescriptor> funcs = module.Functions;
+                if ((uint)functionId < (uint)funcs.Length)
+                {
+                    descriptor = funcs[functionId];
+                    return true;
+                }
+
+                descriptor = null;
+                return false;
+            }
+
+            if (_byId is not null && _byId.TryGetValue(functionId, out FunctionDescriptor? found))
+            {
+                descriptor = found;
+                return true;
+            }
+
+            descriptor = null;
+            return false;
+        }
+
+        public bool TryGetByName(BytecodeModule module, string name, out FunctionDescriptor? descriptor)
+        {
+            Dictionary<string, FunctionDescriptor> map = GetByName(module);
+            return map.TryGetValue(name, out descriptor);
+        }
+
+        private Dictionary<string, FunctionDescriptor> GetByName(BytecodeModule module)
+        {
+            Dictionary<string, FunctionDescriptor>? map = Volatile.Read(ref _byName);
+            if (map is not null)
+            {
+                return map;
+            }
+
+            StringComparer cmp = (module.CompilerOptions.IgnoreCase && !module.CompilerOptions.CompatiFunctionNoIgnoreCase)
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
+            ImmutableArray<FunctionDescriptor> funcs = module.Functions;
+            var created = new Dictionary<string, FunctionDescriptor>(funcs.Length, cmp);
+            for (int i = 0; i < funcs.Length; i++)
+            {
+                FunctionDescriptor fd = funcs[i];
+                created.TryAdd(fd.Name, fd);
+            }
+
+            Dictionary<string, FunctionDescriptor>? existing = Interlocked.CompareExchange(ref _byName, created, null);
+            return existing ?? created;
+        }
+    }
 
     private StaticSlotIndex GetStaticSlotIndex()
     {

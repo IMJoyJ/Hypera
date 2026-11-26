@@ -179,4 +179,104 @@ public sealed class MemoryOptimizationTests
             if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
         }
     }
+
+    [Fact]
+    public void CharacterStore_LazyGrowableArrays_VirtualDefaults_AndSharedGamePackage_IsolateConcurrentSessions()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_p1_shared_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+        Directory.CreateDirectory(Path.Combine(workDir, "CSV"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "CSV", "_Replace.csv"),
+                "RelationDef,100\n汚れの初期値,0/0/2/1\n");
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                FOR LOCAL, 0, 50
+                    ADDVOIDCHARA
+                NEXT
+                ; Read virtual RELATION/STAIN defaults without forcing allocation on untouched characters
+                A:0 = RELATION:10:5
+                A:1 = STAIN:10:2
+                A:2 = STAIN:10:3
+                ; Mutate one character's RELATION and CFLAG
+                RELATION:0:5 = 180
+                CFLAG:0:200 = 777
+                CSTR:0:5 '= "memo5"
+                A:3 = RELATION:0:5
+                A:4 = RELATION:0:6
+                A:5 = CFLAG:0:200
+                TSTR:0 '= CSTR:0:5
+                ; Exercise lazy function hydration via GETVAR("LOCAL@HELPER_FN")
+                CALL HELPER_FN
+                A:6 = GETVAR("LOCAL@HELPER_FN:3")
+                QUIT
+
+                @HELPER_FN
+                LOCAL:3 = 4321
+                RETURN 0
+
+                @COLD_UNHYDRATED_FN
+                LOCAL:0 = 999
+                RETURN 0
+                """);
+
+            using var vfs = new PhysicalDirectoryVfs(workDir);
+            SharedGamePackage shared = HyperaGameHost.LoadSharedPackage(vfs, usePrebuiltBytecode: false);
+
+            // Cold functions are NOT eagerly hydrated into shared.SharedSymbols at package load time
+            Assert.Empty(shared.SharedSymbols.AllFunctions);
+
+            using HyperaGameHost host1 = HyperaGameHost.LoadFromVfs(
+                vfs,
+                ownsVfs: false,
+                options: new HyperaGameLoadOptions { AutoStartSystemFlow = true, SharedPackage = shared });
+            using HyperaGameHost host2 = HyperaGameHost.LoadFromVfs(
+                vfs,
+                ownsVfs: false,
+                options: new HyperaGameLoadOptions { AutoStartSystemFlow = true, SharedPackage = shared });
+
+            // Both sessions share the exact same immutable Module, GameData, Config, and SymbolTable
+            Assert.Same(host1.Module, host2.Module);
+            Assert.Same(host1.GameData, host2.GameData);
+            Assert.Same(host1.Config, host2.Config);
+            Assert.Same(host1.DynamicCompiler.Symbols, host2.DynamicCompiler.Symbols);
+
+            Assert.Equal(EngineStepStatus.Completed, host1.Engine.Step());
+            Assert.Equal(EngineStepStatus.Completed, host2.Engine.Step());
+
+            VariableStore v1 = host1.Engine.FastVariables!;
+            VariableStore v2 = host2.Engine.FastVariables!;
+
+            Assert.Equal(100L, v1.GetInt("A", 0));
+            Assert.Equal(2L, v1.GetInt("A", 1));
+            Assert.Equal(1L, v1.GetInt("A", 2));
+            Assert.Equal(180L, v1.GetInt("A", 3));
+            Assert.Equal(100L, v1.GetInt("A", 4));
+            Assert.Equal(777L, v1.GetInt("A", 5));
+            Assert.Equal("memo5", v1.GetStr("TSTR", 0));
+            Assert.Equal(4321L, v1.GetInt("A", 6));
+
+            // 50 characters x ~29 slots would be ~1,450 arrays eagerly; lazily only ~3 arrays were allocated!
+            Assert.True(v1.Characters.AllocatedSlotArrayCount < 20,
+                $"Expected lazy character storage (<20 allocated arrays across 50 chars), got {v1.Characters.AllocatedSlotArrayCount}.");
+
+            // Complete mutable state isolation between concurrent sessions sharing SharedGamePackage
+            v1.SetInt("FLAG", 9999, 0);
+            v1.Characters.SetInt1D(0, v1.Characters.CFlagSlotId, 200, 1234);
+            Assert.Equal(0L, v2.GetInt("FLAG", 0));
+            Assert.Equal(777L, v2.Characters.GetInt1D(0, v2.Characters.CFlagSlotId, 200));
+
+            // COLD_UNHYDRATED_FN still untouched in shared symbol table
+            Assert.DoesNotContain(shared.SharedSymbols.AllFunctions, static f => f.Name.Equals("COLD_UNHYDRATED_FN", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
 }

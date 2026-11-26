@@ -1948,11 +1948,125 @@ public sealed partial class EmueraEngine : IDisposable
 
             if (schema.ValueKind == VariableValueKind.Int)
             {
-                UnpackIntSaveValueIntoFlat(val, chars.GetIntSpan(charaIdx, schema.GlobalSlotId), schema.Dim0, schema.Dim1, schema.Dim2);
+                UnpackIntSaveValueIntoCharacter(val, chars, charaIdx, schema);
             }
             else
             {
-                UnpackStrSaveValueIntoFlat(val, chars.GetStrSpan(charaIdx, schema.GlobalSlotId), schema.Dim0, schema.Dim1, schema.Dim2);
+                UnpackStrSaveValueIntoCharacter(val, chars, charaIdx, schema);
+            }
+        }
+    }
+
+    private static void UnpackIntSaveValueIntoCharacter(EraSaveValue val, CharacterStore chars, int charaIdx, CharacterSlotSchema schema)
+    {
+        switch (val.DataType)
+        {
+            case EraSaveDataType.Int:
+                if (schema.TotalLength > 0) chars.WriteFlatInt(charaIdx, schema, 0, val.AsInt());
+                break;
+            case EraSaveDataType.IntArray:
+            {
+                long[] src = val.AsIntArray();
+                int n = Math.Min(src.Length, schema.TotalLength);
+                for (int i = 0; i < n; i++)
+                {
+                    chars.WriteFlatInt(charaIdx, schema, i, src[i]);
+                }
+
+                break;
+            }
+            case EraSaveDataType.IntArray2D:
+            {
+                long[,] src = val.AsIntArray2D();
+                int r0 = Math.Min(schema.Dim0, src.GetLength(0));
+                int r1 = Math.Min(schema.Dim1, src.GetLength(1));
+                for (int i = 0; i < r0; i++)
+                {
+                    for (int j = 0; j < r1; j++)
+                    {
+                        int idx = (i * schema.Dim1) + j;
+                        if ((uint)idx < (uint)schema.TotalLength) chars.WriteFlatInt(charaIdx, schema, idx, src[i, j]);
+                    }
+                }
+
+                break;
+            }
+            case EraSaveDataType.IntArray3D:
+            {
+                long[,,] src = val.AsIntArray3D();
+                int r0 = Math.Min(schema.Dim0, src.GetLength(0));
+                int r1 = Math.Min(schema.Dim1, src.GetLength(1));
+                int r2 = Math.Min(schema.Dim2, src.GetLength(2));
+                for (int i = 0; i < r0; i++)
+                {
+                    for (int j = 0; j < r1; j++)
+                    {
+                        for (int k = 0; k < r2; k++)
+                        {
+                            int idx = (((i * schema.Dim1) + j) * schema.Dim2) + k;
+                            if ((uint)idx < (uint)schema.TotalLength) chars.WriteFlatInt(charaIdx, schema, idx, src[i, j, k]);
+                        }
+                    }
+                }
+
+                break;
+            }
+        }
+    }
+
+    private static void UnpackStrSaveValueIntoCharacter(EraSaveValue val, CharacterStore chars, int charaIdx, CharacterSlotSchema schema)
+    {
+        switch (val.DataType)
+        {
+            case EraSaveDataType.Str:
+                if (schema.TotalLength > 0) chars.WriteFlatStr(charaIdx, schema, 0, val.AsStr());
+                break;
+            case EraSaveDataType.StrArray:
+            {
+                string[] src = val.AsStrArray();
+                int n = Math.Min(src.Length, schema.TotalLength);
+                for (int i = 0; i < n; i++)
+                {
+                    chars.WriteFlatStr(charaIdx, schema, i, src[i]);
+                }
+
+                break;
+            }
+            case EraSaveDataType.StrArray2D:
+            {
+                string[,] src = val.AsStrArray2D();
+                int r0 = Math.Min(schema.Dim0, src.GetLength(0));
+                int r1 = Math.Min(schema.Dim1, src.GetLength(1));
+                for (int i = 0; i < r0; i++)
+                {
+                    for (int j = 0; j < r1; j++)
+                    {
+                        int idx = (i * schema.Dim1) + j;
+                        if ((uint)idx < (uint)schema.TotalLength) chars.WriteFlatStr(charaIdx, schema, idx, src[i, j]);
+                    }
+                }
+
+                break;
+            }
+            case EraSaveDataType.StrArray3D:
+            {
+                string[,,] src = val.AsStrArray3D();
+                int r0 = Math.Min(schema.Dim0, src.GetLength(0));
+                int r1 = Math.Min(schema.Dim1, src.GetLength(1));
+                int r2 = Math.Min(schema.Dim2, src.GetLength(2));
+                for (int i = 0; i < r0; i++)
+                {
+                    for (int j = 0; j < r1; j++)
+                    {
+                        for (int k = 0; k < r2; k++)
+                        {
+                            int idx = (((i * schema.Dim1) + j) * schema.Dim2) + k;
+                            if ((uint)idx < (uint)schema.TotalLength) chars.WriteFlatStr(charaIdx, schema, idx, src[i, j, k]);
+                        }
+                    }
+                }
+
+                break;
             }
         }
     }

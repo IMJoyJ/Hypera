@@ -34,7 +34,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
     private readonly ConcurrentDictionary<Guid, ManagedSession> _sessionsById = new();
     private readonly ConcurrentDictionary<(Guid UserId, Guid AppId), Guid> _activeSessionByUserApp = new();
     private readonly ConcurrentDictionary<(Guid UserId, Guid AppId), SemaphoreSlim> _userAppGates = new();
-    private readonly ConcurrentDictionary<Guid, Lazy<BytecodeModule>> _moduleCache = new();
+    private readonly ConcurrentDictionary<Guid, Lazy<SharedGamePackage>> _packageCache = new();
     private bool _disposed;
 
     public RuntimeSessionManager(
@@ -57,13 +57,13 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         _saveService = saveService;
     }
 
-    public int CachedModuleCount => _moduleCache.Count;
+    public int CachedModuleCount => _packageCache.Count;
 
     public bool TryGetCachedModule(Guid submissionId, out BytecodeModule? module)
     {
-        if (_moduleCache.TryGetValue(submissionId, out Lazy<BytecodeModule>? lazy) && lazy.IsValueCreated)
+        if (_packageCache.TryGetValue(submissionId, out Lazy<SharedGamePackage>? lazy) && lazy.IsValueCreated)
         {
-            module = lazy.Value;
+            module = lazy.Value.Module;
             return true;
         }
 
@@ -510,7 +510,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 throw new FileNotFoundException($"Compiled .hep package not found at '{hepFullPath}'.", hepFullPath);
             }
 
-            BytecodeModule sharedModule = GetOrLoadSharedBytecodeModule(target.SubmissionId, hepFullPath);
+            SharedGamePackage sharedPackage = GetOrLoadSharedGamePackage(target.SubmissionId, hepFullPath);
             bool allowSharpPlugins = await DetermineAllowSharpPluginsAsync(target.SubmissionId, cancellationToken).ConfigureAwait(false);
 
             Guid newSessionId = Guid.NewGuid();
@@ -534,13 +534,14 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     UsePrebuiltBytecode = true,
                     AutoStartSystemFlow = true,
                     SharpPluginHost = allowSharpPlugins ? null : DisabledSharpPluginHost.Instance,
+                    SharedPackage = sharedPackage,
                 };
 
                 host = HyperaGameHost.LoadFromVfs(
                     hepVfs,
                     ownsVfs: true,
                     options: loadOptions,
-                    preloadedModule: sharedModule);
+                    preloadedModule: sharedPackage.Module);
 
                 if (allowSharpPlugins)
                 {
@@ -594,22 +595,14 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         }
     }
 
-    private BytecodeModule GetOrLoadSharedBytecodeModule(Guid submissionId, string hepFullPath)
+    private SharedGamePackage GetOrLoadSharedGamePackage(Guid submissionId, string hepFullPath)
     {
-        Lazy<BytecodeModule> lazy = _moduleCache.GetOrAdd(
+        Lazy<SharedGamePackage> lazy = _packageCache.GetOrAdd(
             submissionId,
-            _ => new Lazy<BytecodeModule>(() =>
+            _ => new Lazy<SharedGamePackage>(() =>
             {
                 using var vfs = new HepArchiveVfs(hepFullPath);
-                if (TryDeserializeEmbeddedBytecode(vfs, out BytecodeModule? prebuilt) && prebuilt is not null)
-                {
-                    return prebuilt;
-                }
-
-                ConfigLoadResult cfg = ConfigLoader.Default.Load(vfs);
-                GameData data = CsvGameDataLoader.Default.Load(vfs, cfg.CompilerOptions);
-                CompilerExternalContext ext = CompilerExternalContext.FromGameData(data, cfg.CompilerOptions.IgnoreCase);
-                return ErbProjectCompiler.Compile(vfs, cfg.CompilerOptions, ext);
+                return HyperaGameHost.LoadSharedPackage(vfs, usePrebuiltBytecode: true);
             }, LazyThreadSafetyMode.ExecutionAndPublication));
 
         return lazy.Value;

@@ -1678,6 +1678,14 @@ public sealed class VariableStore : IVariableStore
         return 0;
     }
 
+    internal void ClearSlot(int slotId)
+    {
+        if (slotId >= 0 && TryGetMaterializedSlot(slotId) is { } slot)
+        {
+            slot.ClearToZeroOrEmpty();
+        }
+    }
+
     internal void TryClearMaterializedSlotByName(string name)
     {
         if (TryResolveExistingSlot(name, out int slotId) && TryGetMaterializedSlot(slotId) is { } slot)

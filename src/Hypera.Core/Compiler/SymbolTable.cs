@@ -221,6 +221,13 @@ public sealed partial class SymbolTable
     public IReadOnlyDictionary<string, DefineMacroSymbol> Macros => _macros;
     public IReadOnlyList<UserFunctionSymbol> AllFunctions => _allFunctions;
 
+    /// <summary>
+    /// Optional thread-safe lazy function hydrator used by <see cref="RuntimeDynamicCompiler"/>
+    /// to avoid eagerly instantiating 100k+ <see cref="UserFunctionSymbol"/> objects at startup.
+    /// </summary>
+    internal Func<string, UserFunctionSymbol?>? LazyFunctionHydrator { get; set; }
+    internal object LazySyncRoot { get; } = new();
+
     [GeneratedRegex(@"^COM\d+$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex ComFuncRegex();
 
@@ -506,12 +513,12 @@ public sealed partial class SymbolTable
         // Cross-function scoped variable syntax: LOCAL@OTHER_FUNC or PRIV_STATIC@OTHER_FUNC
         if (!string.IsNullOrEmpty(explicitSubFunctionName))
         {
-            if (!_functionsByName.TryGetValue(explicitSubFunctionName, out List<UserFunctionSymbol>? targetDefs) || targetDefs.Count == 0)
+            UserFunctionSymbol? targetFn = TryGetOrHydratePrimaryFunction(explicitSubFunctionName);
+            if (targetFn is null)
             {
                 return false;
             }
 
-            UserFunctionSymbol targetFn = targetDefs[0];
             if (_idComparer.Equals(name, "LOCAL")) { variable = targetFn.LocalArray; return variable is not null; }
             if (_idComparer.Equals(name, "LOCALS")) { variable = targetFn.LocalsArray; return variable is not null; }
             if (_idComparer.Equals(name, "ARG")) { variable = targetFn.ArgArray; return variable is not null; }
@@ -546,12 +553,12 @@ public sealed partial class SymbolTable
 
     public UserFunctionSymbol? TryResolveCallableFunction(string name, bool allowEventIfCompati = false)
     {
-        if (!_functionsByName.TryGetValue(name, out List<UserFunctionSymbol>? defs) || defs.Count == 0)
+        UserFunctionSymbol? primary = TryGetOrHydratePrimaryFunction(name);
+        if (primary is null)
         {
             return null;
         }
 
-        UserFunctionSymbol primary = defs[0];
         if (primary.IsEvent && !(allowEventIfCompati && _options.CompatiCallEvent))
         {
             return null;
@@ -562,6 +569,26 @@ public sealed partial class SymbolTable
 
     public bool TryGetFunctionsByName(string name, out IReadOnlyList<UserFunctionSymbol> definitions)
     {
+        if (LazyFunctionHydrator is not null)
+        {
+            lock (LazySyncRoot)
+            {
+                if (!_functionsByName.TryGetValue(name, out List<UserFunctionSymbol>? existing) || existing.Count == 0)
+                {
+                    LazyFunctionHydrator(name);
+                }
+
+                if (_functionsByName.TryGetValue(name, out List<UserFunctionSymbol>? hydrated))
+                {
+                    definitions = hydrated;
+                    return true;
+                }
+
+                definitions = [];
+                return false;
+            }
+        }
+
         if (_functionsByName.TryGetValue(name, out List<UserFunctionSymbol>? list))
         {
             definitions = list;
@@ -570,6 +597,26 @@ public sealed partial class SymbolTable
 
         definitions = [];
         return false;
+    }
+
+    private UserFunctionSymbol? TryGetOrHydratePrimaryFunction(string name)
+    {
+        if (LazyFunctionHydrator is not null)
+        {
+            lock (LazySyncRoot)
+            {
+                if (_functionsByName.TryGetValue(name, out List<UserFunctionSymbol>? defs) && defs.Count > 0)
+                {
+                    return defs[0];
+                }
+
+                return LazyFunctionHydrator(name);
+            }
+        }
+
+        return _functionsByName.TryGetValue(name, out List<UserFunctionSymbol>? found) && found.Count > 0
+            ? found[0]
+            : null;
     }
 
     public ImmutableArray<EventFunctionGroup> BuildEventGroups()

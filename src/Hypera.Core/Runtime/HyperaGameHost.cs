@@ -32,6 +32,20 @@ public readonly record struct GameLoadProgress(
     string? Detail = null);
 
 /// <summary>
+/// Read-only compiled game package bundle shareable across concurrent <see cref="HyperaGameHost"/> sessions
+/// (amortizing <see cref="BytecodeModule"/>, <see cref="ConfigLoadResult"/>, <see cref="GameData"/>,
+/// and <see cref="SymbolTable"/> memory once per game package in multi-user server hosts).
+/// </summary>
+public sealed class SharedGamePackage
+{
+    public required BytecodeModule Module { get; init; }
+    public required ConfigLoadResult Config { get; init; }
+    public required GameData GameData { get; init; }
+    public required SymbolTable SharedSymbols { get; init; }
+    public bool LoadedFromPrebuiltBytecode { get; init; }
+}
+
+/// <summary>
 /// Configuration options for turnkey game startup via <see cref="HyperaGameHost"/> or <see cref="EmueraEngine"/>.
 /// </summary>
 public sealed class HyperaGameLoadOptions
@@ -110,6 +124,12 @@ public sealed class HyperaGameLoadOptions
     /// Optional cancellation token observed across loading stages.
     /// </summary>
     public CancellationToken CancellationToken { get; init; }
+
+    /// <summary>
+    /// Optional preloaded immutable <see cref="SharedGamePackage"/> reused across concurrent sessions
+    /// so each session only allocates its own mutable <see cref="VariableStore"/> and <see cref="CharacterStore"/>.
+    /// </summary>
+    public SharedGamePackage? SharedPackage { get; init; }
 }
 
 /// <summary>
@@ -296,6 +316,54 @@ public sealed class HyperaGameHost : IDisposable
         return LoadFromVfsCore(vfs, ownsVfs, defaultSaveRoot, options, preloadedModule);
     }
 
+    /// <summary>
+    /// Loads and caches the immutable portions of a game package (<see cref="ConfigLoadResult"/>,
+    /// <see cref="GameData"/>, <see cref="BytecodeModule"/>, and lazy <see cref="SymbolTable"/>) once for
+    /// sharing across many concurrent sessions via <see cref="HyperaGameLoadOptions.SharedPackage"/>.
+    /// </summary>
+    public static SharedGamePackage LoadSharedPackage(
+        IVirtualFileSystem vfs,
+        bool usePrebuiltBytecode = true,
+        bool isDebugMode = false,
+        CompilerOptions? compilerOptionsOverride = null)
+    {
+        ArgumentNullException.ThrowIfNull(vfs);
+        ConfigLoadResult config = ConfigLoader.Default.Load(vfs);
+        CompilerOptions compilerOptions = compilerOptionsOverride ?? config.CompilerOptions;
+        GameData gameData = CsvGameDataLoader.Default.Load(vfs, compilerOptions);
+
+        BytecodeModule module;
+        SymbolTable symbols;
+        bool loadedPrebuilt = false;
+
+        if (usePrebuiltBytecode && TryLoadPrebuiltBytecode(vfs, out BytecodeModule? embedded) && embedded is not null)
+        {
+            module = embedded;
+            symbols = RuntimeDynamicCompiler.CreateSharedSymbolTable(module);
+            loadedPrebuilt = true;
+        }
+        else
+        {
+            CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, compilerOptions.IgnoreCase) with
+            {
+                IsDebugMode = isDebugMode,
+            };
+            var compiler = new ErbProjectCompiler(compilerOptions, external);
+            CompilationResult compilation = compiler.CompileProject(vfs, throwOnError: true);
+            module = compilation.Module;
+            symbols = RuntimeDynamicCompiler.CreateSharedSymbolTable(module);
+        }
+
+        return new SharedGamePackage
+        {
+            Module = module,
+            Config = config,
+            GameData = gameData,
+            SharedSymbols = symbols,
+            LoadedFromPrebuiltBytecode = loadedPrebuilt,
+        };
+    }
+
     internal static HyperaGameHost LoadFromVfsCore(
         IVirtualFileSystem vfs,
         bool ownsVfs,
@@ -312,36 +380,66 @@ public sealed class HyperaGameHost : IDisposable
 
         ct.ThrowIfCancellationRequested();
 
-        // 1. Load layered configuration: csv/_default.config -> emuera.config -> csv/_fixed.config + setting.json
-        Report(progress, 6, "Loading configuration...", "emuera.config & defaults");
-        ConfigLoadResult config = ConfigLoader.Default.Load(vfs);
-        CompilerOptions compilerOptions = opts.CompilerOptionsOverride ?? config.CompilerOptions;
-        RuntimeOptions runtimeOptions = opts.RuntimeOptionsOverride ?? config.RuntimeOptions;
-        ct.ThrowIfCancellationRequested();
-
-        // 2. Load all CSV, ERD, ALS, VarExt, and resources metadata
-        Report(progress, 10, "Loading CSV & resource metadata...", "CSV / ERD / resources");
-        GameData gameData = CsvGameDataLoader.Default.Load(vfs, compilerOptions);
-        ct.ThrowIfCancellationRequested();
-
-        // 3. Resolve BytecodeModule: explicit preloaded -> embedded .heb in VFS -> strict ErbProjectCompiler
+        ConfigLoadResult config;
+        CompilerOptions compilerOptions;
+        RuntimeOptions runtimeOptions;
+        GameData gameData;
         BytecodeModule module;
         CompilationResult? compilation = null;
+        SymbolTable? sharedSymbols = null;
         bool loadedPrebuilt = false;
 
-        if (preloadedModule is not null)
+        if (opts.SharedPackage is { } shared)
         {
-            Report(progress, 44, "Using preloaded bytecode...");
-            module = preloadedModule;
-            loadedPrebuilt = true;
+            Report(progress, 44, "Attaching shared game package...");
+            config = shared.Config;
+            compilerOptions = opts.CompilerOptionsOverride ?? config.CompilerOptions;
+            runtimeOptions = opts.RuntimeOptionsOverride ?? config.RuntimeOptions;
+            gameData = shared.GameData;
+            module = shared.Module;
+            sharedSymbols = shared.SharedSymbols;
+            loadedPrebuilt = shared.LoadedFromPrebuiltBytecode;
         }
-        else if (opts.UsePrebuiltBytecode && HasPrebuiltBytecode(vfs))
+        else
         {
-            Report(progress, 15, "Loading precompiled bytecode...", "game.heb");
-            if (TryLoadPrebuiltBytecode(vfs, out BytecodeModule? embedded) && embedded is not null)
+            // 1. Load layered configuration: csv/_default.config -> emuera.config -> csv/_fixed.config + setting.json
+            Report(progress, 6, "Loading configuration...", "emuera.config & defaults");
+            config = ConfigLoader.Default.Load(vfs);
+            compilerOptions = opts.CompilerOptionsOverride ?? config.CompilerOptions;
+            runtimeOptions = opts.RuntimeOptionsOverride ?? config.RuntimeOptions;
+            ct.ThrowIfCancellationRequested();
+
+            // 2. Load all CSV, ERD, ALS, VarExt, and resources metadata
+            Report(progress, 10, "Loading CSV & resource metadata...", "CSV / ERD / resources");
+            gameData = CsvGameDataLoader.Default.Load(vfs, compilerOptions);
+            ct.ThrowIfCancellationRequested();
+
+            // 3. Resolve BytecodeModule: explicit preloaded -> embedded .heb in VFS -> strict ErbProjectCompiler
+            if (preloadedModule is not null)
             {
-                module = embedded;
+                Report(progress, 44, "Using preloaded bytecode...");
+                module = preloadedModule;
                 loadedPrebuilt = true;
+            }
+            else if (opts.UsePrebuiltBytecode && HasPrebuiltBytecode(vfs))
+            {
+                Report(progress, 15, "Loading precompiled bytecode...", "game.heb");
+                if (TryLoadPrebuiltBytecode(vfs, out BytecodeModule? embedded) && embedded is not null)
+                {
+                    module = embedded;
+                    loadedPrebuilt = true;
+                }
+                else
+                {
+                    Report(progress, 15, "Compiling ERB scripts...");
+                    CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, compilerOptions.IgnoreCase) with
+                    {
+                        IsDebugMode = opts.IsDebugMode,
+                    };
+                    var compiler = new ErbProjectCompiler(compilerOptions, external);
+                    compilation = compiler.CompileProject(vfs, throwOnError: true);
+                    module = compilation.Module;
+                }
             }
             else
             {
@@ -354,17 +452,6 @@ public sealed class HyperaGameHost : IDisposable
                 compilation = compiler.CompileProject(vfs, throwOnError: true);
                 module = compilation.Module;
             }
-        }
-        else
-        {
-            Report(progress, 15, "Compiling ERB scripts...");
-            CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, compilerOptions.IgnoreCase) with
-            {
-                IsDebugMode = opts.IsDebugMode,
-            };
-            var compiler = new ErbProjectCompiler(compilerOptions, external);
-            compilation = compiler.CompileProject(vfs, throwOnError: true);
-            module = compilation.Module;
         }
 
         ct.ThrowIfCancellationRequested();
@@ -407,7 +494,7 @@ public sealed class HyperaGameHost : IDisposable
 
         // 6. Wire RuntimeDynamicCompiler (IDynamicEvaluator)
         Report(progress, 88, "Preparing dynamic expression evaluator...");
-        var dynamicCompiler = new RuntimeDynamicCompiler(module, compilation?.Symbols);
+        var dynamicCompiler = new RuntimeDynamicCompiler(module, sharedSymbols ?? compilation?.Symbols);
         dynamicCompiler.AttachTo(engine);
         ct.ThrowIfCancellationRequested();
 

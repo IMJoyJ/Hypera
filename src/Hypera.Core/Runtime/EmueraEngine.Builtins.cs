@@ -917,13 +917,27 @@ public sealed partial class EmueraEngine
         {
             if (!schema.IsSavedata ||
                 schema.GlobalSlotId == chars.NoSlotId ||
-                schema.GlobalSlotId == chars.IsAssiSlotId)
+                schema.GlobalSlotId == chars.IsAssiSlotId ||
+                !chars.HasNonDefaultIntData(c, schema))
             {
                 continue;
             }
 
-            ReadOnlySpan<long> raw = chars.GetIntSpan(c, schema.GlobalSlotId);
-            EraSaveValue val = PackIntSaveValue(raw, schema.SubRank, schema.Dim0, schema.Dim1, schema.Dim2);
+            EraSaveValue val;
+            if (schema.SubRank <= 0)
+            {
+                val = EraSaveValue.FromInt(chars.ReadFlatInt(c, schema, 0));
+            }
+            else if (schema.SubRank == 1)
+            {
+                val = EraSaveValue.FromIntArray(chars.ExportTrimmedIntArray(c, schema));
+            }
+            else
+            {
+                ReadOnlySpan<long> raw = chars.GetIntSpan(c, schema.GlobalSlotId);
+                val = PackIntSaveValue(raw, schema.SubRank, schema.Dim0, schema.Dim1, schema.Dim2);
+            }
+
             if (schema.IsUserDefined)
             {
                 charaData.UserVariables[schema.Name] = val;
@@ -940,13 +954,27 @@ public sealed partial class EmueraEngine
                 schema.GlobalSlotId == chars.NameSlotId ||
                 schema.GlobalSlotId == chars.CallNameSlotId ||
                 schema.GlobalSlotId == chars.NickNameSlotId ||
-                schema.GlobalSlotId == chars.MasterNameSlotId)
+                schema.GlobalSlotId == chars.MasterNameSlotId ||
+                !chars.HasNonDefaultStrData(c, schema))
             {
                 continue;
             }
 
-            ReadOnlySpan<string> raw = chars.GetStrSpan(c, schema.GlobalSlotId);
-            EraSaveValue val = PackStrSaveValue(raw, schema.SubRank, schema.Dim0, schema.Dim1, schema.Dim2);
+            EraSaveValue val;
+            if (schema.SubRank <= 0)
+            {
+                val = EraSaveValue.FromStr(chars.ReadFlatStr(c, schema, 0));
+            }
+            else if (schema.SubRank == 1)
+            {
+                val = EraSaveValue.FromStrArray(chars.ExportTrimmedStrArray(c, schema));
+            }
+            else
+            {
+                ReadOnlySpan<string> raw = chars.GetStrSpan(c, schema.GlobalSlotId);
+                val = PackStrSaveValue(raw, schema.SubRank, schema.Dim0, schema.Dim1, schema.Dim2);
+            }
+
             if (schema.IsUserDefined)
             {
                 charaData.UserVariables[schema.Name] = val;

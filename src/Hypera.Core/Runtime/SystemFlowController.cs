@@ -1211,17 +1211,17 @@ public sealed class SystemFlowController
         vars.SetInt0D(vars.AssiPlaySlotId, 0L);
         vars.PrevCom = -1L;
         vars.NextCom = -1L;
-        vars.GetIntSpan(vars.TFlagSlotId).Clear();
-        vars.GetStrSpan(vars.TStrSlotId).Fill(string.Empty);
+        vars.ClearSlot(vars.TFlagSlotId);
+        vars.ClearSlot(vars.TStrSlotId);
 
         CharacterStore chars = vars.Characters;
         for (int c = 0; c < chars.Count; c++)
         {
-            if (chars.GotJuelSlotId >= 0) chars.GetIntSpan(c, chars.GotJuelSlotId).Clear();
-            if (chars.TequipSlotId >= 0) chars.GetIntSpan(c, chars.TequipSlotId).Clear();
-            if (chars.ExSlotId >= 0) chars.GetIntSpan(c, chars.ExSlotId).Clear();
-            if (chars.SourceSlotId >= 0) chars.GetIntSpan(c, chars.SourceSlotId).Clear();
-            if (chars.TcvarSlotId >= 0) chars.GetIntSpan(c, chars.TcvarSlotId).Clear();
+            if (chars.GotJuelSlotId >= 0) chars.ClearCharacterSlot(c, chars.GotJuelSlotId);
+            if (chars.TequipSlotId >= 0) chars.ClearCharacterSlot(c, chars.TequipSlotId);
+            if (chars.ExSlotId >= 0) chars.ClearCharacterSlot(c, chars.ExSlotId);
+            if (chars.SourceSlotId >= 0) chars.ClearCharacterSlot(c, chars.SourceSlotId);
+            if (chars.TcvarSlotId >= 0) chars.ClearCharacterSlot(c, chars.TcvarSlotId);
             chars.ResetStain(c);
         }
     }
@@ -1229,16 +1229,16 @@ public sealed class SystemFlowController
     private void ResetVariablesAfterShowUserCom()
     {
         VariableStore vars = _engine.RequireVariableStore();
-        vars.GetIntSpan(vars.UpSlotId).Clear();
-        vars.GetIntSpan(vars.DownSlotId).Clear();
-        vars.GetIntSpan(vars.LoseBaseSlotId).Clear();
+        vars.ClearSlot(vars.UpSlotId);
+        vars.ClearSlot(vars.DownSlotId);
+        vars.ClearSlot(vars.LoseBaseSlotId);
 
         CharacterStore chars = vars.Characters;
         for (int c = 0; c < chars.Count; c++)
         {
-            if (chars.DownBaseSlotId >= 0) chars.GetIntSpan(c, chars.DownBaseSlotId).Clear();
-            if (chars.CupSlotId >= 0) chars.GetIntSpan(c, chars.CupSlotId).Clear();
-            if (chars.CdownSlotId >= 0) chars.GetIntSpan(c, chars.CdownSlotId).Clear();
+            if (chars.DownBaseSlotId >= 0) chars.ClearCharacterSlot(c, chars.DownBaseSlotId);
+            if (chars.CupSlotId >= 0) chars.ClearCharacterSlot(c, chars.CupSlotId);
+            if (chars.CdownSlotId >= 0) chars.ClearCharacterSlot(c, chars.CdownSlotId);
         }
     }
 
@@ -1248,7 +1248,7 @@ public sealed class SystemFlowController
         CharacterStore chars = vars.Characters;
         for (int c = 0; c < chars.Count; c++)
         {
-            if (chars.NowExSlotId >= 0) chars.GetIntSpan(c, chars.NowExSlotId).Clear();
+            if (chars.NowExSlotId >= 0) chars.ClearCharacterSlot(c, chars.NowExSlotId);
         }
     }
 
@@ -1258,7 +1258,7 @@ public sealed class SystemFlowController
         CharacterStore chars = vars.Characters;
         for (int c = 0; c < chars.Count; c++)
         {
-            if (chars.SourceSlotId >= 0) chars.GetIntSpan(c, chars.SourceSlotId).Clear();
+            if (chars.SourceSlotId >= 0) chars.ClearCharacterSlot(c, chars.SourceSlotId);
         }
     }
 }
