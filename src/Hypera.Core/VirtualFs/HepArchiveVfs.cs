@@ -223,6 +223,17 @@ public sealed class HepArchiveVfs : IVirtualFileSystem
             bool isCompressed = span[offset + 28] != 0;
             offset += 29;
 
+            if (rawPath.EndsWith('/'))
+            {
+                string emptyDir = VfsPathNormalizer.Normalize(rawPath);
+                if (emptyDir.Length > 0)
+                {
+                    AddDirectoryHierarchy(emptyDir);
+                }
+
+                continue;
+            }
+
             string normalized = VfsPathNormalizer.Normalize(rawPath);
             var desc = new ArchiveEntryDescriptor(
                 normalized,

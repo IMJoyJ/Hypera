@@ -14,6 +14,7 @@ public sealed class GraphicsManager : IDisposable
     private readonly FontRegistry _fontRegistry;
     private readonly GlyphMeasurer _glyphMeasurer;
     private readonly string? _saveDirectory;
+    private IWritableUserStorage? _writableStorage;
     private bool _disposed;
 
     public GraphicsManager(
@@ -39,6 +40,12 @@ public sealed class GraphicsManager : IDisposable
     public string DefaultFontName { get; }
     public int DefaultFontSize { get; }
     public int Count => _surfaces.Count;
+
+    public void AttachWritableStorage(IWritableUserStorage? writableStorage)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _writableStorage = writableStorage;
+    }
 
     public bool IsCreated(int id)
     {
@@ -375,7 +382,11 @@ public sealed class GraphicsManager : IDisposable
         }
 
         byte[] png = s.EncodeToPng();
-        if (!string.IsNullOrWhiteSpace(_saveDirectory))
+        if (_writableStorage is not null)
+        {
+            _writableStorage.WriteAllBytes($"img{saveIndex:D4}.png", png);
+        }
+        else if (!string.IsNullOrWhiteSpace(_saveDirectory))
         {
             Directory.CreateDirectory(_saveDirectory);
             string path = Path.Combine(_saveDirectory, $"img{saveIndex:D4}.png");
@@ -395,7 +406,15 @@ public sealed class GraphicsManager : IDisposable
             return CreateFromBytes(id, memBytes);
         }
 
-        if (!string.IsNullOrWhiteSpace(_saveDirectory))
+        if (_writableStorage is not null)
+        {
+            string rel = $"img{saveIndex:D4}.png";
+            if (_writableStorage.FileExists(rel))
+            {
+                return CreateFromBytes(id, _writableStorage.ReadAllBytes(rel));
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(_saveDirectory))
         {
             string path = Path.Combine(_saveDirectory, $"img{saveIndex:D4}.png");
             if (File.Exists(path))

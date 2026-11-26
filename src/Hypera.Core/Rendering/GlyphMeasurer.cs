@@ -55,6 +55,7 @@ public sealed class GlyphMeasurer : IDisposable
     public static bool IsBoxDrawingOrGeometricSymbol(int codePoint) =>
         (codePoint >= 0x2500 && codePoint <= 0x257F) ||
         (codePoint >= 0x25A0 && codePoint <= 0x25FF) ||
+        codePoint == 0x2014 ||
         codePoint == 0x2015 ||
         codePoint == 0x2225 ||
         (codePoint >= 0x2605 && codePoint <= 0x2606);

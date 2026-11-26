@@ -363,6 +363,16 @@ public sealed class VariableStore : IVariableStore
         _replaceConfig = gameData.ReplaceConfig;
         _characters.UpdateReplaceConfiguration(_replaceConfig);
 
+        if (string.IsNullOrEmpty(WindowTitle) && !string.IsNullOrWhiteSpace(_gameBase.Title))
+        {
+            string verSuffix = !string.IsNullOrWhiteSpace(_gameBase.VersionName)
+                ? $" {_gameBase.VersionName.Trim()}"
+                : _gameBase.Version > 0
+                    ? $" {_gameBase.Version / 1000}.{_gameBase.Version % 1000:000}"
+                    : string.Empty;
+            WindowTitle = _gameBase.Title.Trim() + verSuffix;
+        }
+
         // Apply VariableSize.csv overrides to built-in non-const/const slots and character schemas
         foreach ((string varName, int[] dims) in gameData.VariableSizes)
         {

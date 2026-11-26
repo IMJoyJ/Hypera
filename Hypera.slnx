@@ -7,6 +7,7 @@
     <Project Path="src/Hypera.Maui/Hypera.Maui.csproj" />
     <Project Path="src/Hypera.Platform/Hypera.Platform.csproj" />
     <Project Path="src/Hypera.Server/Hypera.Server.csproj" />
+    <Project Path="src/Hypera.Standalone/Hypera.Standalone.csproj" />
     <Project Path="src/Hypera.Views.WinForms/Hypera.Views.WinForms.csproj" />
     <Project Path="src/Hypera.Views.Wpf/Hypera.Views.Wpf.csproj" />
     <Project Path="src/Hypera.Web.UI/Hypera.Web.UI.csproj" />

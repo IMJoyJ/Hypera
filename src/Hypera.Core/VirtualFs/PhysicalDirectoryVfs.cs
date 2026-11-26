@@ -32,6 +32,8 @@ public class PhysicalDirectoryVfs : IVirtualFileSystem
 
     public string RootDescription => _rootFullPath;
 
+    public IReadOnlyCollection<string> Directories => _directoryIndex;
+
     public void RefreshIndex()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

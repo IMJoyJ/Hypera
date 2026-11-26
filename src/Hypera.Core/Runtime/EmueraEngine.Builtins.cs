@@ -10,18 +10,39 @@ using Hypera.VirtualFs;
 
 namespace Hypera.Runtime;
 
+public readonly record struct EngineDebugLogEntry(
+    DateTime TimestampUtc,
+    string Category,
+    string Message,
+    string? SourceLocation = null)
+{
+    public string FormatLine()
+    {
+        string ts = TimestampUtc.ToLocalTime().ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture);
+        return string.IsNullOrEmpty(SourceLocation)
+            ? $"[{ts}] [{Category}] {Message}"
+            : $"[{ts}] [{Category}] {Message}  ({SourceLocation})";
+    }
+}
+
 public sealed partial class EmueraEngine
 {
+    private const int MaxTraceLogEntries = 4000;
     private readonly Dictionary<int, bool> _keyStates = [];
     private readonly HashSet<int> _keyTriggered = [];
     private readonly Dictionary<int, long> _hotkeyStates = [];
     private readonly List<string> _debugLog = [];
+    private readonly List<EngineDebugLogEntry> _traceLog = [];
+    private readonly HashSet<string> _dedupedDiagnostics = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, byte[]> _memoryVarDataFiles = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, byte[]> _memoryCharaDataFiles = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _memoryTextFiles = new(StringComparer.OrdinalIgnoreCase);
     private static readonly IReadOnlyDictionary<ConfigCode, object> DefaultConfigValues = ConfigLoader.CreateDefaultConfigValues();
 
     public IReadOnlyList<string> DebugLog => _debugLog;
+    public IReadOnlyList<EngineDebugLogEntry> TraceLog => _traceLog;
+    public bool AlwaysCaptureDebugPrint { get; set; }
+    public event Action<EngineDebugLogEntry>? DebugEntryLogged;
 
     public void ConfigureConfigValues(IReadOnlyDictionary<ConfigCode, object> rawValues)
     {
@@ -69,8 +90,10 @@ public sealed partial class EmueraEngine
 
         if (newLine)
         {
-            _debugLog.Add(_pendingDebugLine.ToString());
+            string line = _pendingDebugLine.ToString();
+            _debugLog.Add(line);
             _pendingDebugLine.Clear();
+            RecordDiagnostic("DEBUGPRINT", line, dedupeKey: null, includeCallerLocation: true);
         }
     }
 
@@ -78,6 +101,129 @@ public sealed partial class EmueraEngine
     {
         _pendingDebugLine.Clear();
         _debugLog.Clear();
+        _traceLog.Clear();
+        _dedupedDiagnostics.Clear();
+    }
+
+    public void RecordDiagnostic(
+        string category,
+        string message,
+        string? dedupeKey = null,
+        bool includeCallerLocation = true)
+    {
+        if (!string.IsNullOrEmpty(dedupeKey) && !_dedupedDiagnostics.Add(dedupeKey))
+        {
+            return;
+        }
+
+        string? location = null;
+        if (includeCallerLocation && _callStack.Count > 0)
+        {
+            string file = ResolveCurrentSourceFile();
+            long line = ResolveCurrentSourceLine();
+            if (!string.IsNullOrEmpty(file))
+            {
+                location = line > 0 ? $"{file}:{line}" : file;
+            }
+        }
+
+        var entry = new EngineDebugLogEntry(DateTime.UtcNow, category, message, location);
+        if (_traceLog.Count >= MaxTraceLogEntries)
+        {
+            _traceLog.RemoveRange(0, MaxTraceLogEntries / 4);
+        }
+
+        _traceLog.Add(entry);
+        DebugEntryLogged?.Invoke(entry);
+    }
+
+    /// <summary>
+    /// Evaluates an interactive debug console expression (variable lookup, FORM string, or arithmetic/builtin expression)
+    /// against the live engine state without mutating the call stack.
+    /// </summary>
+    public bool TryEvaluateDebugExpression(string expression, out string formattedResult)
+    {
+        formattedResult = string.Empty;
+        if (string.IsNullOrWhiteSpace(expression))
+        {
+            return false;
+        }
+
+        string trimmed = expression.Trim();
+        CallFrame? topFrame = _callStack.Count > 0 ? _callStack[^1] : null;
+        IDynamicEvaluator eval = ActiveDynamicEvaluator;
+
+        // Fast-path: CHKFONT("...") helper for convenient interactive font diagnostics
+        if (trimmed.StartsWith("CHKFONT(", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith(')'))
+        {
+            string inner = trimmed[8..^1].Trim().Trim('"', '\'');
+            bool has = Fonts.HasFont(inner);
+            formattedResult = has ? "1 (found)" : "0 (not found)";
+            return true;
+        }
+
+        // Fast-path: explicit string literal or FORM string
+        if (trimmed.StartsWith('"') && trimmed.EndsWith('"'))
+        {
+            try
+            {
+                string val = eval.EvaluateStrExpression(this, topFrame, trimmed);
+                formattedResult = $"\"{val}\"";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                formattedResult = $"Error: {ex.Message}";
+                return false;
+            }
+        }
+
+        // Check if identifier looks like a string variable first
+        long varKind = 0;
+        try
+        {
+            varKind = eval.VariableExists(this, topFrame, trimmed);
+        }
+        catch
+        {
+            varKind = 0;
+        }
+
+        if (varKind == 2L)
+        {
+            try
+            {
+                string s = eval.GetVariableStr(this, topFrame, trimmed);
+                formattedResult = $"\"{s}\"";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                formattedResult = $"Error: {ex.Message}";
+                return false;
+            }
+        }
+
+        try
+        {
+            long intVal = eval.EvaluateIntExpression(this, topFrame, trimmed);
+            formattedResult = intVal.ToString(CultureInfo.InvariantCulture);
+            return true;
+        }
+        catch (Exception intEx)
+        {
+            try
+            {
+                string strVal = eval.EvaluateStrExpression(this, topFrame, trimmed);
+                formattedResult = $"\"{strVal}\"";
+                return true;
+            }
+            catch
+            {
+                formattedResult = $"Error: {intEx.Message}";
+                return false;
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -245,25 +391,14 @@ public sealed partial class EmueraEngine
         string effectivePattern = string.IsNullOrEmpty(pattern) ? "*" : pattern;
 
         bool vfsHasDir = string.IsNullOrEmpty(normalizedDir) || FileSystem.DirectoryExists(normalizedDir);
-        bool saveHasDir = false;
-        string? saveFullDir = null;
-        if (_saveDirectory is not null)
-        {
-            try
-            {
-                saveFullDir = string.IsNullOrEmpty(normalizedDir)
-                    ? _saveDirectory.RootDirectory
-                    : _saveDirectory.ResolveConfinedPath(normalizedDir);
-                saveHasDir = Directory.Exists(saveFullDir);
-            }
-            catch
-            {
-                saveHasDir = false;
-            }
-        }
+        bool storageHasDir = _writableStorage is not null && _writableStorage.DirectoryExists(normalizedDir);
 
-        if (!vfsHasDir && !saveHasDir)
+        if (!vfsHasDir && !storageHasDir)
         {
+            RecordDiagnostic(
+                "VFS",
+                $"ENUMFILES directory not found (-1): '{dirArg}' (pattern='{effectivePattern}')",
+                dedupeKey: $"ENUMFILES:{normalizedDir}");
             return -1;
         }
 
@@ -288,21 +423,20 @@ public sealed partial class EmueraEngine
             }
         }
 
-        if (saveHasDir && saveFullDir is not null)
+        if (storageHasDir && _writableStorage is not null)
         {
-            SearchOption opt = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-            foreach (string fullFile in Directory.EnumerateFiles(saveFullDir, "*", opt))
+            foreach (string relPath in _writableStorage.EnumerateFiles(normalizedDir, "*", recursive))
             {
-                string fileName = Path.GetFileName(fullFile);
+                string fileName = Path.GetFileName(relPath);
                 if (!FileSystemName.MatchesSimpleExpression(effectivePattern, fileName, ignoreCase: true))
                 {
                     continue;
                 }
 
-                string rel = Path.GetRelativePath(_saveDirectory!.RootDirectory, fullFile).Replace('/', '\\');
-                if (seen.Add(rel))
+                string winRel = relPath.Replace('/', '\\');
+                if (seen.Add(winRel))
                 {
-                    results.Add(rel);
+                    results.Add(winRel);
                 }
             }
         }
@@ -355,10 +489,11 @@ public sealed partial class EmueraEngine
 
         byte[] payload = EraSaveSerializer.Save(snap, fmt);
         _memoryVarDataFiles[name.Trim()] = payload;
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
-            string rel = _saveDirectory.GetDatVirtualPath(name, isCharaVar: false);
-            _saveDirectory.WriteAllBytes(rel, payload);
+            string rel = _writableStorage.GetDatVirtualPath(name, isCharaVar: false);
+            _writableStorage.WriteAllBytes(rel, payload);
+            RecordDiagnostic("IO", $"SAVEVAR '{name}' -> '{rel}'");
         }
     }
 
@@ -424,10 +559,11 @@ public sealed partial class EmueraEngine
 
         byte[] payload = EraSaveSerializer.Save(snap, fmt);
         _memoryCharaDataFiles[name.Trim()] = payload;
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
-            string rel = _saveDirectory.GetDatVirtualPath(name, isCharaVar: true);
-            _saveDirectory.WriteAllBytes(rel, payload);
+            string rel = _writableStorage.GetDatVirtualPath(name, isCharaVar: true);
+            _writableStorage.WriteAllBytes(rel, payload);
+            RecordDiagnostic("IO", $"SAVECHARA '{name}' -> '{rel}'");
         }
     }
 
@@ -477,13 +613,12 @@ public sealed partial class EmueraEngine
     internal long CheckGlobalData(out string message)
     {
         VariableStore vars = RequireVariableStore();
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
-            string rel = _saveDirectory.GetGlobalSaveVirtualPath(Options.UseSaveFolder);
-            string fullPath = _saveDirectory.ResolveConfinedPath(rel);
-            if (File.Exists(fullPath))
+            string rel = _writableStorage.GetGlobalSaveVirtualPath(Options.UseSaveFolder);
+            if (_writableStorage.FileExists(rel))
             {
-                return ValidateSaveHeaderBytes(File.ReadAllBytes(fullPath), vars.GameBase, EraSaveFileType.Global, out message);
+                return ValidateSaveHeaderBytes(_writableStorage.ReadAllBytes(rel), vars.GameBase, EraSaveFileType.Global, out message);
             }
         }
 
@@ -512,22 +647,18 @@ public sealed partial class EmueraEngine
             }
         }
 
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null && _writableStorage.DirectoryExists("dat"))
         {
-            string datDir = _saveDirectory.ResolveConfinedPath("dat");
-            if (Directory.Exists(datDir))
+            foreach (string relPath in _writableStorage.EnumerateFiles("dat", $"{prefix}*.dat", recursive: false))
             {
-                foreach (string file in Directory.EnumerateFiles(datDir, $"{prefix}*.dat", SearchOption.TopDirectoryOnly))
+                string fileName = Path.GetFileName(relPath);
+                if (fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                    fileName.EndsWith(".dat", StringComparison.OrdinalIgnoreCase))
                 {
-                    string fileName = Path.GetFileName(file);
-                    if (fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
-                        fileName.EndsWith(".dat", StringComparison.OrdinalIgnoreCase))
+                    string inner = fileName[prefix.Length..^4];
+                    if (FileSystemName.MatchesSimpleExpression(effectivePattern, inner, ignoreCase: true) && seen.Add(inner))
                     {
-                        string inner = fileName[prefix.Length..^4];
-                        if (FileSystemName.MatchesSimpleExpression(effectivePattern, inner, ignoreCase: true) && seen.Add(inner))
-                        {
-                            names.Add(inner);
-                        }
+                        names.Add(inner);
                     }
                 }
             }
@@ -570,8 +701,8 @@ public sealed partial class EmueraEngine
                 }
 
                 string ext = VfsPathNormalizer.GetExtension(relPath).TrimStart('.');
-                bool allowed = _saveDirectory is not null
-                    ? _saveDirectory.IsExtensionAllowed(relPath)
+                bool allowed = _writableStorage is not null
+                    ? _writableStorage.IsExtensionAllowed(relPath)
                     : Options.ValidExtensions.Any(e => e.TrimStart('.').Equals(ext, StringComparison.OrdinalIgnoreCase));
                 if (!allowed)
                 {
@@ -580,18 +711,18 @@ public sealed partial class EmueraEngine
             }
 
             _memoryTextFiles[relPath] = content ?? string.Empty;
-            if (_saveDirectory is not null)
+            if (_writableStorage is not null)
             {
-                Encoding enc = forceUtf8
-                    ? new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)
-                    : new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
-                _saveDirectory.SaveText(relPath, content ?? string.Empty, enc);
+                Encoding enc = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
+                _writableStorage.SaveText(relPath, content ?? string.Empty, enc);
+                RecordDiagnostic("IO", $"SAVETEXT -> '{relPath}' ({(content ?? string.Empty).Length:N0} chars)");
             }
 
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            RecordDiagnostic("IO", $"SAVETEXT failed: {ex.Message}");
             return false;
         }
     }
@@ -625,8 +756,8 @@ public sealed partial class EmueraEngine
                 }
 
                 string ext = VfsPathNormalizer.GetExtension(relPath).TrimStart('.');
-                bool allowed = _saveDirectory is not null
-                    ? _saveDirectory.IsExtensionAllowed(relPath)
+                bool allowed = _writableStorage is not null
+                    ? _writableStorage.IsExtensionAllowed(relPath)
                     : Options.ValidExtensions.Any(e => e.TrimStart('.').Equals(ext, StringComparison.OrdinalIgnoreCase));
                 if (!allowed)
                 {
@@ -635,10 +766,10 @@ public sealed partial class EmueraEngine
             }
 
             string? loaded = null;
-            if (_saveDirectory is not null && _saveDirectory.FileExists(relPath))
+            if (_writableStorage is not null && _writableStorage.FileExists(relPath))
             {
                 Encoding? enc = forceUtf8 ? Encoding.UTF8 : null;
-                loaded = _saveDirectory.LoadText(relPath, enc);
+                loaded = _writableStorage.LoadText(relPath, enc);
             }
             else if (_memoryTextFiles.TryGetValue(relPath, out string? memText))
             {
@@ -686,22 +817,19 @@ public sealed partial class EmueraEngine
             }
 
             _memoryTextFiles[rel] = content;
-            if (_saveDirectory is not null)
+            if (_writableStorage is not null)
             {
-                string fullPath = _saveDirectory.ResolveConfinedPath(rel);
-                string? dir = Path.GetDirectoryName(fullPath);
-                if (!string.IsNullOrEmpty(dir))
-                {
-                    Directory.CreateDirectory(dir);
-                }
-
-                File.WriteAllText(fullPath, content, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+                var utf8Bom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
+                byte[] bytes = [.. utf8Bom.GetPreamble(), .. utf8Bom.GetBytes(content)];
+                _writableStorage.WriteAllBytes(rel, bytes);
+                RecordDiagnostic("IO", $"OUTPUTLOG -> '{rel}'");
             }
 
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            RecordDiagnostic("IO", $"OUTPUTLOG failed: {ex.Message}");
             return false;
         }
     }
@@ -719,14 +847,14 @@ public sealed partial class EmueraEngine
         }
 
         string trimmed = name.Trim();
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
             try
             {
-                string rel = _saveDirectory.GetDatVirtualPath(trimmed, isCharaVar);
-                if (_saveDirectory.FileExists(rel))
+                string rel = _writableStorage.GetDatVirtualPath(trimmed, isCharaVar);
+                if (_writableStorage.FileExists(rel))
                 {
-                    bytes = _saveDirectory.ReadAllBytes(rel);
+                    bytes = _writableStorage.ReadAllBytes(rel);
                     return true;
                 }
             }

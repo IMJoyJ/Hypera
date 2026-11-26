@@ -168,7 +168,8 @@ internal static partial class VmBuiltinExecutor
         var flags = (PrintModifierFlags)insn.Aux;
         if ((flags & PrintModifierFlags.DebugOnly) != 0)
         {
-            if (engine.Options.UseDebugCommand && insn.Op is OpCode.Print or OpCode.PrintLine)
+            if ((engine.Options.UseDebugCommand || engine.AlwaysCaptureDebugPrint) &&
+                insn.Op is OpCode.Print or OpCode.PrintLine)
             {
                 string[] dbgRegs = frame.StrRegisters;
                 string dbgText = insn.A < dbgRegs.Length ? (dbgRegs[insn.A] ?? string.Empty) : string.Empty;
@@ -340,10 +341,21 @@ internal static partial class VmBuiltinExecutor
             }
 
             case OpCode.SetFont:
-                engine.CurrentFontName = insn.Aux == 0xFFFF || insn.A >= strRegs.Length || string.IsNullOrEmpty(strRegs[insn.A])
+            {
+                string fontName = insn.Aux == 0xFFFF || insn.A >= strRegs.Length || string.IsNullOrEmpty(strRegs[insn.A])
                     ? engine.Options.FontName
                     : strRegs[insn.A];
+                if (!string.IsNullOrWhiteSpace(fontName) && !engine.Fonts.HasFont(fontName))
+                {
+                    engine.RecordDiagnostic(
+                        "FONT",
+                        $"SETFONT requested unregistered font '{fontName}' (custom aliases: {string.Join(", ", engine.Fonts.CustomFamilyNames)})",
+                        dedupeKey: $"SETFONT:{fontName.Trim()}");
+                }
+
+                engine.CurrentFontName = fontName;
                 return false;
+            }
         }
 
         return false;
@@ -965,7 +977,19 @@ internal static partial class VmBuiltinExecutor
                 return engine.Viewport.LogicalHeight;
 
             case BuiltinMethodKind.CHKFONT:
-                return engine.Fonts.HasFont(w.GetStr(0)) ? 1L : 0L;
+            {
+                string fontQuery = w.GetStr(0);
+                bool found = engine.Fonts.HasFont(fontQuery);
+                if (!found && !string.IsNullOrWhiteSpace(fontQuery))
+                {
+                    engine.RecordDiagnostic(
+                        "FONT",
+                        $"CHKFONT miss: '{fontQuery}' not found (custom aliases: {string.Join(", ", engine.Fonts.CustomFamilyNames)})",
+                        dedupeKey: $"CHKFONT:{fontQuery.Trim()}");
+                }
+
+                return found ? 1L : 0L;
+            }
 
             case BuiltinMethodKind.CHKDATA:
                 return engine.CheckSaveSlotExists((int)w.GetInt(0), out string summary)
@@ -990,7 +1014,21 @@ internal static partial class VmBuiltinExecutor
             case BuiltinMethodKind.GCREATE:
                 return engine.Graphics.Create((int)w.GetInt(0), (int)w.GetInt(1), (int)w.GetInt(2)) ? 1L : 0L;
             case BuiltinMethodKind.GCREATEFROMFILE:
-                return engine.Graphics.CreateFromFile((int)w.GetInt(0), engine.FileSystem, w.GetStr(1), w.HasArg(2) ? (int)w.GetInt(2) : 0) ? 1L : 0L;
+            {
+                int gid = (int)w.GetInt(0);
+                string imgPath = w.GetStr(1);
+                int imgIdx = w.HasArg(2) ? (int)w.GetInt(2) : 0;
+                bool ok = engine.Graphics.CreateFromFile(gid, engine.FileSystem, imgPath, imgIdx);
+                if (!ok)
+                {
+                    engine.RecordDiagnostic(
+                        "GFX",
+                        $"GCREATEFROMFILE failed: id={gid}, path='{imgPath}'",
+                        dedupeKey: $"GCREATEFROMFILE:{imgPath}");
+                }
+
+                return ok ? 1L : 0L;
+            }
             case BuiltinMethodKind.GDISPOSE:
                 return engine.Graphics.DisposeSurface((int)w.GetInt(0)) ? 1L : 0L;
             case BuiltinMethodKind.GCREATED:

@@ -138,7 +138,7 @@ public static class Program
     {
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: hypera pack <game-directory> [-o <output.hep>] [--no-compress]");
+            Console.Error.WriteLine("Usage: hypera pack <game-directory> [-o <output.hep>] [--no-compress] [--compiled-only] [--exclude <path>]...");
             return 2;
         }
 
@@ -152,6 +152,9 @@ public static class Program
         string outputPath = ParseOptionValue(args[1..], "-o", "--output")
             ?? Path.Combine(Directory.GetCurrentDirectory(), Path.GetFileName(Path.GetFullPath(sourceDir).TrimEnd('\\', '/')) + ".hep");
         bool compress = !args.Contains("--no-compress", StringComparer.OrdinalIgnoreCase);
+        bool compiledOnly = args.Contains("--compiled-only", StringComparer.OrdinalIgnoreCase) ||
+                            args.Contains("--strip-erb", StringComparer.OrdinalIgnoreCase);
+        List<string> excludes = ParseOptionValues(args[1..], "--exclude", "-x");
 
         BytecodeModule? module;
         try
@@ -168,8 +171,37 @@ public static class Program
             module = null;
         }
 
-        HepPackageCodec.PackDirectory(sourceDir, outputPath, compress, module);
-        Console.WriteLine($"[hypera] Packed '{sourceDir}' -> '{outputPath}'.");
+        Func<string, bool>? filter = null;
+        if (compiledOnly)
+        {
+            filter = HepPackageWriter.CreateCompiledDistributionFilter(excludes);
+        }
+        else if (excludes.Count > 0)
+        {
+            var excludeSet = excludes
+                .Where(static e => !string.IsNullOrWhiteSpace(e))
+                .Select(static e => VfsPathNormalizer.Normalize(e))
+                .Where(static e => e.Length > 0)
+                .ToList();
+            filter = normalizedPath =>
+            {
+                foreach (string ex in excludeSet)
+                {
+                    if (normalizedPath.Equals(ex, StringComparison.OrdinalIgnoreCase) ||
+                        normalizedPath.StartsWith(ex + "/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            };
+        }
+
+        ArchivePackageHeader header = HepPackageCodec.PackDirectory(sourceDir, outputPath, compress, module, filter);
+        long sizeBytes = new FileInfo(outputPath).Length;
+        Console.WriteLine(
+            $"[hypera] Packed '{sourceDir}' ({header.EntryCount} entries, {sizeBytes:N0} bytes, compiledOnly={compiledOnly}) -> '{outputPath}'.");
         return 0;
     }
 
@@ -220,6 +252,20 @@ public static class Program
         }
 
         return (headlessDir, inputs);
+    }
+
+    private static List<string> ParseOptionValues(string[] args, params string[] names)
+    {
+        var values = new List<string>();
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (names.Contains(args[i], StringComparer.OrdinalIgnoreCase))
+            {
+                values.Add(args[++i]);
+            }
+        }
+
+        return values;
     }
 
     private static string? ParseOptionValue(string[] args, params string[] names)
@@ -275,7 +321,7 @@ public static class Program
         Console.WriteLine("Usage:");
         Console.WriteLine("  hypera run <path> [--headless-frames <dir>]            Run a game directory, .heb, .hep, or .zip");
         Console.WriteLine("  hypera compile <dir> [-o <out.heb>]                    Compile scripts to .heb bytecode");
-        Console.WriteLine("  hypera pack <dir> [-o <out.hep>]                       Pack assets & scripts into a .hep archive");
+        Console.WriteLine("  hypera pack <dir> [-o <out.hep>] [--compiled-only] [--exclude <p>]  Pack into a .hep archive");
         Console.WriteLine("  hypera bundle <heb-or-hep> --host <exe> -o <Game.exe>  Create single-file HYPRBNDL executable");
     }
 }

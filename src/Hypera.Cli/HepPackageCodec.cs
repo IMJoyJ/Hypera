@@ -12,11 +12,12 @@ public static class HepPackageCodec
 {
     public const string EmbeddedModuleVirtualPath = HepPackageWriter.DefaultPrebuiltBytecodePath;
 
-    public static void PackDirectory(
+    public static ArchivePackageHeader PackDirectory(
         string sourceDirectory,
         string outputHepPath,
         bool compress = true,
-        BytecodeModule? prebuiltModule = null)
+        BytecodeModule? prebuiltModule = null,
+        Func<string, bool>? includeFileFilter = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sourceDirectory);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputHepPath);
@@ -25,12 +26,13 @@ public static class HepPackageCodec
             ? BytecodeSerializer.Serialize(prebuiltModule)
             : null;
 
-        HepPackageWriter.PackDirectory(
+        return HepPackageWriter.PackDirectory(
             sourceDirectory,
             outputHepPath,
             prebuiltBytecode: prebuiltBytes,
             prebuiltBytecodeVirtualPath: EmbeddedModuleVirtualPath,
-            compress: compress);
+            compress: compress,
+            includeFileFilter: includeFileFilter);
     }
 
     public static void WriteArchive(

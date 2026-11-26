@@ -16,5 +16,6 @@
     <ProjectReference Include="..\..\src\Hypera.Audio\Hypera.Audio.csproj" />
     <ProjectReference Include="..\..\src\Hypera.LegacyPluginShim\Hypera.LegacyPluginShim.csproj" />
     <ProjectReference Include="..\..\src\Hypera.Cli\Hypera.Cli.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\..\src\Hypera.Standalone\Hypera.Standalone.csproj" ReferenceOutputAssembly="false" SkipGetTargetFrameworkProperties="true" GlobalPropertiesToRemove="TargetFramework" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
   </ItemGroup>
 </Project>

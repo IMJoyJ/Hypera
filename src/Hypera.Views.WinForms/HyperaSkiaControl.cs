@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Windows.Forms;
 using Hypera.Rendering;
@@ -20,23 +21,36 @@ public readonly record struct LogicalKeyInputEventArgs(
     string? SubmittedText);
 
 /// <summary>
-/// DPI-aware WinForms <see cref="SKControl"/> host rendering <see cref="DisplaySnapshot"/> via <see cref="SkiaFrameCompositor"/>,
-/// converting mouse move/down/up/wheel into <see cref="LogicalViewport"/> coordinates, driving an animation/timeout timer loop,
-/// and handling keyboard input &amp; scrollback offset.
+/// DPI-aware WinForms <see cref="SKControl"/> host rendering full <see cref="ConsoleScene"/> frames
+/// (custom VFS fonts, sprites, animated WebP/GIF, HTML_PRINT divs, CBG layers, SETBGIMAGE, and tooltips)
+/// via <see cref="SkiaFrameCompositor"/>, performing pixel-accurate <see cref="ConsoleHitTester"/> hover/click
+/// dispatch, driving a time-sliced non-blocking execution loop, and synchronizing scrollback &amp; keyboard input.
 /// </summary>
 public class HyperaSkiaControl : SKControl
 {
-    private readonly SkiaFrameCompositor _compositor = new();
+    private readonly SkiaFrameCompositor _fallbackCompositor = new();
     private readonly System.Windows.Forms.Timer _frameTimer;
+    private readonly Stopwatch _animationStopwatch = Stopwatch.StartNew();
     private readonly StringBuilder _inputBuffer = new();
+
+    private EmueraEngine? _engine;
+    private SkiaFrameCompositor? _engineCompositor;
     private DisplaySnapshot? _currentSnapshot;
+    private ConsoleScene? _lastRenderedScene;
+    private HtmlButtonContext? _hoveredButton;
+    private int? _hoveredCbgButtonValue;
     private int _lastSurfaceWidth;
     private int _lastSurfaceHeight;
     private int _scrollbackOffset;
     private long _trackedGenerationId = -1;
     private long _timeoutDeadlineTimestamp;
+    private long _lastAnimationRedrawMs;
     private bool _autoSubmitEngineInput = true;
+    private bool _isTicking;
+    private bool _faultRaised;
+    private bool _completionRaised;
     private int _frameIntervalMs = 16;
+    private int _maxStepSliceMs = 12;
 
     public HyperaSkiaControl()
     {
@@ -49,11 +63,47 @@ public class HyperaSkiaControl : SKControl
 
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public EmueraEngine? Engine { get; set; }
+    public EmueraEngine? Engine
+    {
+        get => _engine;
+        set
+        {
+            if (ReferenceEquals(_engine, value))
+            {
+                return;
+            }
+
+            _engineCompositor?.Dispose();
+            _engineCompositor = null;
+
+            _engine = value;
+            _lastRenderedScene = null;
+            _hoveredButton = null;
+            _hoveredCbgButtonValue = null;
+            _trackedGenerationId = -1;
+            _timeoutDeadlineTimestamp = 0;
+            _faultRaised = false;
+            _completionRaised = false;
+            _scrollbackOffset = 0;
+            _inputBuffer.Clear();
+
+            if (_engine is not null)
+            {
+                _engineCompositor = new SkiaFrameCompositor(_engine.Fonts, _engine.Glyphs);
+                _engine.ConsoleBuffer.ScrollOffsetLines = 0;
+                _animationStopwatch.Restart();
+                _lastAnimationRedrawMs = 0;
+            }
+
+            Cursor = Cursors.Default;
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+        }
+    }
 
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public SkiaFrameCompositor Compositor => _compositor;
+    public SkiaFrameCompositor Compositor => _engineCompositor ?? _fallbackCompositor;
 
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -77,22 +127,49 @@ public class HyperaSkiaControl : SKControl
 
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public int MaxStepSliceMs
+    {
+        get => _maxStepSliceMs;
+        set => _maxStepSliceMs = Math.Clamp(value, 2, 100);
+    }
+
+    [Browsable(false)]
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public bool IsLoopRunning => _frameTimer.Enabled;
+
+    [Browsable(false)]
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public int MaxScrollbackOffset => _engine?.ConsoleBuffer.MaxScrollOffsetLines ?? 0;
 
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public int ScrollbackOffset
     {
-        get => _scrollbackOffset;
+        get => _engine is not null ? _engine.ConsoleBuffer.ScrollOffsetLines : _scrollbackOffset;
         set
         {
-            int clamped = Math.Max(0, value);
-            if (_scrollbackOffset == clamped)
+            if (_engine is not null)
+            {
+                int clamped = Math.Clamp(value, 0, _engine.ConsoleBuffer.MaxScrollOffsetLines);
+                if (_engine.ConsoleBuffer.ScrollOffsetLines == clamped && _scrollbackOffset == clamped)
+                {
+                    return;
+                }
+
+                _scrollbackOffset = clamped;
+                _engine.ConsoleBuffer.ScrollOffsetLines = clamped;
+                ScrollbackChanged?.Invoke(this, clamped);
+                Invalidate();
+                return;
+            }
+
+            int fallbackClamped = Math.Max(0, value);
+            if (_scrollbackOffset == fallbackClamped)
             {
                 return;
             }
 
-            _scrollbackOffset = clamped;
+            _scrollbackOffset = fallbackClamped;
             ScrollbackChanged?.Invoke(this, _scrollbackOffset);
             Invalidate();
         }
@@ -106,12 +183,37 @@ public class HyperaSkiaControl : SKControl
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public string PendingInputText => _inputBuffer.ToString();
 
+    [Browsable(false)]
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public long? RemainingTimeoutMs
+    {
+        get
+        {
+            if (_timeoutDeadlineTimestamp <= 0)
+            {
+                return null;
+            }
+
+            long remainingTicks = _timeoutDeadlineTimestamp - Stopwatch.GetTimestamp();
+            if (remainingTicks <= 0)
+            {
+                return 0L;
+            }
+
+            return (long)(remainingTicks * 1000.0 / Stopwatch.Frequency);
+        }
+    }
+
     public event EventHandler<LogicalPointerEventArgs>? LogicalPointerMoved;
     public event EventHandler<LogicalPointerEventArgs>? LogicalPointerDown;
     public event EventHandler<LogicalPointerEventArgs>? LogicalPointerUp;
     public event EventHandler<LogicalPointerEventArgs>? LogicalPointerWheel;
     public event EventHandler<LogicalKeyInputEventArgs>? KeyInputSubmitted;
     public event EventHandler<int>? ScrollbackChanged;
+    public event EventHandler? ContentUpdated;
+    public event EventHandler<Exception>? EngineFaulted;
+    public event EventHandler? EngineRestartRequested;
+    public event EventHandler? EngineCompleted;
 
     public void StartLoop()
     {
@@ -129,7 +231,7 @@ public class HyperaSkiaControl : SKControl
         }
     }
 
-    public void ScrollBy(int deltaLines) => ScrollbackOffset = _scrollbackOffset + deltaLines;
+    public void ScrollBy(int deltaLines) => ScrollbackOffset += deltaLines;
 
     public void ScrollToBottom() => ScrollbackOffset = 0;
 
@@ -137,6 +239,99 @@ public class HyperaSkiaControl : SKControl
     {
         _currentSnapshot = snapshot;
         Invalidate();
+    }
+
+    /// <summary>
+    /// Submits a line of text (from the host input box or canvas buffer) to the waiting engine.
+    /// Returns true if accepted by the engine.
+    /// </summary>
+    public bool SubmitLineInput(string text)
+    {
+        if (_engine is not { Status: EngineStepStatus.WaitingInput, PendingInputRequest: { } req } engine)
+        {
+            return false;
+        }
+
+        SubmitResponseForKind(engine, req, text ?? string.Empty);
+        bool accepted = engine.Status != EngineStepStatus.WaitingInput ||
+                        engine.PendingInputRequest?.GenerationId != req.GenerationId;
+        if (accepted)
+        {
+            ClearHoverState();
+            ScrollToBottom();
+        }
+
+        Invalidate();
+        ContentUpdated?.Invoke(this, EventArgs.Empty);
+        return accepted;
+    }
+
+    /// <summary>
+    /// Submits an immediate single-character or any-key input when the engine is awaiting
+    /// <c>ONEINPUT</c>, <c>ONEINPUTS</c>, <c>WAIT</c>, or <c>INPUTMOUSEKEY</c>.
+    /// </summary>
+    public bool TrySubmitImmediateChar(char keyChar)
+    {
+        if (_engine is not { Status: EngineStepStatus.WaitingInput, PendingInputRequest: { } req } engine)
+        {
+            return false;
+        }
+
+        if (req.Kind is InputRequestKind.OneInt or InputRequestKind.OneString)
+        {
+            string single = keyChar.ToString();
+            SubmitResponseForKind(engine, req, single);
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            return true;
+        }
+
+        if (req.Kind is InputRequestKind.AnyKey or InputRequestKind.MouseClick)
+        {
+            engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: keyChar, StringValue: keyChar.ToString()));
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Submits a raw key-down event when the engine is awaiting <c>AnyKey</c> or <c>INPUTMOUSEKEY</c>.
+    /// </summary>
+    public bool TrySubmitImmediateKey(Keys keyCode)
+    {
+        if (_engine is not { Status: EngineStepStatus.WaitingInput, PendingInputRequest: { } req } engine)
+        {
+            return false;
+        }
+
+        if (req.Kind == InputRequestKind.MouseClick)
+        {
+            engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: (int)keyCode, StringValue: keyCode.ToString()));
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            return true;
+        }
+
+        if (req.Kind == InputRequestKind.AnyKey)
+        {
+            engine.SubmitInput(new InputResponse(req.GenerationId, StringValue: keyCode.ToString()));
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            return true;
+        }
+
+        return false;
     }
 
     public LogicalPoint MapScreenToLogical(int clientX, int clientY, out bool isInsideViewport)
@@ -149,7 +344,7 @@ public class HyperaSkiaControl : SKControl
         float scaledX = clientX * ((float)surfaceW / clientW);
         float scaledY = clientY * ((float)surfaceH / clientH);
 
-        LogicalViewport vp = _currentSnapshot?.Viewport ?? Engine?.Viewport ?? LogicalViewport.Default;
+        LogicalViewport vp = _engine?.Viewport ?? _currentSnapshot?.Viewport ?? LogicalViewport.Default;
         var transform = new ViewportTransform(vp.LogicalWidth, vp.LogicalHeight, surfaceW, surfaceH);
         return transform.ScreenToLogical(scaledX, scaledY, out isInsideViewport);
     }
@@ -160,22 +355,55 @@ public class HyperaSkiaControl : SKControl
         _lastSurfaceWidth = Math.Max(1, e.Info.Width);
         _lastSurfaceHeight = Math.Max(1, e.Info.Height);
 
-        DisplaySnapshot? snapshot = _currentSnapshot ?? Engine?.CaptureSnapshot();
-        if (snapshot is null)
+        if (_engine is { } engine)
+        {
+            engine.ElapsedAnimationMs = _animationStopwatch.ElapsedMilliseconds;
+            ConsoleScene scene = engine.ConsoleBuffer.CaptureScene(
+                hoveredCbgButtonValue: _hoveredCbgButtonValue,
+                hoveredButton: _hoveredButton,
+                elapsedAnimationMs: engine.ElapsedAnimationMs);
+            _lastRenderedScene = scene;
+
+            _engineCompositor ??= new SkiaFrameCompositor(engine.Fonts, engine.Glyphs);
+            _engineCompositor.RenderScene(
+                e.Surface.Canvas,
+                e.Info.Width,
+                e.Info.Height,
+                scene,
+                engine.Graphics,
+                engine.Sprites);
+            return;
+        }
+
+        if (_currentSnapshot is null)
         {
             e.Surface.Canvas.Clear(SKColors.Black);
             return;
         }
 
-        DisplaySnapshot renderTarget = ApplyScrollbackOffset(snapshot, _scrollbackOffset);
-        _compositor.RenderSnapshot(e.Surface.Canvas, e.Info.Width, e.Info.Height, renderTarget);
+        DisplaySnapshot renderTarget = ApplyScrollbackOffset(_currentSnapshot, _scrollbackOffset);
+        _fallbackCompositor.RenderSnapshot(e.Surface.Canvas, e.Info.Width, e.Info.Height, renderTarget);
     }
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
         LogicalPoint pt = MapScreenToLogical(e.X, e.Y, out bool inside);
+        if (_engine is { } engine)
+        {
+            UpdateHoverState(engine, pt, inside);
+        }
+
         LogicalPointerMoved?.Invoke(this, new LogicalPointerEventArgs(pt, inside, e.Button));
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (ClearHoverState())
+        {
+            Invalidate();
+        }
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -185,15 +413,28 @@ public class HyperaSkiaControl : SKControl
         LogicalPoint pt = MapScreenToLogical(e.X, e.Y, out bool inside);
         LogicalPointerDown?.Invoke(this, new LogicalPointerEventArgs(pt, inside, e.Button));
 
-        if (_autoSubmitEngineInput && inside && e.Button == MouseButtons.Left)
+        if (_engine is { } engine)
         {
-            TrySubmitPointerToEngine(pt);
+            if (e.Button == MouseButtons.Right)
+            {
+                engine.IsMouseSkip = true;
+            }
+
+            if (_autoSubmitEngineInput && inside)
+            {
+                TrySubmitPointerToEngine(engine, pt, e.Button);
+            }
         }
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        if (_engine is { } engine && e.Button == MouseButtons.Right)
+        {
+            engine.IsMouseSkip = false;
+        }
+
         LogicalPoint pt = MapScreenToLogical(e.X, e.Y, out bool inside);
         LogicalPointerUp?.Invoke(this, new LogicalPointerEventArgs(pt, inside, e.Button));
     }
@@ -202,7 +443,7 @@ public class HyperaSkiaControl : SKControl
     {
         base.OnMouseWheel(e);
         LogicalPoint pt = MapScreenToLogical(e.X, e.Y, out bool inside);
-        int linesPerNotch = Math.Max(1, Engine?.Options.ScrollHeight ?? 1);
+        int linesPerNotch = Math.Max(1, _engine?.Options.ScrollHeight ?? 1);
         int deltaLines = (e.Delta / 120) * linesPerNotch;
         if (deltaLines != 0)
         {
@@ -246,11 +487,8 @@ public class HyperaSkiaControl : SKControl
                 return;
         }
 
-        if (_autoSubmitEngineInput &&
-            Engine is { Status: EngineStepStatus.WaitingInput, PendingInputRequest.Kind: InputRequestKind.AnyKey } engine &&
-            engine.PendingInputRequest is { } req)
+        if (_autoSubmitEngineInput && TrySubmitImmediateKey(e.KeyCode))
         {
-            engine.SubmitInput(new InputResponse(req.GenerationId, StringValue: e.KeyCode.ToString()));
             KeyInputSubmitted?.Invoke(this, new LogicalKeyInputEventArgs(e.KeyCode, e.KeyCode.ToString()));
             e.Handled = true;
         }
@@ -264,13 +502,9 @@ public class HyperaSkiaControl : SKControl
             return;
         }
 
-        if (_autoSubmitEngineInput &&
-            Engine is { Status: EngineStepStatus.WaitingInput, PendingInputRequest: { } req } engine &&
-            req.Kind is InputRequestKind.OneInt or InputRequestKind.OneString)
+        if (_autoSubmitEngineInput && TrySubmitImmediateChar(e.KeyChar))
         {
-            string single = e.KeyChar.ToString();
-            SubmitResponseForKind(engine, req, single);
-            KeyInputSubmitted?.Invoke(this, new LogicalKeyInputEventArgs(Keys.None, single));
+            KeyInputSubmitted?.Invoke(this, new LogicalKeyInputEventArgs(Keys.None, e.KeyChar.ToString()));
             e.Handled = true;
             return;
         }
@@ -280,48 +514,221 @@ public class HyperaSkiaControl : SKControl
 
     private void OnFrameTimerTick(object? sender, EventArgs e)
     {
-        if (Engine is null)
+        if (_isTicking || _engine is not { } engine)
         {
             return;
         }
 
-        if (Engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded)
+        _isTicking = true;
+        try
         {
-            Engine.Step();
-            _currentSnapshot = Engine.CaptureSnapshot();
-            ScrollToBottom();
-            Invalidate();
-        }
+            long elapsedMs = _animationStopwatch.ElapsedMilliseconds;
+            engine.ElapsedAnimationMs = elapsedMs;
 
-        if (Engine.Status == EngineStepStatus.WaitingInput && Engine.PendingInputRequest is { } req)
-        {
-            if (_trackedGenerationId != req.GenerationId)
+            bool needsRepaint = false;
+            bool contentChanged = false;
+
+            if (engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded)
             {
-                _trackedGenerationId = req.GenerationId;
-                _timeoutDeadlineTimestamp = req.TimeoutMilliseconds is > 0
-                    ? Stopwatch.GetTimestamp() + (long)(req.TimeoutMilliseconds.Value * (Stopwatch.Frequency / 1000.0))
-                    : 0;
+                long sliceDeadline = Stopwatch.GetTimestamp() +
+                                     (long)(_maxStepSliceMs * (Stopwatch.Frequency / 1000.0));
+                int batches = 0;
+                do
+                {
+                    engine.Step();
+                    batches++;
+                }
+                while (engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded &&
+                       Stopwatch.GetTimestamp() < sliceDeadline &&
+                       batches < 32);
+
+                _scrollbackOffset = 0;
+                engine.ConsoleBuffer.ScrollOffsetLines = 0;
+                ClearHoverState();
+                needsRepaint = true;
+                contentChanged = true;
             }
-            else if (_timeoutDeadlineTimestamp > 0 && Stopwatch.GetTimestamp() >= _timeoutDeadlineTimestamp)
+
+            if (engine.Status == EngineStepStatus.WaitingInput && engine.PendingInputRequest is { } req)
             {
+                if (_trackedGenerationId != req.GenerationId)
+                {
+                    _trackedGenerationId = req.GenerationId;
+                    _timeoutDeadlineTimestamp = req.TimeoutMilliseconds is > 0
+                        ? Stopwatch.GetTimestamp() + (long)(req.TimeoutMilliseconds.Value * (Stopwatch.Frequency / 1000.0))
+                        : 0;
+                    contentChanged = true;
+                    needsRepaint = true;
+                }
+                else if (engine.IsMouseSkip && req.Kind is InputRequestKind.AnyKey or InputRequestKind.TimedWait)
+                {
+                    _timeoutDeadlineTimestamp = 0;
+                    engine.SubmitInput(new InputResponse(req.GenerationId, IsTimeout: req.Kind == InputRequestKind.TimedWait));
+                    contentChanged = true;
+                    needsRepaint = true;
+                }
+                else if (_timeoutDeadlineTimestamp > 0 && Stopwatch.GetTimestamp() >= _timeoutDeadlineTimestamp)
+                {
+                    _timeoutDeadlineTimestamp = 0;
+                    engine.SubmitInput(new InputResponse(req.GenerationId, IsTimeout: true));
+                    contentChanged = true;
+                    needsRepaint = true;
+                }
+                else if (req.TimeoutMilliseconds is > 0 && elapsedMs - _lastAnimationRedrawMs >= 100)
+                {
+                    // Refresh status countdown while timed wait / TINPUT is active.
+                    contentChanged = true;
+                }
+            }
+            else
+            {
+                _trackedGenerationId = -1;
                 _timeoutDeadlineTimestamp = 0;
-                Engine.SubmitInput(new InputResponse(req.GenerationId, IsTimeout: true));
+            }
+
+            int animeInterval = Math.Max(33, engine.AnimeTimerIntervalMs);
+            if (!needsRepaint && elapsedMs - _lastAnimationRedrawMs >= animeInterval && HasPotentialAnimation(engine))
+            {
+                needsRepaint = true;
+            }
+
+            if (needsRepaint)
+            {
+                _lastAnimationRedrawMs = elapsedMs;
                 Invalidate();
             }
+
+            if (contentChanged)
+            {
+                ContentUpdated?.Invoke(this, EventArgs.Empty);
+            }
+
+            if (engine.Status == EngineStepStatus.Faulted && !_faultRaised)
+            {
+                _faultRaised = true;
+                EngineFaulted?.Invoke(this, engine.FaultException ?? new InvalidOperationException("Engine faulted."));
+            }
+            else if (engine.Status == EngineStepStatus.Completed && !_completionRaised)
+            {
+                _completionRaised = true;
+                if (engine.RestartRequested)
+                {
+                    EngineRestartRequested?.Invoke(this, EventArgs.Empty);
+                }
+                else
+                {
+                    EngineCompleted?.Invoke(this, EventArgs.Empty);
+                }
+            }
         }
-        else
+        finally
         {
-            _trackedGenerationId = -1;
-            _timeoutDeadlineTimestamp = 0;
+            _isTicking = false;
         }
+    }
+
+    private static bool HasPotentialAnimation(EmueraEngine engine) =>
+        engine.Sprites.Count > 0;
+
+    private void UpdateHoverState(EmueraEngine engine, LogicalPoint pt, bool inside)
+    {
+        if (inside)
+        {
+            engine.MouseX = (int)MathF.Floor(pt.X);
+            engine.MouseY = (int)MathF.Floor(pt.Y);
+        }
+
+        if (!inside || !engine.Options.UseMouse)
+        {
+            if (ClearHoverState())
+            {
+                Invalidate();
+            }
+
+            return;
+        }
+
+        ConsoleScene scene = _lastRenderedScene ?? engine.ConsoleBuffer.CaptureScene(
+            hoveredCbgButtonValue: _hoveredCbgButtonValue,
+            hoveredButton: _hoveredButton,
+            elapsedAnimationMs: engine.ElapsedAnimationMs);
+
+        ConsoleHitTestResult hit = ConsoleHitTester.HitTestLogicalPoint(
+            scene,
+            pt.X,
+            pt.Y,
+            engine.Graphics,
+            engine.Sprites);
+
+        HtmlButtonContext? nextButton = hit.ActiveButton;
+        int? nextCbg = hit.ActiveCbgButton?.ButtonValue;
+        string? nextTooltip = hit.TooltipText;
+
+        bool buttonChanged = !ReferenceEquals(_hoveredButton, nextButton) || _hoveredCbgButtonValue != nextCbg;
+        bool tooltipChanged = !string.Equals(engine.ConsoleBuffer.Tooltip.ActiveText, nextTooltip, StringComparison.Ordinal) ||
+                              (!string.IsNullOrEmpty(nextTooltip) &&
+                               (MathF.Abs(engine.ConsoleBuffer.Tooltip.AnchorX - pt.X) >= 1f ||
+                                MathF.Abs(engine.ConsoleBuffer.Tooltip.AnchorY - pt.Y) >= 1f));
+
+        _hoveredButton = nextButton;
+        _hoveredCbgButtonValue = nextCbg;
+
+        engine.HoveredButtonValue = nextButton is not null
+            ? nextButton.StringValue
+            : nextCbg.HasValue
+                ? nextCbg.Value.ToString(CultureInfo.InvariantCulture)
+                : string.Empty;
+
+        engine.ConsoleBuffer.Tooltip = engine.ConsoleBuffer.Tooltip with
+        {
+            ActiveText = nextTooltip,
+            AnchorX = pt.X,
+            AnchorY = pt.Y,
+        };
+
+        bool interactive = hit.HasActiveButton || hit.ActiveCbgButton is not null || hit.HasCbgButtonMapHit || hit.HasSrcMapHit;
+        Cursor = interactive ? Cursors.Hand : Cursors.Default;
+
+        if (buttonChanged || tooltipChanged)
+        {
+            Invalidate();
+        }
+    }
+
+    private bool ClearHoverState()
+    {
+        bool changed = _hoveredButton is not null || _hoveredCbgButtonValue.HasValue;
+        _hoveredButton = null;
+        _hoveredCbgButtonValue = null;
+
+        if (_engine is not null)
+        {
+            if (!string.IsNullOrEmpty(_engine.HoveredButtonValue))
+            {
+                _engine.HoveredButtonValue = string.Empty;
+                changed = true;
+            }
+
+            if (!string.IsNullOrEmpty(_engine.ConsoleBuffer.Tooltip.ActiveText))
+            {
+                _engine.ConsoleBuffer.Tooltip = _engine.ConsoleBuffer.Tooltip with { ActiveText = null };
+                changed = true;
+            }
+        }
+
+        if (Cursor != Cursors.Default)
+        {
+            Cursor = Cursors.Default;
+        }
+
+        return changed;
     }
 
     private void SubmitTextOrKeyInput(Keys keyCode, string text)
     {
-        if (_autoSubmitEngineInput && Engine is { Status: EngineStepStatus.WaitingInput, PendingInputRequest: { } req } engine)
+        if (_autoSubmitEngineInput)
         {
-            SubmitResponseForKind(engine, req, text);
-            Invalidate();
+            SubmitLineInput(text);
         }
 
         KeyInputSubmitted?.Invoke(this, new LogicalKeyInputEventArgs(keyCode, text));
@@ -331,7 +738,7 @@ public class HyperaSkiaControl : SKControl
     {
         if (req.Kind is InputRequestKind.IntValue or InputRequestKind.OneInt)
         {
-            if (long.TryParse(text.Trim(), out long parsed))
+            if (long.TryParse(text.Trim(), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long parsed))
             {
                 engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: parsed));
             }
@@ -346,10 +753,98 @@ public class HyperaSkiaControl : SKControl
         }
     }
 
-    private void TrySubmitPointerToEngine(LogicalPoint pt)
+    private void TrySubmitPointerToEngine(EmueraEngine engine, LogicalPoint pt, MouseButtons button)
     {
-        if (Engine is not { Status: EngineStepStatus.WaitingInput, PendingInputRequest: { } req } engine)
+        if (engine.Status != EngineStepStatus.WaitingInput || engine.PendingInputRequest is not { } req)
         {
+            return;
+        }
+
+        int mouseBtnCode = button switch
+        {
+            MouseButtons.Left => 1,
+            MouseButtons.Right => 2,
+            MouseButtons.Middle => 3,
+            _ => 0,
+        };
+
+        if (mouseBtnCode == 0)
+        {
+            return;
+        }
+
+        ConsoleScene scene = _lastRenderedScene ?? engine.ConsoleBuffer.CaptureScene(
+            hoveredCbgButtonValue: _hoveredCbgButtonValue,
+            hoveredButton: _hoveredButton,
+            elapsedAnimationMs: engine.ElapsedAnimationMs);
+
+        ConsoleHitTestResult hit = ConsoleHitTester.HitTestLogicalPoint(
+            scene,
+            pt.X,
+            pt.Y,
+            engine.Graphics,
+            engine.Sprites);
+        InputHitTestSlots hitSlots = hit.ToInputHitTestSlots(mouseBtnCode);
+
+        if (req.Kind == InputRequestKind.MouseClick)
+        {
+            long? intVal = hit.HasActiveButton && hit.ActiveButton!.IsInteger
+                ? hit.ActiveButton.IntValue
+                : hit.HasCbgButtonMapHit ? hit.CbgButtonMapColor : null;
+            string? strVal = hit.HasActiveButton ? hit.ActiveButton!.StringValue : null;
+            engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: intVal, StringValue: strVal, HitTest: hitSlots));
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        if (req.Kind is InputRequestKind.AnyKey or InputRequestKind.TimedWait)
+        {
+            engine.SubmitInput(new InputResponse(req.GenerationId, HitTest: hitSlots));
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        if (button != MouseButtons.Left || !req.AllowMouseHitTest)
+        {
+            return;
+        }
+
+        if (hit.HasActiveButton && hit.ActiveButton is { } activeBtn)
+        {
+            InputResponse resp = activeBtn.IsInteger
+                ? new InputResponse(req.GenerationId, IntValue: activeBtn.IntValue, StringValue: activeBtn.StringValue, HitTest: hitSlots)
+                : new InputResponse(req.GenerationId, StringValue: activeBtn.StringValue, HitTest: hitSlots);
+            engine.SubmitInput(resp);
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        if (hit.HasCbgButtonMapHit)
+        {
+            engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: hit.CbgButtonMapColor, HitTest: hitSlots));
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        if (hit.HasSrcMapHit)
+        {
+            engine.SubmitInput(new InputResponse(req.GenerationId, IntValue: hit.SrcMapColor, HitTest: hitSlots));
+            ClearHoverState();
+            ScrollToBottom();
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
             return;
         }
 
@@ -357,30 +852,19 @@ public class HyperaSkiaControl : SKControl
         {
             foreach (ButtonDescriptor btn in req.ActiveButtons)
             {
-                if (btn.Bounds.Contains(pt.X, pt.Y))
+                if (btn.Bounds.Width > 0 && btn.Bounds.Height > 0 && btn.Bounds.Contains(pt.X, pt.Y))
                 {
                     InputResponse resp = btn.IsIntegerButton
-                        ? new InputResponse(req.GenerationId, IntValue: btn.IntValue)
-                        : new InputResponse(req.GenerationId, StringValue: btn.StringValue);
+                        ? new InputResponse(req.GenerationId, IntValue: btn.IntValue, HitTest: hitSlots)
+                        : new InputResponse(req.GenerationId, StringValue: btn.StringValue, HitTest: hitSlots);
                     engine.SubmitInput(resp);
+                    ClearHoverState();
+                    ScrollToBottom();
                     Invalidate();
+                    ContentUpdated?.Invoke(this, EventArgs.Empty);
                     return;
                 }
             }
-        }
-
-        if (req.Kind is InputRequestKind.MouseClick or InputRequestKind.AnyKey)
-        {
-            var hitTest = new InputHitTestSlots(
-                HasHitColor: false,
-                Result3PrimaryColor: 0,
-                Result4SecondaryColor: 0,
-                Result6HoverOrAuxColor: 0,
-                LogicalX: (int)Math.Round(pt.X),
-                LogicalY: (int)Math.Round(pt.Y),
-                MouseButton: 1);
-            engine.SubmitInput(new InputResponse(req.GenerationId, HitTest: hitTest));
-            Invalidate();
         }
     }
 
@@ -411,7 +895,8 @@ public class HyperaSkiaControl : SKControl
             _frameTimer.Stop();
             _frameTimer.Tick -= OnFrameTimerTick;
             _frameTimer.Dispose();
-            _compositor.Dispose();
+            _engineCompositor?.Dispose();
+            _fallbackCompositor.Dispose();
         }
 
         base.Dispose(disposing);

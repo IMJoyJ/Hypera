@@ -1,12 +1,14 @@
+using System.IO.Enumeration;
 using System.Text;
 
 namespace Hypera.VirtualFs;
 
 /// <summary>
-/// Sandboxed writable directory helper for runtime save data (sav/, dat/, global.sav)
-/// and SAVETEXT/LOADTEXT operations with strict path confinement and ValidExtension whitelist enforcement.
+/// Sandboxed writable directory helper implementing <see cref="IWritableUserStorage"/> for runtime save data
+/// (sav/, dat/, global.sav, img*.png, output logs) and SAVETEXT/LOADTEXT operations with strict path confinement
+/// and ValidExtension whitelist enforcement.
 /// </summary>
-public sealed class WritableSaveDirectory
+public sealed class WritableSaveDirectory : IWritableUserStorage
 {
     private readonly string _rootFullPath;
     private readonly string _rootWithSeparator;
@@ -43,6 +45,8 @@ public sealed class WritableSaveDirectory
     }
 
     public string RootDirectory => _rootFullPath;
+
+    public string StorageDescription => _rootFullPath;
 
     public IReadOnlyCollection<string> ValidTextExtensions => _validTextExtensions;
 
@@ -110,6 +114,70 @@ public sealed class WritableSaveDirectory
     }
 
     public bool FileExists(string relativePath) => File.Exists(ResolveConfinedPath(relativePath));
+
+    public bool DirectoryExists(string relativeDirectoryPath)
+    {
+        if (string.IsNullOrWhiteSpace(relativeDirectoryPath))
+        {
+            return Directory.Exists(_rootFullPath);
+        }
+
+        try
+        {
+            return Directory.Exists(ResolveConfinedPath(relativeDirectoryPath));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public IEnumerable<string> EnumerateFiles(
+        string directoryRelativePath = "",
+        string searchPattern = "*",
+        bool recursive = true)
+    {
+        string fullDir;
+        try
+        {
+            fullDir = string.IsNullOrWhiteSpace(directoryRelativePath)
+                ? _rootFullPath
+                : ResolveConfinedPath(directoryRelativePath);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        if (!Directory.Exists(fullDir))
+        {
+            yield break;
+        }
+
+        string effectivePattern = string.IsNullOrEmpty(searchPattern) ? "*" : searchPattern;
+        SearchOption opt = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var results = new List<string>();
+        foreach (string fullFile in Directory.EnumerateFiles(fullDir, "*", opt))
+        {
+            string fileName = Path.GetFileName(fullFile);
+            if (effectivePattern != "*" && !FileSystemName.MatchesSimpleExpression(effectivePattern, fileName, ignoreCase: true))
+            {
+                continue;
+            }
+
+            string rel = VfsPathNormalizer.Normalize(Path.GetRelativePath(_rootFullPath, fullFile));
+            if (rel.Length > 0)
+            {
+                results.Add(rel);
+            }
+        }
+
+        results.Sort(VfsPathNormalizer.Comparer);
+        foreach (string item in results)
+        {
+            yield return item;
+        }
+    }
 
     public Stream OpenWrite(string relativePath)
     {

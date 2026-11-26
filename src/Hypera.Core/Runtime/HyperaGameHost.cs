@@ -37,6 +37,13 @@ public sealed class HyperaGameLoadOptions
     public string? SaveDirectory { get; init; }
 
     /// <summary>
+    /// Optional pluggable <see cref="IWritableUserStorage"/> backend (e.g. <see cref="InMemoryWritableStorage"/>
+    /// for Web/Server IndexedDB sync, or custom quota-enforced storage). Takes precedence over
+    /// <see cref="WritableSaveDirectory"/> and <see cref="SaveDirectory"/>.
+    /// </summary>
+    public IWritableUserStorage? WritableStorage { get; init; }
+
+    /// <summary>
     /// Optional pre-constructed <see cref="WritableSaveDirectory"/> (takes precedence over <see cref="SaveDirectory"/>).
     /// </summary>
     public WritableSaveDirectory? WritableSaveDirectory { get; init; }
@@ -109,6 +116,7 @@ public sealed class HyperaGameHost : IDisposable
         GameData gameData,
         RuntimeDynamicCompiler dynamicCompiler,
         WritableSaveDirectory? saveDirectory,
+        IWritableUserStorage? writableStorage,
         bool loadedFromPrebuiltBytecode)
     {
         Engine = engine;
@@ -118,6 +126,7 @@ public sealed class HyperaGameHost : IDisposable
         GameData = gameData;
         DynamicCompiler = dynamicCompiler;
         SaveDirectory = saveDirectory;
+        WritableStorage = writableStorage;
         LoadedFromPrebuiltBytecode = loadedFromPrebuiltBytecode;
     }
 
@@ -128,6 +137,7 @@ public sealed class HyperaGameHost : IDisposable
     public GameData GameData { get; }
     public RuntimeDynamicCompiler DynamicCompiler { get; }
     public WritableSaveDirectory? SaveDirectory { get; }
+    public IWritableUserStorage? WritableStorage { get; }
     public bool LoadedFromPrebuiltBytecode { get; }
 
     /// <summary>
@@ -332,22 +342,22 @@ public sealed class HyperaGameHost : IDisposable
         var dynamicCompiler = new RuntimeDynamicCompiler(module, compilation?.Symbols);
         dynamicCompiler.AttachTo(engine);
 
-        // 7. Wire sandboxed WritableSaveDirectory (never mutating read-only archives)
-        WritableSaveDirectory? saveDir = opts.WritableSaveDirectory;
-        if (saveDir is null)
+        // 7. Wire sandboxed IWritableUserStorage (pluggable host backend; never mutates read-only archives)
+        IWritableUserStorage? writableStorage = opts.WritableStorage ?? opts.WritableSaveDirectory;
+        if (writableStorage is null)
         {
             string? savePath = !string.IsNullOrWhiteSpace(opts.SaveDirectory)
                 ? opts.SaveDirectory
                 : defaultSaveRoot;
             if (!string.IsNullOrWhiteSpace(savePath))
             {
-                saveDir = new WritableSaveDirectory(savePath, runtimeOptions.ValidExtensions);
+                writableStorage = new WritableSaveDirectory(savePath, runtimeOptions.ValidExtensions);
             }
         }
 
-        if (saveDir is not null)
+        if (writableStorage is not null)
         {
-            engine.ConfigureSaveDirectory(saveDir);
+            engine.ConfigureWritableStorage(writableStorage);
         }
 
         // 8. Wire optional legacy CALLSHARP plugin host
@@ -369,7 +379,8 @@ public sealed class HyperaGameHost : IDisposable
             config,
             gameData,
             dynamicCompiler,
-            saveDir,
+            writableStorage as WritableSaveDirectory,
+            writableStorage,
             loadedPrebuilt);
     }
 
@@ -389,6 +400,23 @@ public sealed class HyperaGameHost : IDisposable
             using Stream s = vfs.OpenRead(LegacyEmbeddedBytecodePath);
             module = BytecodeSerializer.Deserialize(s);
             return true;
+        }
+
+        if (TryLoadFromHepIfPrebuilt(vfs, out module))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryLoadFromHepIfPrebuilt(IVirtualFileSystem vfs, out BytecodeModule? module)
+    {
+        module = null;
+        if (vfs is OverlayVirtualFileSystem overlay)
+        {
+            return TryLoadFromHepIfPrebuilt(overlay.Upper, out module) ||
+                   TryLoadFromHepIfPrebuilt(overlay.Lower, out module);
         }
 
         if (vfs is HepArchiveVfs { HasPrebuiltBytecode: true })

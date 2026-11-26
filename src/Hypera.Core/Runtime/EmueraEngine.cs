@@ -41,7 +41,7 @@ public sealed partial class EmueraEngine : IDisposable
     private long _inputGeneration;
     private long _buttonGeneration = 1;
     private PendingScriptInputMeta? _pendingScriptInputMeta;
-    private WritableSaveDirectory? _saveDirectory;
+    private IWritableUserStorage? _writableStorage;
     private EraSaveSnapshot? _memoryGlobalSnapshot;
     private bool _disposed;
 
@@ -112,11 +112,26 @@ public sealed partial class EmueraEngine : IDisposable
         CurrentFontName = Options.FontName;
 
         Fonts = new FontRegistry();
-        Fonts.RegisterFromVfs(fileSystem);
+        int loadedFonts = Fonts.RegisterFromVfs(fileSystem);
         Glyphs = new GlyphMeasurer(Fonts);
         Sprites = new SpriteRegistry();
-        Sprites.LoadResourcesFromVfs(fileSystem);
+        int loadedSprites = Sprites.LoadResourcesFromVfs(fileSystem);
         Graphics = new GraphicsManager(Fonts, Glyphs, defaultFontName: Options.FontName, defaultFontSize: Options.FontSize);
+
+        RecordDiagnostic(
+            "INIT",
+            $"Engine initialized: {module.Functions.Length:N0} functions, {module.Instructions.Length:N0} instructions, viewport {Viewport.LogicalWidth}x{Viewport.LogicalHeight}, font '{Options.FontName}' {Options.FontSize}px",
+            includeCallerLocation: false);
+        RecordDiagnostic(
+            "FONT",
+            loadedFonts > 0
+                ? $"Loaded {loadedFonts} custom VFS font face(s), {Fonts.CustomFontCount} family alias(es): {string.Join(", ", Fonts.CustomFamilyNames.OrderBy(static n => n, StringComparer.OrdinalIgnoreCase))}"
+                : "No custom VFS fonts loaded from 'font/'",
+            includeCallerLocation: false);
+        RecordDiagnostic(
+            "INIT",
+            $"Loaded {loadedSprites} resource sprite definition(s) from 'resources/*.csv'",
+            includeCallerLocation: false);
         ConsoleBuffer = new VirtualConsoleBuffer(
             Viewport,
             Glyphs,
@@ -169,7 +184,8 @@ public sealed partial class EmueraEngine : IDisposable
     public SystemFlowController SystemFlow { get; }
     public IDynamicEvaluator? DynamicEvaluator { get; set; }
     public ISharpPluginHost? SharpPluginHost { get; set; }
-    public WritableSaveDirectory? SaveDirectory => _saveDirectory;
+    public IWritableUserStorage? WritableStorage => _writableStorage;
+    public WritableSaveDirectory? SaveDirectory => _writableStorage as WritableSaveDirectory;
     internal bool OwnsFileSystem { get; set; }
 
     public FontRegistry Fonts { get; }
@@ -246,10 +262,14 @@ public sealed partial class EmueraEngine : IDisposable
     internal bool HasActiveFrames => _callStack.Count > 0;
     internal IDynamicEvaluator ActiveDynamicEvaluator => DynamicEvaluator ?? DefaultRuntimeDynamicEvaluator.Instance;
 
-    public void ConfigureSaveDirectory(WritableSaveDirectory saveDirectory)
+    public void ConfigureSaveDirectory(WritableSaveDirectory saveDirectory) =>
+        ConfigureWritableStorage(saveDirectory);
+
+    public void ConfigureWritableStorage(IWritableUserStorage storage)
     {
-        ArgumentNullException.ThrowIfNull(saveDirectory);
-        _saveDirectory = saveDirectory;
+        ArgumentNullException.ThrowIfNull(storage);
+        _writableStorage = storage;
+        Graphics.AttachWritableStorage(storage);
     }
 
     public void ApplyGameData(GameData gameData)
@@ -298,6 +318,7 @@ public sealed partial class EmueraEngine : IDisposable
         {
             FaultException = ex;
             Status = EngineStepStatus.Faulted;
+            RecordDiagnostic("FAULT", $"{ex.GetType().Name}: {ex.Message}", includeCallerLocation: true);
             return Status;
         }
     }
@@ -1368,10 +1389,8 @@ public sealed partial class EmueraEngine : IDisposable
             }
             : text;
 
-        if ((flags & PrintModifierFlags.PlainText) == 0)
-        {
-            AutoDetectInlineBracketButtons(projected);
-        }
+        bool useDefaultColor = (flags & PrintModifierFlags.DefaultColor) != 0;
+        bool isPlainText = (flags & PrintModifierFlags.PlainText) != 0;
 
         _displayOperations.Add(new DisplayOperation(
             DisplayOperationKind.PrintTextSpan,
@@ -1382,7 +1401,15 @@ public sealed partial class EmueraEngine : IDisposable
             Options.FontSize));
         ConsoleBuffer.CurrentFontFamily = CurrentFontName;
         ConsoleBuffer.FontStyle = (FontStyleFlags)(CurrentFontStyle & 0xF);
-        ConsoleBuffer.Print(projected, useDefaultColor: (flags & PrintModifierFlags.DefaultColor) != 0);
+
+        if (isPlainText)
+        {
+            ConsoleBuffer.Print(projected, useDefaultColor: useDefaultColor);
+        }
+        else
+        {
+            PrintWithAutoDetectedBracketButtons(projected, useDefaultColor);
+        }
 
         if ((flags & PrintModifierFlags.NewLine) != 0)
         {
@@ -1452,10 +1479,31 @@ public sealed partial class EmueraEngine : IDisposable
     internal string BuildLineString(string? customPattern = null)
     {
         string unit = string.IsNullOrEmpty(customPattern) ? (FastVariables?.ReplaceConfig.DrawLineString ?? "-") : customPattern;
-        int cols = Math.Max(1, Viewport.LogicalWidth / Math.Max(1, Options.FontSize / 2));
-        var sb = new StringBuilder(cols + 4);
-        int unitWidth = Math.Max(1, EastAsianStringOps.GetStrlenS(unit, Options.LanguageCodePage));
-        for (int w = 0; w + unitWidth <= cols; w += unitWidth)
+        if (string.IsNullOrEmpty(unit))
+        {
+            unit = "-";
+        }
+
+        float unitPx = Glyphs.MeasureTextWidth(
+            unit,
+            Options.FontSize,
+            CurrentFontName,
+            (FontStyleFlags)(CurrentFontStyle & 0xF));
+
+        int repeatCount;
+        if (unitPx > 0.5f)
+        {
+            repeatCount = Math.Max(1, (int)MathF.Floor(Viewport.LogicalWidth / unitPx));
+        }
+        else
+        {
+            int cols = Math.Max(1, Viewport.LogicalWidth / Math.Max(1, Options.FontSize / 2));
+            int unitWidth = Math.Max(1, EastAsianStringOps.GetStrlenS(unit, Options.LanguageCodePage));
+            repeatCount = Math.Max(1, cols / unitWidth);
+        }
+
+        var sb = new StringBuilder(repeatCount * unit.Length);
+        for (int i = 0; i < repeatCount; i++)
         {
             sb.Append(unit);
         }
@@ -1496,9 +1544,13 @@ public sealed partial class EmueraEngine : IDisposable
         {
             ConsoleBuffer.HtmlPrintIsland(html);
         }
+        else if (noNewLine)
+        {
+            ConsoleBuffer.HtmlPrint(html, noWrap: false, noNewLine: true);
+        }
         else
         {
-            ConsoleBuffer.HtmlPrint(html, noWrap: noNewLine);
+            ConsoleBuffer.HtmlPrint(html, noWrap: false, noNewLine: false);
             SyncLineCount();
         }
 
@@ -1566,29 +1618,27 @@ public sealed partial class EmueraEngine : IDisposable
         VariableStore vars = RequireVariableStore();
         EngineSaveSlotSnapshot memSnap = vars.SaveToMemorySlot(slotNo, description);
 
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
             EraSaveFormat fmt = Options.ZipSaveData
                 ? EraSaveFormat.GZipBinary
                 : Options.SystemSaveInBinary ? EraSaveFormat.Binary : EraSaveFormat.Text;
             var eraSnap = BuildEraSaveSnapshot(vars, memSnap.SaveText, EraSaveFileType.Normal, fmt);
-            string relPath = _saveDirectory.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
-            string fullPath = _saveDirectory.ResolveConfinedPath(relPath);
-            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-            File.WriteAllBytes(fullPath, EraSaveSerializer.Save(eraSnap, fmt));
+            string relPath = _writableStorage.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
+            _writableStorage.WriteAllBytes(relPath, EraSaveSerializer.Save(eraSnap, fmt));
+            RecordDiagnostic("IO", $"SAVEDATA slot {slotNo} -> '{relPath}'");
         }
     }
 
     internal bool LoadFromSlot(int slotNo)
     {
         VariableStore vars = RequireVariableStore();
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
-            string relPath = _saveDirectory.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
-            string fullPath = _saveDirectory.ResolveConfinedPath(relPath);
-            if (File.Exists(fullPath))
+            string relPath = _writableStorage.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
+            if (_writableStorage.FileExists(relPath))
             {
-                EraSaveSnapshot loaded = EraSaveSerializer.Load(File.ReadAllBytes(fullPath));
+                EraSaveSnapshot loaded = EraSaveSerializer.Load(_writableStorage.ReadAllBytes(relPath));
                 ApplyEraSaveSnapshot(vars, loaded, slotNo);
                 return true;
             }
@@ -1605,13 +1655,12 @@ public sealed partial class EmueraEngine : IDisposable
     internal bool CheckSaveSlotExists(int slotNo, out string summary)
     {
         VariableStore vars = RequireVariableStore();
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
-            string relPath = _saveDirectory.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
-            string fullPath = _saveDirectory.ResolveConfinedPath(relPath);
-            if (File.Exists(fullPath))
+            string relPath = _writableStorage.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
+            if (_writableStorage.FileExists(relPath))
             {
-                EraSaveHeader header = EraSaveSerializer.PeekHeader(File.ReadAllBytes(fullPath));
+                EraSaveHeader header = EraSaveSerializer.PeekHeader(_writableStorage.ReadAllBytes(relPath));
                 summary = header.SaveDataText;
                 return true;
             }
@@ -1630,13 +1679,13 @@ public sealed partial class EmueraEngine : IDisposable
     internal void DeleteSaveSlot(int slotNo)
     {
         FastVariables?.DeleteMemorySaveSlot(slotNo);
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
-            string relPath = _saveDirectory.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
-            string fullPath = _saveDirectory.ResolveConfinedPath(relPath);
-            if (File.Exists(fullPath))
+            string relPath = _writableStorage.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
+            if (_writableStorage.FileExists(relPath))
             {
-                File.Delete(fullPath);
+                _writableStorage.DeleteFile(relPath);
+                RecordDiagnostic("IO", $"DELDATA slot {slotNo} -> '{relPath}'");
             }
         }
     }
@@ -1649,25 +1698,23 @@ public sealed partial class EmueraEngine : IDisposable
             : Options.SystemSaveInBinary ? EraSaveFormat.Binary : EraSaveFormat.Text;
         _memoryGlobalSnapshot = BuildEraSaveSnapshot(vars, string.Empty, EraSaveFileType.Global, fmt);
 
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
-            string rel = _saveDirectory.GetGlobalSaveVirtualPath(Options.UseSaveFolder);
-            string fullPath = _saveDirectory.ResolveConfinedPath(rel);
-            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-            File.WriteAllBytes(fullPath, EraSaveSerializer.Save(_memoryGlobalSnapshot, fmt));
+            string rel = _writableStorage.GetGlobalSaveVirtualPath(Options.UseSaveFolder);
+            _writableStorage.WriteAllBytes(rel, EraSaveSerializer.Save(_memoryGlobalSnapshot, fmt));
+            RecordDiagnostic("IO", $"SAVEGLOBAL -> '{rel}'");
         }
     }
 
     internal bool LoadGlobal()
     {
         VariableStore vars = RequireVariableStore();
-        if (_saveDirectory is not null)
+        if (_writableStorage is not null)
         {
-            string rel = _saveDirectory.GetGlobalSaveVirtualPath(Options.UseSaveFolder);
-            string fullPath = _saveDirectory.ResolveConfinedPath(rel);
-            if (File.Exists(fullPath))
+            string rel = _writableStorage.GetGlobalSaveVirtualPath(Options.UseSaveFolder);
+            if (_writableStorage.FileExists(rel))
             {
-                EraSaveSnapshot loaded = EraSaveSerializer.Load(File.ReadAllBytes(fullPath));
+                EraSaveSnapshot loaded = EraSaveSerializer.Load(_writableStorage.ReadAllBytes(rel));
                 ApplyGlobalSnapshot(vars, loaded);
                 return true;
             }
@@ -2044,9 +2091,15 @@ public sealed partial class EmueraEngine : IDisposable
         }
     }
 
-    private void AutoDetectInlineBracketButtons(string text)
+    private void PrintWithAutoDetectedBracketButtons(string text, bool useDefaultColor)
     {
-        // Emuera automatically turns "[123] Choice" patterns in non-plain PRINT lines into clickable integer buttons
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        // Emuera automatically turns "[123] Choice" patterns in non-plain PRINT lines into clickable integer buttons.
+        List<(int Start, long Value)>? buttons = null;
         int open = text.IndexOf('[');
         while (open >= 0)
         {
@@ -2060,9 +2113,43 @@ public sealed partial class EmueraEngine : IDisposable
             if (!inner.IsEmpty && long.TryParse(inner, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long btnVal))
             {
                 RegisterButtonDescriptor(text[open..(close + 1)], isInt: true, btnVal);
+                buttons ??= [];
+                buttons.Add((open, btnVal));
             }
 
             open = text.IndexOf('[', close + 1);
+        }
+
+        if (buttons is null)
+        {
+            ConsoleBuffer.Print(text, useDefaultColor: useDefaultColor);
+            return;
+        }
+
+        int cursor = 0;
+        for (int i = 0; i < buttons.Count; i++)
+        {
+            (int start, long val) = buttons[i];
+            if (start > cursor)
+            {
+                ConsoleBuffer.Print(text[cursor..start], useDefaultColor: useDefaultColor);
+            }
+
+            int nextStart = i + 1 < buttons.Count ? buttons[i + 1].Start : text.Length;
+            int segEnd = nextStart;
+            while (segEnd > start && char.IsWhiteSpace(text[segEnd - 1]))
+            {
+                segEnd--;
+            }
+
+            string caption = text[start..segEnd];
+            ConsoleBuffer.PrintButton(caption, val.ToString(CultureInfo.InvariantCulture), useDefaultColor: useDefaultColor);
+            if (segEnd < nextStart)
+            {
+                ConsoleBuffer.Print(text[segEnd..nextStart], useDefaultColor: useDefaultColor);
+            }
+
+            cursor = nextStart;
         }
     }
 

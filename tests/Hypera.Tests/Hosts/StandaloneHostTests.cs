@@ -1,0 +1,752 @@
+using System.Diagnostics;
+using Hypera.Bytecode;
+using Hypera.Compiler;
+using Hypera.Configuration;
+using Hypera.Data;
+using Hypera.Persistence;
+using Hypera.Rendering;
+using Hypera.Runtime;
+using Hypera.VirtualFs;
+using Xunit;
+
+namespace Hypera.Tests.Hosts;
+
+public sealed class StandaloneHostTests
+{
+    [Fact]
+    public void OverlayVirtualFileSystem_OverridesLowerFilesUnionsListingsAndLoadsPrebuiltBytecode()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_overlay_test_{Guid.NewGuid():N}");
+        string sourceDir = Path.Combine(workDir, "Source");
+        string overrideDir = Path.Combine(workDir, "Override");
+        string hepPath = Path.Combine(workDir, "game.hep");
+
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(sourceDir, "ERB"));
+            Directory.CreateDirectory(Path.Combine(sourceDir, "CSV"));
+            Directory.CreateDirectory(Path.Combine(sourceDir, "resources"));
+            Directory.CreateDirectory(Path.Combine(overrideDir, "resources"));
+
+            File.WriteAllText(Path.Combine(sourceDir, "CSV", "GameBase.csv"), "コード,42\nバージョン,1000\nタイトル,OverlayGame\n");
+            File.WriteAllText(Path.Combine(sourceDir, "emuera.config"), "ウィンドウ幅:800\nウィンドウ高さ:600\n");
+            File.WriteAllText(Path.Combine(sourceDir, "resources", "base.txt"), "from_hep");
+            File.WriteAllText(Path.Combine(sourceDir, "resources", "shared.txt"), "lower_version");
+            File.WriteAllText(Path.Combine(sourceDir, "ERB", "Title.erb"), "@SYSTEM_TITLE\nPRINTL Overlay OK\nQUIT\n");
+
+            // Compile and pack compiled-only .hep
+            using (var srcVfs = new PhysicalDirectoryVfs(sourceDir))
+            {
+                ConfigLoadResult cfg = ConfigLoader.Default.Load(srcVfs);
+                GameData gd = CsvGameDataLoader.Default.Load(srcVfs, cfg.CompilerOptions);
+                var compiler = new ErbProjectCompiler(cfg.CompilerOptions, CompilerExternalContext.FromGameData(gd));
+                BytecodeModule module = compiler.CompileProject(srcVfs, throwOnError: true).Module;
+                byte[] hebBytes = BytecodeSerializer.Serialize(module);
+                HepPackageWriter.PackDirectory(
+                    sourceDir,
+                    hepPath,
+                    prebuiltBytecode: hebBytes,
+                    compress: true,
+                    includeFileFilter: HepPackageWriter.CreateCompiledDistributionFilter());
+            }
+
+            // External user overrides
+            File.WriteAllText(Path.Combine(overrideDir, "emuera.config"), "ウィンドウ幅:1024\nウィンドウ高さ:720\n");
+            File.WriteAllText(Path.Combine(overrideDir, "resources", "shared.txt"), "upper_override");
+            File.WriteAllText(Path.Combine(overrideDir, "resources", "extra.txt"), "added_by_user");
+
+            using var lower = new HepArchiveVfs(hepPath);
+            using var upper = new PhysicalDirectoryVfs(overrideDir);
+            using var overlay = new OverlayVirtualFileSystem(upper, lower, ownsUpper: false, ownsLower: false);
+
+            Assert.Equal("from_hep", overlay.ReadAllText("resources/base.txt"));
+            Assert.Equal("upper_override", overlay.ReadAllText("resources/shared.txt"));
+            Assert.Equal("added_by_user", overlay.ReadAllText("resources/extra.txt"));
+
+            string[] resFiles = overlay.EnumerateFiles("resources", "*.txt", recursive: true).ToArray();
+            Assert.Equal(3, resFiles.Length);
+            Assert.Contains("resources/base.txt", resFiles, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("resources/shared.txt", resFiles, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("resources/extra.txt", resFiles, StringComparer.OrdinalIgnoreCase);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromVfs(
+                overlay,
+                ownsVfs: false,
+                options: new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+
+            Assert.True(host.LoadedFromPrebuiltBytecode);
+            Assert.Equal(1024, host.Engine.Viewport.LogicalWidth);
+            Assert.Equal(720, host.Engine.Viewport.LogicalHeight);
+            Assert.Equal("OverlayGame 1.000", host.Engine.FastVariables!.WindowTitle);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SingleFileBundleCodec_BoundedSubStreamStreamsHepWithoutFullCopy()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_bundle_substream_{Guid.NewGuid():N}");
+        string hostPath = Path.Combine(workDir, "host.bin");
+        string hepPath = Path.Combine(workDir, "data.hep");
+        string outExe = Path.Combine(workDir, "bundled.bin");
+
+        try
+        {
+            Directory.CreateDirectory(workDir);
+            File.WriteAllBytes(hostPath, new byte[4096]);
+            using (var fs = new FileStream(hepPath, FileMode.Create, FileAccess.ReadWrite))
+            {
+                HepPackageWriter.PackEntries(
+                    [
+                        ("CSV/GameBase.csv", "タイトル,StreamTest\n"u8.ToArray()),
+                        ("resources/hello.txt", "Hello BoundedSubStream!"u8.ToArray()),
+                    ],
+                    fs,
+                    compress: true);
+            }
+
+            BundleTrailer packed = SingleFileBundleCodec.PackBundle(hepPath, hostPath, outExe);
+            Assert.Equal(BundlePayloadKind.Hep, packed.PayloadKind);
+            Assert.Equal(4096L, packed.PayloadOffset);
+
+            Assert.True(SingleFileBundleCodec.TryDetectTrailer(outExe, out BundleTrailer detected));
+            Assert.Equal(packed, detected);
+
+            using Stream subStream = SingleFileBundleCodec.OpenPayloadStream(outExe, detected);
+            using var vfs = new HepArchiveVfs(subStream, outExe, leaveOpen: false);
+            Assert.Equal("Hello BoundedSubStream!", vfs.ReadAllText("resources/hello.txt"));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void HepPackageWriter_CompiledDistributionFilterStripsErbSavBinariesAndExtraExcludes()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_filter_test_{Guid.NewGuid():N}");
+        string gameDir = Path.Combine(workDir, "Game");
+        string hepPath = Path.Combine(workDir, "compiled.hep");
+
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(gameDir, "ERB"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "CSV"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "resources"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "font"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "sav"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "資料"));
+
+            File.WriteAllText(Path.Combine(gameDir, "ERB", "Main.erb"), "@SYSTEM_TITLE\nQUIT\n");
+            File.WriteAllText(Path.Combine(gameDir, "CSV", "GameBase.csv"), "タイトル,FilterTest\n");
+            File.WriteAllBytes(Path.Combine(gameDir, "resources", "img.png"), [1, 2, 3]);
+            File.WriteAllBytes(Path.Combine(gameDir, "font", "pixel.ttf"), [4, 5, 6]);
+            File.WriteAllText(Path.Combine(gameDir, "emuera.config"), "ウィンドウ幅:800\n");
+            File.WriteAllText(Path.Combine(gameDir, "sav", "save00.sav"), "save");
+            File.WriteAllBytes(Path.Combine(gameDir, "Emuera.exe"), [0x4D, 0x5A]);
+            File.WriteAllBytes(Path.Combine(gameDir, "libwebp.dll"), [0x4D, 0x5A]);
+            File.WriteAllText(Path.Combine(gameDir, "資料", "notes.txt"), "doc");
+
+            Func<string, bool> filter = HepPackageWriter.CreateCompiledDistributionFilter(["資料"]);
+            HepPackageWriter.PackDirectory(
+                gameDir,
+                hepPath,
+                prebuiltBytecode: new byte[] { 0x48, 0x45, 0x42, 0x43 },
+                compress: true,
+                includeFileFilter: filter);
+
+            using var vfs = new HepArchiveVfs(hepPath);
+            Assert.True(vfs.FileExists("game.heb"));
+            Assert.True(vfs.FileExists("CSV/GameBase.csv"));
+            Assert.True(vfs.FileExists("resources/img.png"));
+            Assert.True(vfs.FileExists("font/pixel.ttf"));
+            Assert.True(vfs.FileExists("emuera.config"));
+
+            Assert.False(vfs.FileExists("ERB/Main.erb"));
+            Assert.False(vfs.FileExists("sav/save00.sav"));
+            Assert.False(vfs.FileExists("Emuera.exe"));
+            Assert.False(vfs.FileExists("libwebp.dll"));
+            Assert.False(vfs.FileExists("資料/notes.txt"));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void PrintStyled_AutoWrapsInlineBracketButtonsAndRespectsPrintPlain()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_inline_btn_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                PRINTL [0] Start Game   [1] Load Game
+                PRINTPLAIN [9] Plain Not Button
+                PRINTL
+                INPUT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+
+            Assert.Equal(EngineStepStatus.WaitingInput, host.Engine.Step());
+            ConsoleScene scene = host.Engine.ConsoleBuffer.CaptureScene();
+            float[] lineTops = ConsoleHitTester.ComputeVisibleLineTops(scene);
+
+            // First printed line has two clickable buttons: 0 and 1
+            ConsoleLine btnLine = scene.VisibleLines[0];
+            List<ConsoleRenderPart> buttonParts = btnLine.Parts.Where(static p => p.Button is { IsButton: true }).ToList();
+            Assert.Equal(2, buttonParts.Count);
+            Assert.Equal(0L, buttonParts[0].Button!.IntValue);
+            Assert.Equal(1L, buttonParts[1].Button!.IntValue);
+
+            // Hit-testing directly over the second button resolves IntValue == 1
+            ConsoleRenderPart secondPart = buttonParts[1];
+            float hitX = secondPart.X + (secondPart.Width * 0.5f);
+            float hitY = lineTops[0] + (secondPart.Height * 0.5f);
+            ConsoleHitTestResult hit = ConsoleHitTester.HitTestLogicalPoint(scene, hitX, hitY, host.Engine.Graphics, host.Engine.Sprites);
+            Assert.True(hit.HasActiveButton);
+            Assert.Equal(1L, hit.ActiveButton!.IntValue);
+
+            // Second printed line (PRINTPLAINL) has NO clickable buttons
+            ConsoleLine plainLine = scene.VisibleLines[1];
+            Assert.DoesNotContain(plainLine.Parts, static p => p.Button is { IsButton: true });
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void HtmlPrintNoNewLineAndCustomDrawLine_ClearLineCountAndFullViewportWidthAreAccurate()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_html_drawline_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "emuera.config"),
+                "ウィンドウ幅:1230\nウィンドウ高さ:950\nフォント名:ＭＳ ゴシック\nフォントサイズ:16\n一行の高さ:16\n");
+
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                CUSTOMDRAWLINE —
+                FOR LOCAL, 0, 5
+                    HTML_PRINT "<p align='center'>FRAME_TAG</p>", 1
+                    PRINTL
+                    PRINTL Spacer
+                    CLEARLINE 2
+                NEXT
+                HTML_PRINT "<p align='center'>FINAL_FRAME</p>", 1
+                PRINTL
+                PRINTL Done
+                INPUT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+
+            Assert.Equal(EngineStepStatus.WaitingInput, host.Engine.Step());
+            ConsoleScene scene = host.Engine.ConsoleBuffer.CaptureScene();
+
+            // 1. CUSTOMDRAWLINE — must span >= 95% of 1230px logical width without wrapping
+            ConsoleLine divider = scene.VisibleLines[0];
+            Assert.True(divider.ContentWidth >= 1230f * 0.95f && divider.ContentWidth <= 1230.5f,
+                $"Expected divider ContentWidth near 1230px, got {divider.ContentWidth}px.");
+
+            // 2. HTML_PRINT ..., 1 + PRINTL + PRINTL Spacer = 2 logical lines -> CLEARLINE 2 removes ALL 5 fade frames!
+            Assert.Equal(3, scene.VisibleLines.Count); // divider + FINAL_FRAME + Done
+            Assert.DoesNotContain(scene.VisibleLines, static l => l.PlainText.Contains("FRAME_TAG", StringComparison.Ordinal));
+            Assert.Contains("FINAL_FRAME", scene.VisibleLines[1].PlainText, StringComparison.Ordinal);
+            Assert.Equal("Done", scene.VisibleLines[2].PlainText);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FontRegistry_ExtractsTrueTypeLegacyFamilyNameWhenSubfamilyIsCustom()
+    {
+        // Build a minimal valid TrueType sfnt with a 'name' table where nameID=1 is "xonFont"
+        // (matching eraOCG2's ぉんFont.ttf whose DirectWrite FamilyName becomes "xonFont xonng_angreed328").
+        byte[] ttfBytes = BuildMinimalTtfWithNameTable(
+            (platformId: 3, encodingId: 1, langId: 0x0409, nameId: 1, text: "xonFont"),
+            (platformId: 3, encodingId: 1, langId: 0x0409, nameId: 2, text: "xonng_angreed328"),
+            (platformId: 3, encodingId: 1, langId: 0x0409, nameId: 16, text: "xonFont Typo"));
+
+        IReadOnlyList<string> extracted = FontRegistry.ExtractTrueTypeFamilyNames(ttfBytes);
+        Assert.Contains("xonFont", extracted);
+        Assert.Contains("xonFont Typo", extracted);
+        Assert.DoesNotContain("xonng_angreed328", extracted);
+    }
+
+    [Fact]
+    public void HepPackageWriter_PreservesEmptyDirectoriesSoEnumFilesReturnsZeroNotMinusOne()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_empty_dir_hep_{Guid.NewGuid():N}");
+        string gameDir = Path.Combine(workDir, "Game");
+        string hepPath = Path.Combine(workDir, "game.hep");
+
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(gameDir, "ERB"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "CSV"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "resources", "DUEL"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "resources", "CHARA"));
+            Directory.CreateDirectory(Path.Combine(gameDir, "sav"));
+
+            File.WriteAllText(
+                Path.Combine(gameDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                A:0 = ENUMFILES("RESOURCES/DUEL", "-1_DUEL.*")
+                A:1 = ENUMFILES("RESOURCES/CHARA", "1_FACE.*")
+                A:2 = ENUMFILES("RESOURCES/NONEXISTENT_DIR", "*")
+                QUIT
+                """);
+
+            using (var srcVfs = new PhysicalDirectoryVfs(gameDir))
+            {
+                ConfigLoadResult cfg = ConfigLoader.Default.Load(srcVfs);
+                GameData gd = CsvGameDataLoader.Default.Load(srcVfs, cfg.CompilerOptions);
+                var compiler = new ErbProjectCompiler(cfg.CompilerOptions, CompilerExternalContext.FromGameData(gd));
+                byte[] hebBytes = BytecodeSerializer.Serialize(compiler.CompileProject(srcVfs, throwOnError: true).Module);
+                HepPackageWriter.PackDirectory(
+                    gameDir,
+                    hepPath,
+                    prebuiltBytecode: hebBytes,
+                    compress: true,
+                    includeFileFilter: HepPackageWriter.CreateCompiledDistributionFilter());
+            }
+
+            using var hepVfs = new HepArchiveVfs(hepPath);
+            Assert.True(hepVfs.DirectoryExists("resources/DUEL"));
+            Assert.True(hepVfs.DirectoryExists("resources/CHARA"));
+            Assert.False(hepVfs.FileExists("resources/DUEL"));
+            Assert.Empty(hepVfs.EnumerateFiles("resources/DUEL", "*", recursive: true));
+            Assert.False(hepVfs.DirectoryExists("ERB"));
+            Assert.False(hepVfs.DirectoryExists("sav"));
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromVfs(
+                hepVfs,
+                ownsVfs: false,
+                options: new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+            Assert.Equal(EngineStepStatus.Completed, host.Engine.Step());
+
+            // Existing empty dirs MUST return 0 (falsy in ERB), whereas missing dir returns -1!
+            Assert.Equal(0L, host.Engine.FastVariables!.GetInt("A", 0));
+            Assert.Equal(0L, host.Engine.FastVariables.GetInt("A", 1));
+            Assert.Equal(-1L, host.Engine.FastVariables.GetInt("A", 2));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void EngineDiagnostics_CapturesStartupFontMissVfsMissDebugPrintAndInteractiveEval()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_diag_trace_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "emuera.config"),
+                "デバッグコマンドを使用する:NO\n");
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                FLAG:7 = 1234
+                DEBUGPRINTFORML hello from debug flag={FLAG:7}
+                A:0 = CHKFONT("TotallyMissingFontXYZ")
+                A:1 = ENUMFILES("RESOURCES/NO_SUCH_DIR", "*")
+                A:2 = GCREATEFROMFILE(1, "no_such_image.png")
+                INPUT
+                QUIT
+                """);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+            host.Engine.AlwaysCaptureDebugPrint = true;
+
+            Assert.Equal(EngineStepStatus.WaitingInput, host.Engine.Step());
+
+            IReadOnlyList<EngineDebugLogEntry> trace = host.Engine.TraceLog;
+            Assert.Contains(trace, static e => e.Category == "INIT");
+            Assert.Contains(trace, static e => e.Category == "DEBUGPRINT" && e.Message.Contains("hello from debug flag=1234", StringComparison.Ordinal));
+            Assert.Contains(trace, static e => e.Category == "FONT" && e.Message.Contains("TotallyMissingFontXYZ", StringComparison.Ordinal));
+            Assert.Contains(trace, static e => e.Category == "VFS" && e.Message.Contains("RESOURCES/NO_SUCH_DIR", StringComparison.Ordinal));
+            Assert.Contains(trace, static e => e.Category == "GFX" && e.Message.Contains("no_such_image.png", StringComparison.Ordinal));
+
+            // Interactive debug expression evaluator works against live engine state
+            Assert.True(host.Engine.TryEvaluateDebugExpression("FLAG:7 + 6", out string evalInt));
+            Assert.Equal("1240", evalInt);
+            Assert.True(host.Engine.TryEvaluateDebugExpression("CHKFONT(\"TotallyMissingFontXYZ\")", out string evalFont));
+            Assert.Contains("0", evalFont);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    private static byte[] BuildMinimalTtfWithNameTable(params (ushort platformId, ushort encodingId, ushort langId, ushort nameId, string text)[] records)
+    {
+        using var strMs = new MemoryStream();
+        var encoded = new List<(ushort plat, ushort enc, ushort lang, ushort id, ushort off, ushort len)>();
+        foreach (var r in records)
+        {
+            byte[] bytes = r.platformId is 3 or 0
+                ? System.Text.Encoding.BigEndianUnicode.GetBytes(r.text)
+                : System.Text.Encoding.Latin1.GetBytes(r.text);
+            ushort off = (ushort)strMs.Position;
+            strMs.Write(bytes, 0, bytes.Length);
+            encoded.Add((r.platformId, r.encodingId, r.langId, r.nameId, off, (ushort)bytes.Length));
+        }
+
+        byte[] strBytes = strMs.ToArray();
+        int nameHeaderLen = 6 + (encoded.Count * 12);
+        int nameTableLen = nameHeaderLen + strBytes.Length;
+        int nameTableOffset = 12 + 16; // sfnt header (12) + 1 table dir record (16)
+
+        byte[] buf = new byte[nameTableOffset + nameTableLen];
+        // sfntVersion = 0x00010000, numTables = 1
+        buf[1] = 1;
+        buf[5] = 1;
+        // Table record: 'name'
+        buf[12] = (byte)'n'; buf[13] = (byte)'a'; buf[14] = (byte)'m'; buf[15] = (byte)'e';
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(20, 4), (uint)nameTableOffset);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(24, 4), (uint)nameTableLen);
+
+        // name table header
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(nameTableOffset + 2, 2), (ushort)encoded.Count);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(nameTableOffset + 4, 2), (ushort)nameHeaderLen);
+
+        for (int i = 0; i < encoded.Count; i++)
+        {
+            int nr = nameTableOffset + 6 + (i * 12);
+            var rec = encoded[i];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(nr, 2), rec.plat);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(nr + 2, 2), rec.enc);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(nr + 4, 2), rec.lang);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(nr + 6, 2), rec.id);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(nr + 8, 2), rec.len);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(nr + 10, 2), rec.off);
+        }
+
+        strBytes.CopyTo(buf, nameTableOffset + nameHeaderLen);
+        return buf;
+    }
+
+    [Fact]
+    public void InMemoryWritableStorage_IsolatesAllRuntimeWritesEnforcesQuotaAndTracksDirtyDeltas()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_mem_storage_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(workDir, "ERB"));
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(workDir, "emuera.config"),
+                "セーブデータをSAVフォルダ内に作成する:YES\nLOADTEXTとSAVETEXTで使える拡張子:txt\n");
+            File.WriteAllText(
+                Path.Combine(workDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                FLAG:1 = 777
+                GLOBAL:2 = 888
+                SAVEDATA 0, "MemSave"
+                SAVEGLOBAL
+                SAVEVAR "vpack", "VarPack", FLAG
+                SAVETEXT "deck_alpha", "Deck/mydeck.txt"
+                OUTPUTLOG "session.log"
+                GCREATE 1, 8, 8
+                GCLEAR 1, 0xFFFF0000
+                GSAVE 1, 5
+                GDISPOSE 1
+                A:0 = GLOAD(2, 5)
+                A:1 = GWIDTH(2)
+                A:2 = ENUMFILES("Deck", "*.txt")
+                TSTR:0 '= LOADTEXT("Deck/mydeck.txt")
+                FLAG:1 = 0
+                LOADVAR "vpack"
+                A:3 = FLAG:1
+                DELDATA 0
+                QUIT
+                """);
+
+            var writtenPaths = new List<string>();
+            var deletedPaths = new List<string>();
+            var storage = new InMemoryWritableStorage(
+                storageDescription: "indexeddb://user-42/app-1",
+                validTextExtensions: ["txt"],
+                maxTotalBytes: 256 * 1024);
+            storage.FileWritten += (p, _) => writtenPaths.Add(p);
+            storage.FileDeleted += p => deletedPaths.Add(p);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromDirectory(
+                workDir,
+                new HyperaGameLoadOptions
+                {
+                    WritableStorage = storage,
+                    AutoStartSystemFlow = true,
+                });
+
+            Assert.Equal(EngineStepStatus.Completed, host.Engine.Step());
+
+            // 1. Verify ALL runtime writes went to InMemoryWritableStorage — ZERO files written to disk!
+            Assert.False(Directory.Exists(Path.Combine(workDir, "sav")));
+            Assert.False(Directory.Exists(Path.Combine(workDir, "dat")));
+            Assert.False(Directory.Exists(Path.Combine(workDir, "Deck")));
+            Assert.False(File.Exists(Path.Combine(workDir, "session.log")));
+            Assert.False(File.Exists(Path.Combine(workDir, "img0005.png")));
+
+            // 2. Verify all runtime reads/writes succeeded via IWritableUserStorage
+            Assert.Equal(1L, host.Engine.FastVariables!.GetInt("A", 0)); // GLOAD succeeded
+            Assert.Equal(8L, host.Engine.FastVariables.GetInt("A", 1));  // GWIDTH == 8
+            Assert.Equal(1L, host.Engine.FastVariables.GetInt("A", 2));  // ENUMFILES found Deck/mydeck.txt
+            Assert.Equal(777L, host.Engine.FastVariables.GetInt("A", 3)); // LOADVAR restored FLAG:1
+            Assert.Equal("deck_alpha", host.Engine.FastVariables.GetStr("TSTR", 0));
+
+            // 3. Verify change hooks & dirty delta batch (ready for async IndexedDB / DB sync!)
+            Assert.Contains("sav/save00.sav", writtenPaths, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("sav/save00.sav", deletedPaths, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("sav/global.sav", writtenPaths, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("dat/var_vpack.dat", writtenPaths, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("Deck/mydeck.txt", writtenPaths, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("session.log", writtenPaths, StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("img0005.png", writtenPaths, StringComparer.OrdinalIgnoreCase);
+
+            IReadOnlyList<(string RelativePath, byte[]? DataOrNullIfDeleted)> delta = storage.DrainDirtyChanges();
+            Assert.Contains(delta, static d => d.RelativePath.Equals("sav/save00.sav", StringComparison.OrdinalIgnoreCase) && d.DataOrNullIfDeleted is null);
+            Assert.Contains(delta, static d => d.RelativePath.Equals("Deck/mydeck.txt", StringComparison.OrdinalIgnoreCase) && d.DataOrNullIfDeleted is { Length: > 0 });
+            Assert.Empty(storage.DrainDirtyChanges());
+
+            // 4. Verify strict quota & path traversal enforcement
+            Assert.Throws<UnauthorizedAccessException>(() => storage.WriteAllBytes("/etc/passwd", new byte[] { 1 }));
+            Assert.Throws<UnauthorizedAccessException>(() => storage.SaveText("evil.exe", "bad"));
+            Assert.Throws<InvalidOperationException>(() => storage.WriteAllBytes("too_big.bin", new byte[300 * 1024]));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void HyperaStandalone_EndToEnd_SideBySideHep_Overlay_HyprBndl_AndDiagnostics()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        string cliBinDir = LocateProjectBinDirectory("Hypera.Cli", "hypera.dll");
+        string standaloneBinDir = LocateProjectBinDirectory("Hypera.Standalone", "Hypera.Standalone.exe");
+        string hyperaDll = Path.Combine(cliBinDir, "hypera.dll");
+        string standaloneExeSrc = Path.Combine(standaloneBinDir, "Hypera.Standalone.exe");
+
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_standalone_e2e_{Guid.NewGuid():N}");
+        string sourceDir = Path.Combine(workDir, "GameSource");
+        string distDir = Path.Combine(workDir, "Dist");
+        string bundleDir = Path.Combine(workDir, "BundleDist");
+        string brokenDir = Path.Combine(workDir, "BrokenGame");
+
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(sourceDir, "ERB"));
+            Directory.CreateDirectory(Path.Combine(sourceDir, "CSV"));
+            Directory.CreateDirectory(Path.Combine(sourceDir, "資料"));
+
+            File.WriteAllText(
+                Path.Combine(sourceDir, "CSV", "GameBase.csv"),
+                "コード,9001\nバージョン,1000\nタイトル,StandaloneTestGame\n");
+            File.WriteAllText(
+                Path.Combine(sourceDir, "emuera.config"),
+                "ウィンドウ幅:800\nウィンドウ高さ:600\nLOADTEXTとSAVETEXTで使える拡張子:txt\n");
+            File.WriteAllText(
+                Path.Combine(sourceDir, "資料", "readme_doc.txt"),
+                "excluded doc");
+            File.WriteAllText(
+                Path.Combine(sourceDir, "ERB", "Title.erb"),
+                """
+                @SYSTEM_TITLE
+                PRINTL === StandaloneTestGame ===
+                PRINTL [0] Begin Adventure
+                PRINTL [1] Quit
+                INPUT
+                IF RESULT == 0
+                    PRINTL Adventure Started!
+                    SAVETEXT "saved_from_standalone", "standalone_out.txt"
+                    WAIT
+                ENDIF
+                QUIT
+                """);
+
+            // 1. Build a clean distribution folder with renamed MyEraGame.exe + MyEraGame.hep (compiled-only)
+            CopyDirectoryRecursive(standaloneBinDir, distDir);
+            string renamedExe = Path.Combine(distDir, "MyEraGame.exe");
+            File.Copy(Path.Combine(distDir, "Hypera.Standalone.exe"), renamedExe, overwrite: true);
+
+            string sideBySideHep = Path.Combine(distDir, "MyEraGame.hep");
+            RunProcess("dotnet", [hyperaDll, "pack", sourceDir, "-o", sideBySideHep, "--compiled-only", "--exclude", "資料"], workDir);
+
+            using (var checkVfs = new HepArchiveVfs(sideBySideHep))
+            {
+                Assert.True(checkVfs.FileExists("game.heb"));
+                Assert.False(checkVfs.FileExists("ERB/Title.erb"));
+                Assert.False(checkVfs.FileExists("資料/readme_doc.txt"));
+            }
+
+            // 2. Launch MyEraGame.exe with NO path argument -> auto-discovers MyEraGame.hep!
+            string smokePng1 = Path.Combine(workDir, "smoke1.png");
+            string stdout1 = RunProcess(renamedExe, ["--headless-smoke", smokePng1, "--input", "0"], distDir);
+            Assert.Contains("SMOKE_OK TargetKind=HepArchive Prebuilt=True", stdout1);
+            Assert.Contains("TITLE=StandaloneTestGame 1.000", stdout1);
+            Assert.Contains("Adventure Started!", stdout1);
+            Assert.Contains("Size=800x600", stdout1);
+            Assert.True(File.Exists(smokePng1));
+            Assert.Equal(new byte[] { 0x89, 0x50, 0x4E, 0x47 }, File.ReadAllBytes(smokePng1)[..4]);
+
+            // Verify SAVETEXT persisted right next to MyEraGame.exe!
+            string savedTextPath = Path.Combine(distDir, "standalone_out.txt");
+            Assert.True(File.Exists(savedTextPath), "Expected SAVETEXT output next to MyEraGame.exe");
+            Assert.Contains("saved_from_standalone", File.ReadAllText(savedTextPath));
+
+            // 3. External overlay: drop an overriding emuera.config next to MyEraGame.exe -> viewport changes to 960x640!
+            File.WriteAllText(Path.Combine(distDir, "emuera.config"), "ウィンドウ幅:960\nウィンドウ高さ:640\n");
+            string smokePngOverlay = Path.Combine(workDir, "smoke_overlay.png");
+            string stdoutOverlay = RunProcess(renamedExe, ["--headless-smoke", smokePngOverlay], distDir);
+            Assert.Contains("Size=960x640", stdoutOverlay);
+
+            // 4. Single-file HYPRBNDL bundle with Hypera.Standalone.exe as host!
+            CopyDirectoryRecursive(standaloneBinDir, bundleDir);
+            string bundledExe = Path.Combine(bundleDir, "BundledStandalone.exe");
+            SingleFileBundleCodec.PackBundle(sideBySideHep, standaloneExeSrc, bundledExe);
+            string smokePngBundle = Path.Combine(workDir, "smoke_bundle.png");
+            string stdoutBundle = RunProcess(bundledExe, ["--headless-smoke", smokePngBundle], bundleDir);
+            Assert.Contains("SMOKE_OK TargetKind=EmbeddedBundle Prebuilt=True", stdoutBundle);
+            Assert.Contains("StandaloneTestGame", stdoutBundle);
+            Assert.True(File.Exists(smokePngBundle));
+
+            // 5. Broken raw ERB folder -> exits with code 1 and prints diagnostics!
+            Directory.CreateDirectory(Path.Combine(brokenDir, "ERB"));
+            File.WriteAllText(Path.Combine(brokenDir, "ERB", "Bad.erb"), "@SYSTEM_TITLE\nA:0 = UNDEFINED_SYMBOL_XYZ\n");
+            (int badExit, _, string badStderr) = RunProcessCapturingExit(
+                standaloneExeSrc,
+                [brokenDir, "--headless-smoke", Path.Combine(workDir, "never.png")],
+                workDir);
+            Assert.Equal(1, badExit);
+            Assert.Contains("ERA1426", badStderr);
+            Assert.Contains("UNDEFINED_SYMBOL_XYZ", badStderr);
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    private static string LocateProjectBinDirectory(string projectName, string probeFile)
+    {
+        string testsBin = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string? configDir = Path.GetDirectoryName(testsBin);
+        string configName = configDir is not null ? Path.GetFileName(configDir) : "Release";
+
+        DirectoryInfo? dir = new(testsBin);
+        string? repoRoot = null;
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "Hypera.slnx")))
+            {
+                repoRoot = dir.FullName;
+                break;
+            }
+
+            dir = dir.Parent;
+        }
+
+        Assert.NotNull(repoRoot);
+        string projectBin = Path.Combine(repoRoot!, "src", projectName, "bin");
+        foreach (string cfg in new[] { configName, "Release", "Debug" }.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            string cfgPath = Path.Combine(projectBin, cfg);
+            if (!Directory.Exists(cfgPath)) continue;
+            foreach (string tfmDir in Directory.GetDirectories(cfgPath))
+            {
+                if (File.Exists(Path.Combine(tfmDir, probeFile)))
+                {
+                    return tfmDir;
+                }
+            }
+        }
+
+        throw new DirectoryNotFoundException($"Could not locate '{probeFile}' under '{projectBin}'.");
+    }
+
+    private static void CopyDirectoryRecursive(string sourceDir, string destinationDir)
+    {
+        Directory.CreateDirectory(destinationDir);
+        foreach (string file in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories))
+        {
+            string relative = Path.GetRelativePath(sourceDir, file);
+            string destPath = Path.Combine(destinationDir, relative);
+            string? destParent = Path.GetDirectoryName(destPath);
+            if (!string.IsNullOrEmpty(destParent)) Directory.CreateDirectory(destParent);
+            File.Copy(file, destPath, overwrite: true);
+        }
+    }
+
+    private static string RunProcess(string fileName, IEnumerable<string> arguments, string workingDirectory)
+    {
+        (int exitCode, string stdout, string stderr) = RunProcessCapturingExit(fileName, arguments, workingDirectory);
+        Assert.True(exitCode == 0, $"Command '{fileName} {string.Join(' ', arguments)}' exited with {exitCode}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        return stdout;
+    }
+
+    private static (int ExitCode, string Stdout, string Stderr) RunProcessCapturingExit(
+        string fileName,
+        IEnumerable<string> arguments,
+        string workingDirectory)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = fileName,
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        foreach (string arg in arguments) psi.ArgumentList.Add(arg);
+
+        using Process proc = Process.Start(psi) ?? throw new InvalidOperationException($"Failed to start '{fileName}'.");
+        string stdout = proc.StandardOutput.ReadToEnd();
+        string stderr = proc.StandardError.ReadToEnd();
+        proc.WaitForExit(30_000);
+        return (proc.ExitCode, stdout, stderr);
+    }
+}

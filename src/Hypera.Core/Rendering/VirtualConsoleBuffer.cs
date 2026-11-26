@@ -136,7 +136,22 @@ public sealed class VirtualConsoleBuffer
     public int ScrollOffsetLines
     {
         get => _scrollOffsetLines;
-        set => _scrollOffsetLines = Math.Max(0, value);
+        set => _scrollOffsetLines = Math.Clamp(value, 0, MaxScrollOffsetLines);
+    }
+
+    public int MaxScrollOffsetLines
+    {
+        get
+        {
+            int effLineH = _measurer.GetEffectiveLineHeight(
+                CurrentFontFamily,
+                Viewport.FontSize,
+                Viewport.LineHeight,
+                SamplingMode);
+            int visibleCapacity = Math.Max(1, Viewport.LogicalHeight / effLineH);
+            int total = _physicalLines.Count + (_pendingHtmlBuffer.Length > 0 ? 1 : 0);
+            return Math.Max(0, total - visibleCapacity);
+        }
     }
 
     public TooltipState Tooltip
@@ -188,13 +203,13 @@ public sealed class VirtualConsoleBuffer
         NewLine();
     }
 
-    public void PrintButton(string caption, string value, string? title = null)
+    public void PrintButton(string caption, string value, string? title = null, bool useDefaultColor = false)
     {
         string escapedVal = HtmlPrintEngine.Escape(value);
         string escapedCap = HtmlPrintEngine.Escape(caption);
         string titleAttr = title is not null ? $" title='{HtmlPrintEngine.Escape(title)}'" : string.Empty;
         string fragment = $"<button value='{escapedVal}'{titleAttr}>{escapedCap}</button>";
-        AppendStyledPendingFragment(fragment, CurrentForeColorRgba);
+        AppendStyledPendingFragment(fragment, useDefaultColor ? DefaultForeColorRgba : CurrentForeColorRgba);
     }
 
     public void NewLine()
@@ -205,10 +220,22 @@ public sealed class VirtualConsoleBuffer
     }
 
     /// <summary>
-    /// Implements HTML_PRINT: flushes any pending partial line and commits an HTML logical line.
+    /// Implements HTML_PRINT: when <paramref name="noNewLine"/> is true (<c>HTML_PRINT str, 1</c>),
+    /// appends <paramref name="html"/> to the pending line buffer without committing a newline;
+    /// otherwise flushes any pending partial line and commits an HTML logical line.
     /// </summary>
-    public void HtmlPrint(string html, bool noWrap = false)
+    public void HtmlPrint(string html, bool noWrap = false, bool noNewLine = false)
     {
+        if (noNewLine)
+        {
+            if (!string.IsNullOrEmpty(html))
+            {
+                _pendingHtmlBuffer.Append(html);
+            }
+
+            return;
+        }
+
         if (_pendingHtmlBuffer.Length > 0)
         {
             NewLine();

@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Text;
 using Hypera.VirtualFs;
 using SkiaSharp;
 
@@ -76,7 +78,8 @@ public sealed class FontRegistry : IDisposable
                         break;
                     }
 
-                    RegisterTypeface(typeface, isCustomTileFont: true, alias: index == 0 ? stem : null);
+                    IReadOnlyList<string> ttfNames = ExtractTrueTypeFamilyNames(bytes, index);
+                    RegisterTypeface(typeface, isCustomTileFont: true, alias: index == 0 ? stem : null, extraAliases: ttfNames);
                     loadedCount++;
                 }
             }
@@ -86,7 +89,8 @@ public sealed class FontRegistry : IDisposable
                 SKTypeface? typeface = SKTypeface.FromData(data);
                 if (typeface is not null)
                 {
-                    RegisterTypeface(typeface, isCustomTileFont: true, alias: stem);
+                    IReadOnlyList<string> ttfNames = ExtractTrueTypeFamilyNames(bytes, ttcFaceIndex: 0);
+                    RegisterTypeface(typeface, isCustomTileFont: true, alias: stem, extraAliases: ttfNames);
                     loadedCount++;
                 }
             }
@@ -99,7 +103,11 @@ public sealed class FontRegistry : IDisposable
     /// Registers an <see cref="SKTypeface"/> directly into this instance-scoped registry.
     /// Takes ownership of <paramref name="typeface"/> and disposes it when the registry is disposed.
     /// </summary>
-    public void RegisterTypeface(SKTypeface typeface, bool isCustomTileFont = true, string? alias = null)
+    public void RegisterTypeface(
+        SKTypeface typeface,
+        bool isCustomTileFont = true,
+        string? alias = null,
+        IEnumerable<string>? extraAliases = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(typeface);
@@ -108,14 +116,177 @@ public sealed class FontRegistry : IDisposable
 
         if (!string.IsNullOrWhiteSpace(typeface.FamilyName))
         {
-            AddCustomEntry(typeface.FamilyName, typeface, isCustomTileFont);
+            AddCustomEntry(typeface.FamilyName.Trim(), typeface, isCustomTileFont);
         }
 
-        if (!string.IsNullOrWhiteSpace(alias) &&
-            !alias.Equals(typeface.FamilyName, StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrWhiteSpace(alias))
         {
-            AddCustomEntry(alias, typeface, isCustomTileFont);
+            string trimmedAlias = alias.Trim();
+            if (!trimmedAlias.Equals(typeface.FamilyName, StringComparison.OrdinalIgnoreCase))
+            {
+                AddCustomEntry(trimmedAlias, typeface, isCustomTileFont);
+            }
         }
+
+        if (extraAliases is not null)
+        {
+            foreach (string extra in extraAliases)
+            {
+                if (string.IsNullOrWhiteSpace(extra))
+                {
+                    continue;
+                }
+
+                string trimmedExtra = extra.Trim();
+                if (!_customFamilies.TryGetValue(trimmedExtra, out List<SKTypeface>? existing) || !existing.Contains(typeface))
+                {
+                    AddCustomEntry(trimmedExtra, typeface, isCustomTileFont);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Extracts GDI legacy family names (nameID=1) and OpenType typographic family names (nameID=16)
+    /// from a raw TrueType/OpenType/TTC binary so DirectWrite's subfamily concatenation (e.g.
+    /// <c>"xonFont xonng_angreed328"</c>) never breaks Emuera's <c>CHKFONT("xonFont")</c> / <c>SETFONT</c>.
+    /// </summary>
+    public static IReadOnlyList<string> ExtractTrueTypeFamilyNames(ReadOnlySpan<byte> fontBytes, int ttcFaceIndex = 0)
+    {
+        var results = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (fontBytes.Length < 12)
+        {
+            return results;
+        }
+
+        int sfntOffset = 0;
+        if (fontBytes[0] == (byte)'t' && fontBytes[1] == (byte)'t' && fontBytes[2] == (byte)'c' && fontBytes[3] == (byte)'f')
+        {
+            if (fontBytes.Length < 12)
+            {
+                return results;
+            }
+
+            uint numFonts = BinaryPrimitives.ReadUInt32BigEndian(fontBytes.Slice(8, 4));
+            if (ttcFaceIndex < 0 || (uint)ttcFaceIndex >= numFonts)
+            {
+                return results;
+            }
+
+            int offsetPos = 12 + (ttcFaceIndex * 4);
+            if (offsetPos + 4 > fontBytes.Length)
+            {
+                return results;
+            }
+
+            uint faceOffset = BinaryPrimitives.ReadUInt32BigEndian(fontBytes.Slice(offsetPos, 4));
+            if (faceOffset > (uint)fontBytes.Length - 12u)
+            {
+                return results;
+            }
+
+            sfntOffset = (int)faceOffset;
+        }
+
+        int numTables = BinaryPrimitives.ReadUInt16BigEndian(fontBytes.Slice(sfntOffset + 4, 2));
+        int tableDirStart = sfntOffset + 12;
+        if (tableDirStart + (numTables * 16) > fontBytes.Length)
+        {
+            return results;
+        }
+
+        int nameTableOffset = -1;
+        int nameTableLength = 0;
+        for (int i = 0; i < numTables; i++)
+        {
+            int rec = tableDirStart + (i * 16);
+            if (fontBytes[rec] == (byte)'n' &&
+                fontBytes[rec + 1] == (byte)'a' &&
+                fontBytes[rec + 2] == (byte)'m' &&
+                fontBytes[rec + 3] == (byte)'e')
+            {
+                uint off = BinaryPrimitives.ReadUInt32BigEndian(fontBytes.Slice(rec + 8, 4));
+                uint len = BinaryPrimitives.ReadUInt32BigEndian(fontBytes.Slice(rec + 12, 4));
+                if (off <= (uint)fontBytes.Length && len <= (uint)fontBytes.Length - off && len >= 6)
+                {
+                    nameTableOffset = (int)off;
+                    nameTableLength = (int)len;
+                }
+
+                break;
+            }
+        }
+
+        if (nameTableOffset < 0)
+        {
+            return results;
+        }
+
+        ReadOnlySpan<byte> nameTable = fontBytes.Slice(nameTableOffset, nameTableLength);
+        int count = BinaryPrimitives.ReadUInt16BigEndian(nameTable.Slice(2, 2));
+        int stringStorageOffset = BinaryPrimitives.ReadUInt16BigEndian(nameTable.Slice(4, 2));
+        if (stringStorageOffset > nameTable.Length)
+        {
+            return results;
+        }
+
+        for (int n = 0; n < count; n++)
+        {
+            int nr = 6 + (n * 12);
+            if (nr + 12 > nameTable.Length)
+            {
+                break;
+            }
+
+            ushort platformId = BinaryPrimitives.ReadUInt16BigEndian(nameTable.Slice(nr, 2));
+            ushort encodingId = BinaryPrimitives.ReadUInt16BigEndian(nameTable.Slice(nr + 2, 2));
+            ushort nameId = BinaryPrimitives.ReadUInt16BigEndian(nameTable.Slice(nr + 6, 2));
+            ushort strLen = BinaryPrimitives.ReadUInt16BigEndian(nameTable.Slice(nr + 8, 2));
+            ushort strOff = BinaryPrimitives.ReadUInt16BigEndian(nameTable.Slice(nr + 10, 2));
+
+            if (nameId is not (1 or 16) || strLen == 0)
+            {
+                continue;
+            }
+
+            int absStart = stringStorageOffset + strOff;
+            if (absStart < 0 || absStart + strLen > nameTable.Length)
+            {
+                continue;
+            }
+
+            ReadOnlySpan<byte> raw = nameTable.Slice(absStart, strLen);
+            string decoded;
+            try
+            {
+                if (platformId is 3 or 0)
+                {
+                    decoded = Encoding.BigEndianUnicode.GetString(raw);
+                }
+                else if (platformId == 1 && encodingId == 1)
+                {
+                    decoded = Encoding.GetEncoding(932).GetString(raw);
+                }
+                else
+                {
+                    decoded = Encoding.Latin1.GetString(raw);
+                }
+            }
+            catch
+            {
+                continue;
+            }
+
+            string clean = decoded.Replace("\0", string.Empty).Trim();
+            if (clean.Length > 0 && seen.Add(clean))
+            {
+                results.Add(clean);
+            }
+        }
+
+        return results;
     }
 
     public bool IsCustomFont(string? familyName)
@@ -129,6 +300,30 @@ public sealed class FontRegistry : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         return !string.IsNullOrWhiteSpace(familyName) && _customTileFamilies.Contains(familyName.Trim());
     }
+
+    private static readonly Dictionary<string, string> LocalizedFamilyAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["ＭＳ ゴシック"] = "MS Gothic",
+        ["MS ゴシック"] = "MS Gothic",
+        ["ＭＳ Ｐゴシック"] = "MS PGothic",
+        ["MS Ｐゴシック"] = "MS PGothic",
+        ["MS Pゴシック"] = "MS PGothic",
+        ["ＭＳ 明朝"] = "MS Mincho",
+        ["MS 明朝"] = "MS Mincho",
+        ["ＭＳ Ｐ明朝"] = "MS PMincho",
+        ["MS Ｐ明朝"] = "MS PMincho",
+        ["MS P明朝"] = "MS PMincho",
+        ["メイリオ"] = "Meiryo",
+        ["游ゴシック"] = "Yu Gothic",
+        ["游明朝"] = "Yu Mincho",
+        ["新宋体"] = "NSimSun",
+        ["宋体"] = "SimSun",
+        ["黑体"] = "SimHei",
+        ["微软雅黑"] = "Microsoft YaHei",
+    };
+
+    private static string ResolveLocalizedSystemFamilyName(string familyName) =>
+        LocalizedFamilyAliases.TryGetValue(familyName, out string? mapped) ? mapped : familyName;
 
     /// <summary>
     /// Implements Emuera CHKFONT: checks instance-scoped custom VFS fonts first, then installed host fonts.
@@ -148,8 +343,24 @@ public sealed class FontRegistry : IDisposable
         }
 
         using SKTypeface? matched = SKFontManager.Default.MatchFamily(trimmed);
-        return matched is not null &&
-               matched.FamilyName.Equals(trimmed, StringComparison.OrdinalIgnoreCase);
+        if (matched is not null &&
+            matched.FamilyName.Equals(trimmed, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        string mapped = ResolveLocalizedSystemFamilyName(trimmed);
+        if (!mapped.Equals(trimmed, StringComparison.OrdinalIgnoreCase))
+        {
+            using SKTypeface? aliasMatched = SKFontManager.Default.MatchFamily(mapped);
+            if (aliasMatched is not null &&
+                aliasMatched.FamilyName.Equals(mapped, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public SKTypeface ResolveTypeface(string? familyName, FontStyleFlags style = FontStyleFlags.Regular) =>
@@ -183,7 +394,10 @@ public sealed class FontRegistry : IDisposable
                 SKFontStyleWidth.Normal,
                 wantItalic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
 
-            SKTypeface resolved = SKTypeface.FromFamilyName(trimmed, fontStyle) ?? SKTypeface.Default;
+            string systemQuery = ResolveLocalizedSystemFamilyName(trimmed);
+            SKTypeface resolved = SKTypeface.FromFamilyName(systemQuery, fontStyle)
+                                  ?? SKTypeface.FromFamilyName(trimmed, fontStyle)
+                                  ?? SKTypeface.Default;
             if (!ReferenceEquals(resolved, SKTypeface.Default))
             {
                 _ownedTypefaces.Add(resolved);

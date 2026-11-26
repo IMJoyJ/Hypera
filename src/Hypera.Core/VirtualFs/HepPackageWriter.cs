@@ -17,7 +17,8 @@ public static class HepPackageWriter
         string outputHepPath,
         ReadOnlyMemory<byte>? prebuiltBytecode = null,
         string prebuiltBytecodeVirtualPath = DefaultPrebuiltBytecodePath,
-        bool compress = true)
+        bool compress = true,
+        Func<string, bool>? includeFileFilter = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sourceDirectory);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputHepPath);
@@ -30,7 +31,7 @@ public static class HepPackageWriter
         }
 
         using var fs = new FileStream(outputHepPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
-        return PackVfs(vfs, fs, prebuiltBytecode, prebuiltBytecodeVirtualPath, compress);
+        return PackVfs(vfs, fs, prebuiltBytecode, prebuiltBytecodeVirtualPath, compress, includeFileFilter);
     }
 
     public static ArchivePackageHeader PackVfs(
@@ -38,7 +39,8 @@ public static class HepPackageWriter
         Stream outputStream,
         ReadOnlyMemory<byte>? prebuiltBytecode = null,
         string prebuiltBytecodeVirtualPath = DefaultPrebuiltBytecodePath,
-        bool compress = true)
+        bool compress = true,
+        Func<string, bool>? includeFileFilter = null)
     {
         ArgumentNullException.ThrowIfNull(sourceVfs);
         ArgumentNullException.ThrowIfNull(outputStream);
@@ -58,15 +60,61 @@ public static class HepPackageWriter
             seen.Add(normalizedBytecodePath);
         }
 
+        var coveredDirs = new HashSet<string>(VfsPathNormalizer.Comparer) { string.Empty };
+
+        static void MarkAncestors(HashSet<string> dirs, string filePath)
+        {
+            string current = VfsPathNormalizer.GetDirectoryName(filePath);
+            while (current.Length > 0 && dirs.Add(current))
+            {
+                current = VfsPathNormalizer.GetDirectoryName(current);
+            }
+        }
+
         foreach (string path in sourceVfs.EnumerateFiles(string.Empty, "*", recursive: true))
         {
             string normalized = VfsPathNormalizer.Normalize(path);
-            if (normalized.Length == 0 || !seen.Add(normalized))
+            if (normalized.Length == 0)
+            {
+                continue;
+            }
+
+            if (includeFileFilter is not null && !includeFileFilter(normalized))
+            {
+                continue;
+            }
+
+            if (!seen.Add(normalized))
             {
                 continue;
             }
 
             entries.Add((normalized, sourceVfs.ReadAllBytes(normalized)));
+            MarkAncestors(coveredDirs, normalized);
+        }
+
+        // Preserve empty directories (e.g. resources/DUEL, resources/CHARA) so ENUMFILES returns 0 instead of -1!
+        if (sourceVfs is PhysicalDirectoryVfs physVfs)
+        {
+            foreach (string rawDir in physVfs.Directories.OrderBy(static d => d, VfsPathNormalizer.Comparer))
+            {
+                string normDir = VfsPathNormalizer.Normalize(rawDir);
+                if (normDir.Length == 0 || coveredDirs.Contains(normDir))
+                {
+                    continue;
+                }
+
+                if (includeFileFilter is not null && !includeFileFilter(normDir + "/__dir__"))
+                {
+                    continue;
+                }
+
+                string dirMarker = normDir + "/";
+                if (seen.Add(dirMarker))
+                {
+                    entries.Add((dirMarker, []));
+                }
+            }
         }
 
         return PackEntries(
@@ -74,6 +122,84 @@ public static class HepPackageWriter
             outputStream,
             compress: compress,
             includesPrebuiltBytecode: prebuiltBytecode.HasValue);
+    }
+
+    /// <summary>
+    /// Creates an inclusion predicate for compiled standalone <c>.hep</c> distributions:
+    /// strips raw <c>ERB/</c> / <c>ERH/</c> script sources (already compiled into <c>game.heb</c>),
+    /// runtime save folders (<c>sav/</c>, <c>*.sav</c>), host binaries (<c>*.exe</c>, <c>*.dll</c>, <c>*.pdb</c>),
+    /// and any caller-specified excluded path prefixes or file names.
+    /// </summary>
+    public static Func<string, bool> CreateCompiledDistributionFilter(IEnumerable<string>? extraExcludePrefixes = null)
+    {
+        var excludedPrefixes = new List<string>();
+        var excludedExact = new HashSet<string>(VfsPathNormalizer.Comparer);
+        if (extraExcludePrefixes is not null)
+        {
+            foreach (string raw in extraExcludePrefixes)
+            {
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    continue;
+                }
+
+                bool dirPrefix = raw.EndsWith('/') || raw.EndsWith('\\');
+                string norm = VfsPathNormalizer.Normalize(raw);
+                if (norm.Length == 0)
+                {
+                    continue;
+                }
+
+                if (dirPrefix)
+                {
+                    excludedPrefixes.Add(norm + "/");
+                }
+                else
+                {
+                    excludedExact.Add(norm);
+                    excludedPrefixes.Add(norm + "/");
+                }
+            }
+        }
+
+        return normalizedPath =>
+        {
+            if (normalizedPath.StartsWith("erb/", StringComparison.OrdinalIgnoreCase) ||
+                normalizedPath.StartsWith("erh/", StringComparison.OrdinalIgnoreCase) ||
+                normalizedPath.StartsWith("sav/", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            string ext = VfsPathNormalizer.GetExtension(normalizedPath);
+            if (ext.Equals(".erb", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".erh", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".sav", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".pdb", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".so", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".dylib", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".hep", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (excludedExact.Contains(normalizedPath))
+            {
+                return false;
+            }
+
+            foreach (string prefix in excludedPrefixes)
+            {
+                if (normalizedPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        };
     }
 
     public static ArchivePackageHeader PackEntries(
@@ -100,25 +226,27 @@ public static class HepPackageWriter
 
         foreach ((string rawPath, byte[] rawData) in entries)
         {
+            bool isDirectoryMarker = rawPath.EndsWith('/') || rawPath.EndsWith('\\');
             string normalized = VfsPathNormalizer.Normalize(rawPath);
             if (normalized.Length == 0)
             {
                 throw new ArgumentException($"Invalid empty virtual path: '{rawPath}'.", nameof(entries));
             }
 
-            if (!seenPaths.Add(normalized))
+            string storedPath = isDirectoryMarker ? normalized + "/" : normalized;
+            if (!seenPaths.Add(storedPath))
             {
-                throw new InvalidOperationException($"Duplicate virtual entry path in .hep archive: '{normalized}'.");
+                throw new InvalidOperationException($"Duplicate virtual entry path in .hep archive: '{storedPath}'.");
             }
 
-            byte[] uncompressed = rawData ?? [];
+            byte[] uncompressed = isDirectoryMarker ? [] : (rawData ?? []);
             uint crc32 = Crc32Helper.Compute(uncompressed);
             ulong payloadOffset = (ulong)(outputStream.Position - startPosition);
 
             byte[] payloadToWrite = uncompressed;
             bool entryCompressed = false;
 
-            if (compress && uncompressed.Length > 0)
+            if (!isDirectoryMarker && compress && uncompressed.Length > 0)
             {
                 byte[] compressed = DeflateCompress(uncompressed);
                 if (compressed.Length < uncompressed.Length)
@@ -131,7 +259,7 @@ public static class HepPackageWriter
 
             outputStream.Write(payloadToWrite, 0, payloadToWrite.Length);
             descriptors.Add(new ArchiveEntryDescriptor(
-                NormalizedPath: normalized,
+                NormalizedPath: storedPath,
                 PayloadOffset: payloadOffset,
                 StoredByteLength: (ulong)payloadToWrite.Length,
                 UncompressedByteLength: (ulong)uncompressed.Length,
