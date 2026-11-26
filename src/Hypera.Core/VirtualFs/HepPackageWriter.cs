@@ -93,10 +93,13 @@ public static class HepPackageWriter
             MarkAncestors(coveredDirs, normalized);
         }
 
-        // Preserve empty directories (e.g. resources/DUEL, resources/CHARA) so ENUMFILES returns 0 instead of -1!
-        if (sourceVfs is PhysicalDirectoryVfs physVfs)
+        // Preserve empty directories (e.g. resources/DUEL, resources/CHARA) across direct directories,
+        // .hep repacks, and OverlayVirtualFileSystem mounts so ENUMFILES returns 0 instead of -1!
+        var preservedDirs = new HashSet<string>(VfsPathNormalizer.Comparer);
+        CollectDirectories(sourceVfs, preservedDirs);
+        if (preservedDirs.Count > 0)
         {
-            foreach (string rawDir in physVfs.Directories.OrderBy(static d => d, VfsPathNormalizer.Comparer))
+            foreach (string rawDir in preservedDirs.OrderBy(static d => d, VfsPathNormalizer.Comparer))
             {
                 string normDir = VfsPathNormalizer.Normalize(rawDir);
                 if (normDir.Length == 0 || coveredDirs.Contains(normDir))
@@ -122,6 +125,31 @@ public static class HepPackageWriter
             outputStream,
             compress: compress,
             includesPrebuiltBytecode: prebuiltBytecode.HasValue);
+    }
+
+    private static void CollectDirectories(IVirtualFileSystem vfs, HashSet<string> target)
+    {
+        switch (vfs)
+        {
+            case PhysicalDirectoryVfs physVfs:
+                foreach (string d in physVfs.Directories)
+                {
+                    target.Add(d);
+                }
+                break;
+
+            case HepArchiveVfs hepVfs:
+                foreach (string d in hepVfs.Directories)
+                {
+                    target.Add(d);
+                }
+                break;
+
+            case OverlayVirtualFileSystem overlayVfs:
+                CollectDirectories(overlayVfs.Upper, target);
+                CollectDirectories(overlayVfs.Lower, target);
+                break;
+        }
     }
 
     /// <summary>

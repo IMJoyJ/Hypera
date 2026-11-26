@@ -10,6 +10,7 @@ namespace Hypera.Runtime;
 public sealed class CallFrame
 {
     private StringBuilder? _activeStrForm;
+    private StringBuilder? _reusableStrForm;
     private Stack<StringBuilder>? _nestedStrForms;
 
     public CallFrame(
@@ -41,6 +42,7 @@ public sealed class CallFrame
     public ushort CallerReturnRegister { get; }
     public bool ExpectsStringReturn { get; }
     public int? ActiveCatchTargetPc { get; set; }
+    public int PassiveDebugGuardEndPc { get; set; } = -1;
 
     public bool IsMethodFunction { get; init; }
     public bool DiscardCallerRegisterWrite { get; init; }
@@ -57,6 +59,14 @@ public sealed class CallFrame
             return;
         }
 
+        if (_reusableStrForm is not null)
+        {
+            _activeStrForm = _reusableStrForm;
+            _activeStrForm.Clear();
+            _reusableStrForm = null;
+            return;
+        }
+
         _activeStrForm = new StringBuilder(64);
     }
 
@@ -64,18 +74,43 @@ public sealed class CallFrame
 
     public string FinishStrForm()
     {
-        string result = _activeStrForm?.ToString() ?? string.Empty;
+        StringBuilder? finished = _activeStrForm;
+        string result = finished?.ToString() ?? string.Empty;
         if (_nestedStrForms is { Count: > 0 })
         {
             _activeStrForm = _nestedStrForms.Pop();
         }
         else
         {
-            _activeStrForm?.Clear();
+            if (finished is not null)
+            {
+                finished.Clear();
+                if (finished.Capacity <= 4096)
+                {
+                    _reusableStrForm = finished;
+                }
+            }
+
             _activeStrForm = null;
         }
 
         return result;
+    }
+
+    internal void ResetActiveStrForm()
+    {
+        if (_activeStrForm is not null)
+        {
+            _activeStrForm.Clear();
+            if (_activeStrForm.Capacity <= 4096)
+            {
+                _reusableStrForm = _activeStrForm;
+            }
+
+            _activeStrForm = null;
+        }
+
+        _nestedStrForms?.Clear();
     }
 
     public bool TryGetLocal(string name, bool ignoreCase, out FrameLocalStorage? storage)
@@ -108,6 +143,7 @@ public sealed class CallFrame
         {
             ProgramCounter = ProgramCounter,
             ActiveCatchTargetPc = ActiveCatchTargetPc,
+            PassiveDebugGuardEndPc = PassiveDebugGuardEndPc,
             IsMethodFunction = IsMethodFunction,
             DiscardCallerRegisterWrite = DiscardCallerRegisterWrite,
             RepeatEnd = RepeatEnd,

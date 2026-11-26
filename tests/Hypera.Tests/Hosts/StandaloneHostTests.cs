@@ -366,6 +366,95 @@ public sealed class StandaloneHostTests
     }
 
     [Fact]
+    public void HepPackageWriter_PackVfs_OverlayAndHepRepack_PreservesEmptyDirectoriesForEnumFiles()
+    {
+        string workDir = Path.Combine(Path.GetTempPath(), $"hypera_overlay_empty_dirs_{Guid.NewGuid():N}");
+        string lowerDir = Path.Combine(workDir, "lower");
+        string upperDir = Path.Combine(workDir, "upper");
+        string hepPath1 = Path.Combine(workDir, "overlay.hep");
+        string hepPath2 = Path.Combine(workDir, "repacked.hep");
+
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(lowerDir, "ERB"));
+            Directory.CreateDirectory(Path.Combine(lowerDir, "resources", "CHARA"));
+            Directory.CreateDirectory(Path.Combine(lowerDir, "resources", "DUEL"));
+            Directory.CreateDirectory(Path.Combine(lowerDir, "resources", "ROOMS"));
+            Directory.CreateDirectory(Path.Combine(lowerDir, "sav"));
+            File.WriteAllBytes(Path.Combine(lowerDir, "resources", "ROOMS", "01_room.png"), [1, 2, 3, 4]);
+            File.WriteAllText(Path.Combine(lowerDir, "ERB", "Main.erb"), "@SYSTEM_TITLE\nQUIT\n");
+
+            Directory.CreateDirectory(Path.Combine(upperDir, "ERB"));
+            Directory.CreateDirectory(Path.Combine(upperDir, "resources", "CUSTOM_EMPTY"));
+            File.WriteAllText(
+                Path.Combine(upperDir, "ERB", "Main.erb"),
+                """
+                @SYSTEM_TITLE
+                A:0 = ENUMFILES("RESOURCES/CHARA", "1001_*")
+                A:1 = ENUMFILES("RESOURCES/DUEL", "1001_*")
+                A:2 = ENUMFILES("RESOURCES/CUSTOM_EMPTY", "*")
+                A:3 = ENUMFILES("RESOURCES/ROOMS", "*_room.*", 0)
+                A:4 = ENUMFILES("RESOURCES", "*_room.*", 1)
+                A:5 = ENUMFILES("RESOURCES/MISSING_DIR", "*")
+                QUIT
+                """);
+
+            using (var upperVfs = new PhysicalDirectoryVfs(upperDir))
+            using (var lowerVfs = new PhysicalDirectoryVfs(lowerDir))
+            using (var overlay = new OverlayVirtualFileSystem(upperVfs, lowerVfs, ownsUpper: false, ownsLower: false))
+            {
+                ConfigLoadResult cfg = ConfigLoader.Default.Load(overlay);
+                GameData gd = CsvGameDataLoader.Default.Load(overlay, cfg.CompilerOptions);
+                var compiler = new ErbProjectCompiler(cfg.CompilerOptions, CompilerExternalContext.FromGameData(gd));
+                byte[] hebBytes = BytecodeSerializer.Serialize(compiler.CompileProject(overlay, throwOnError: true).Module);
+                using var fs1 = new FileStream(hepPath1, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+                HepPackageWriter.PackVfs(
+                    overlay,
+                    fs1,
+                    prebuiltBytecode: hebBytes,
+                    compress: true,
+                    includeFileFilter: HepPackageWriter.CreateCompiledDistributionFilter());
+            }
+
+            // Also verify repacking from HepArchiveVfs preserves empty directories
+            using (var hep1 = new HepArchiveVfs(hepPath1))
+            {
+                Assert.True(hep1.DirectoryExists("resources/CHARA"));
+                Assert.True(hep1.DirectoryExists("resources/DUEL"));
+                Assert.True(hep1.DirectoryExists("resources/CUSTOM_EMPTY"));
+                Assert.False(hep1.DirectoryExists("sav"));
+                Assert.Single(hep1.EnumerateFiles("resources/ROOMS", "*_room.*", recursive: false));
+                Assert.Single(hep1.EnumerateFiles("resources", "*_room.*", recursive: true));
+
+                using var fs2 = new FileStream(hepPath2, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+                HepPackageWriter.PackVfs(hep1, fs2, compress: true);
+            }
+
+            using var hep2 = new HepArchiveVfs(hepPath2);
+            Assert.True(hep2.DirectoryExists("resources/CHARA"));
+            Assert.True(hep2.DirectoryExists("resources/DUEL"));
+            Assert.True(hep2.DirectoryExists("resources/CUSTOM_EMPTY"));
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromVfs(
+                hep2,
+                ownsVfs: false,
+                options: new HyperaGameLoadOptions { AutoStartSystemFlow = true });
+            Assert.Equal(EngineStepStatus.Completed, host.Engine.Step());
+
+            Assert.Equal(0L, host.Engine.FastVariables!.GetInt("A", 0));
+            Assert.Equal(0L, host.Engine.FastVariables.GetInt("A", 1));
+            Assert.Equal(0L, host.Engine.FastVariables.GetInt("A", 2));
+            Assert.Equal(1L, host.Engine.FastVariables.GetInt("A", 3));
+            Assert.Equal(1L, host.Engine.FastVariables.GetInt("A", 4));
+            Assert.Equal(-1L, host.Engine.FastVariables.GetInt("A", 5));
+        }
+        finally
+        {
+            if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void EngineDiagnostics_CapturesStartupFontMissVfsMissDebugPrintAndInteractiveEval()
     {
         string workDir = Path.Combine(Path.GetTempPath(), $"hypera_diag_trace_{Guid.NewGuid():N}");

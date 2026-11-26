@@ -169,6 +169,7 @@ internal static partial class VmBuiltinExecutor
         bool isPrintOpcode = insn.Op is OpCode.Print or OpCode.PrintLine or OpCode.PrintWait or OpCode.PrintSingle or OpCode.PrintColumn;
         if (isPrintOpcode && (flags & PrintModifierFlags.DebugOnly) != 0)
         {
+            frame.PassiveDebugGuardEndPc = -1;
             if ((engine.Options.UseDebugCommand || engine.AlwaysCaptureDebugPrint) &&
                 insn.Op is OpCode.Print or OpCode.PrintLine)
             {
@@ -2261,7 +2262,11 @@ internal static partial class VmBuiltinExecutor
 
             // Extended Console, HTML, Background Image, Tooltip, Persistence & Legacy Display Instructions
             case BuiltinInstructionKind.DEBUGCLEAR:
-                engine.ClearDebugLog();
+                if (engine.Options.UseDebugCommand || engine.AlwaysCaptureDebugPrint)
+                {
+                    engine.ClearDebugLog();
+                }
+
                 return null;
 
             case BuiltinInstructionKind.HTML_PRINT_ISLAND_CLEAR:

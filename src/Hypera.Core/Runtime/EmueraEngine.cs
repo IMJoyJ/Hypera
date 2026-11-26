@@ -299,19 +299,60 @@ public sealed partial class EmueraEngine : IDisposable
         LastAwaitMilliseconds = 0L;
         Status = EngineStepStatus.Running;
 
-        try
+        int passiveDebugRecoveries = 0;
+        while (true)
         {
-            EngineStepStatus nextStatus = VmDispatcher.ExecuteStep(this, budget);
-            Status = nextStatus;
-            return Status;
+            try
+            {
+                EngineStepStatus nextStatus = VmDispatcher.ExecuteStep(this, budget);
+                Status = nextStatus;
+                return Status;
+            }
+            catch (Exception ex) when (passiveDebugRecoveries < 64 && TryRecoverFromPassiveDebugPrintFault(ex))
+            {
+                passiveDebugRecoveries++;
+            }
+            catch (Exception ex)
+            {
+                FaultException = ex;
+                Status = EngineStepStatus.Faulted;
+                RecordDiagnostic("FAULT", $"{ex.GetType().Name}: {ex.Message}", includeCallerLocation: true);
+                return Status;
+            }
         }
-        catch (Exception ex)
+    }
+
+    private bool TryRecoverFromPassiveDebugPrintFault(Exception ex)
+    {
+        if (Options.UseDebugCommand || !AlwaysCaptureDebugPrint)
         {
-            FaultException = ex;
-            Status = EngineStepStatus.Faulted;
-            RecordDiagnostic("FAULT", $"{ex.GetType().Name}: {ex.Message}", includeCallerLocation: true);
-            return Status;
+            return false;
         }
+
+        for (int i = _callStack.Count - 1; i >= 0; i--)
+        {
+            CallFrame guarded = _callStack[i];
+            if (guarded.PassiveDebugGuardEndPc >= 0 && guarded.ProgramCounter <= guarded.PassiveDebugGuardEndPc)
+            {
+                int skipToPc = guarded.PassiveDebugGuardEndPc;
+                guarded.PassiveDebugGuardEndPc = -1;
+                guarded.ResetActiveStrForm();
+                if (i < _callStack.Count - 1)
+                {
+                    _callStack.RemoveRange(i + 1, _callStack.Count - (i + 1));
+                }
+
+                guarded.ProgramCounter = skipToPc;
+                RecordDiagnostic(
+                    "DEBUGPRINT",
+                    $"Skipped faulty DEBUGPRINT* expression in non-debug mode: {ex.GetType().Name}: {ex.Message}",
+                    dedupeKey: null,
+                    includeCallerLocation: true);
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public void SubmitInput(InputResponse response)

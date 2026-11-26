@@ -697,4 +697,131 @@ public sealed class EmueraCompatibilityFixesTests
         Assert.Equal(" 相手 ", run.GetStr("STR", 3));
         Assert.Equal(" 相手 ", run.GetStr("STR", 4));
     }
+
+    [Fact]
+    public void DebugPrintAndAssert_SkipEvaluationWhenDisabled_AndRecoverPassivelyWhenAlwaysCapturing()
+    {
+        string erb = """
+            @MAIN
+            #DIM DYNAMIC IDX = -1
+            A:1 = 42
+            DEBUGPRINTFORML valid={A:1}
+            DEBUGPRINTFORML faulty={NO:IDX}_THUMB
+            ASSERT NO:IDX == 0
+            A:0 = 999
+            """;
+
+        var vfs = new CompilerMemoryVfs();
+        vfs.AddFile("ERB/MAIN.ERB", erb);
+        CompilationResult compiled = CompilerTestHarness.Compile(vfs, throwOnError: true);
+
+        // 1. Normal non-debug runtime (UseDebugCommand=false, AlwaysCaptureDebugPrint=false): skips DEBUGPRINT* & ASSERT completely
+        using (var engDisabled = new EmueraEngine(compiled.Module, vfs, RuntimeOptions.Default with { UseDebugCommand = false }))
+        {
+            engDisabled.PushEntryFrame(compiled.Module.Functions[0]);
+            Assert.Equal(EngineStepStatus.Completed, engDisabled.Step());
+            Assert.Equal(999L, engDisabled.FastVariables!.GetInt("A", 0));
+            Assert.Empty(engDisabled.DebugLog);
+        }
+
+        // 2. Standalone passive capture (UseDebugCommand=false, AlwaysCaptureDebugPrint=true): captures valid line, skips faulty line without crashing
+        using (var engPassive = new EmueraEngine(compiled.Module, vfs, RuntimeOptions.Default with { UseDebugCommand = false }))
+        {
+            engPassive.AlwaysCaptureDebugPrint = true;
+            engPassive.PushEntryFrame(compiled.Module.Functions[0]);
+            Assert.Equal(EngineStepStatus.Completed, engPassive.Step());
+            Assert.Equal(999L, engPassive.FastVariables!.GetInt("A", 0));
+            Assert.Contains(engPassive.DebugLog, static line => line == "valid=42");
+            Assert.Contains(engPassive.TraceLog, static e => e.Category == "DEBUGPRINT" && e.Message.Contains("Skipped faulty DEBUGPRINT*", StringComparison.Ordinal));
+        }
+
+        // 3. Explicit debug mode (UseDebugCommand=true): evaluates DEBUGPRINTFORML normally and surfaces the fault
+        using (var engDebug = new EmueraEngine(compiled.Module, vfs, RuntimeOptions.Default with { UseDebugCommand = true }))
+        {
+            engDebug.PushEntryFrame(compiled.Module.Functions[0]);
+            Assert.Equal(EngineStepStatus.Faulted, engDebug.Step());
+            Assert.IsType<ArgumentOutOfRangeException>(engDebug.FaultException);
+        }
+    }
+
+    [Fact]
+    public void RuntimeDynamicCompiler_CachedGetVarSetVarFastPaths_HandleScalarsLoopsStaticsAndReadOnly()
+    {
+        string erh = """
+            #DIM GLOBAL_SCALAR
+            #DIMS GLOBAL_STR
+            #DIM ARR, 20
+            #DIMS SARR, 20
+            """;
+
+        string erb = """
+            @MAIN
+            #DIM DYNAMIC IDX
+            #DIM DYNAMIC SUM_I
+            #DIMS DYNAMIC JOIN_S
+
+            SETVAR "GLOBAL_SCALAR", 55
+            SETVAR "GLOBAL_STR", "hello"
+            A:0 = GETVAR("GLOBAL_SCALAR")
+            STR:0 '= GETVARS("GLOBAL_STR")
+
+            ; Const 1D subscript fast path
+            SETVAR "ARR:3", 300
+            SETVAR "SARR:2", "two"
+            A:1 = GETVAR("ARR:3")
+            STR:1 '= GETVARS("SARR:2")
+
+            ; Dynamic #DIM DYNAMIC loop index fast path (mutated across iterations)
+            FOR IDX, 0, 10
+                SETVAR @"ARR:IDX", IDX * 10
+                SETVAR @"SARR:IDX", @"v{IDX}"
+            NEXT
+            FOR IDX, 0, 10
+                SUM_I += GETVAR(@"ARR:IDX")
+                JOIN_S += GETVARS(@"SARR:IDX")
+            NEXT
+            A:2 = SUM_I
+            STR:2 '= JOIN_S
+
+            ; Function-static LOCAL subscript fast path
+            FOR LOCAL, 0, 5
+                SETVAR "ARR:LOCAL", LOCAL + 100
+            NEXT
+            A:3 = 0
+            FOR LOCAL, 0, 5
+                A:3 += GETVAR("ARR:LOCAL")
+            NEXT
+
+            ; Complex expression subscript fallback (cached AST)
+            IDX = 4
+            A:4 = GETVAR("ARR:(IDX - 1)")
+            A:5 = GETVAR("CHARANUM")
+            """;
+
+        ExecutedRun run = CompilerTestHarness.CompileAndRun(erb, erhSource: erh);
+        Assert.Equal(55L, run.GetInt("A", 0));
+        Assert.Equal("hello", run.GetStr("STR", 0));
+        Assert.Equal(300L, run.GetInt("A", 1));
+        Assert.Equal("two", run.GetStr("STR", 1));
+        Assert.Equal(450L, run.GetInt("A", 2));
+        Assert.Equal("v0v1v2v3v4v5v6v7v8v9", run.GetStr("STR", 2));
+        Assert.Equal(510L, run.GetInt("A", 3));
+        Assert.Equal(103L, run.GetInt("A", 4));
+        Assert.Equal(0L, run.GetInt("A", 5));
+
+        // Verify read-only builtin variable (CHARANUM) still rejects SETVAR even after cached GETVAR
+        string readonlyErb = """
+            @MAIN
+            A:0 = GETVAR("CHARANUM")
+            SETVAR "CHARANUM", 999
+            """;
+        var vfs = new CompilerMemoryVfs();
+        vfs.AddFile("ERB/MAIN.ERB", readonlyErb);
+        CompilationResult compiled = CompilerTestHarness.Compile(vfs, throwOnError: true);
+        using var engine = new EmueraEngine(compiled.Module, vfs);
+        new RuntimeDynamicCompiler(compiled.Module, compiled.Symbols).AttachTo(engine);
+        engine.PushEntryFrame(compiled.Module.Functions[0]);
+        Assert.Equal(EngineStepStatus.Faulted, engine.Step());
+        Assert.IsType<InvalidOperationException>(engine.FaultException);
+    }
 }

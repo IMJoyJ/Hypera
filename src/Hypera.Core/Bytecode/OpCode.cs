@@ -173,4 +173,5 @@ public enum OpCode : ushort
     DynamicSetVarInt = 0x0125,
     DynamicSetVarStr = 0x0126,
     DynamicExistVar = 0x0127,
+    BeginDebugGuard = 0x0128,
 }

@@ -16,6 +16,8 @@ public sealed class HepArchiveVfs : IVirtualFileSystem
     private readonly IEncodingDetector _encodingDetector;
     private readonly Dictionary<string, ArchiveEntryDescriptor> _entryIndex;
     private readonly HashSet<string> _directoryIndex;
+    private string[] _sortedPaths = [];
+    private Dictionary<string, string[]> _directFilesByDir = new(VfsPathNormalizer.Comparer);
     private readonly object _syncLock = new();
     private bool _disposed;
 
@@ -61,6 +63,8 @@ public sealed class HepArchiveVfs : IVirtualFileSystem
     public bool HasPrebuiltBytecode => Header.Flags.HasFlag(ArchivePackageFlags.IncludesPrebuiltBytecode);
 
     public IReadOnlyCollection<ArchiveEntryDescriptor> Entries => _entryIndex.Values;
+
+    public IReadOnlyCollection<string> Directories => _directoryIndex;
 
     public bool TryGetDescriptor(string virtualPath, out ArchiveEntryDescriptor descriptor)
     {
@@ -147,26 +151,50 @@ public sealed class HepArchiveVfs : IVirtualFileSystem
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         string prefix = VfsPathNormalizer.Normalize(directoryVirtualPath);
-        string prefixWithSlash = prefix.Length == 0 ? string.Empty : prefix + "/";
 
-        foreach (string normalizedPath in _entryIndex.Keys.OrderBy(static k => k, VfsPathNormalizer.Comparer))
+        if (!recursive)
         {
-            if (prefix.Length > 0 && !normalizedPath.StartsWith(prefixWithSlash, StringComparison.OrdinalIgnoreCase))
+            if (!_directFilesByDir.TryGetValue(prefix, out string[]? directFiles) || directFiles.Length == 0)
             {
-                continue;
+                yield break;
             }
 
-            ReadOnlySpan<char> relativeToDir = prefix.Length == 0
-                ? normalizedPath.AsSpan()
-                : normalizedPath.AsSpan(prefixWithSlash.Length);
-
-            if (!recursive && relativeToDir.Contains('/'))
+            bool matchAll = searchPattern == "*";
+            for (int i = 0; i < directFiles.Length; i++)
             {
-                continue;
+                string normalizedPath = directFiles[i];
+                if (matchAll || FileSystemName.MatchesSimpleExpression(searchPattern, VfsPathNormalizer.GetFileName(normalizedPath), ignoreCase: true))
+                {
+                    yield return normalizedPath;
+                }
             }
 
-            ReadOnlySpan<char> fileName = VfsPathNormalizer.GetFileName(normalizedPath);
-            if (searchPattern == "*" || FileSystemName.MatchesSimpleExpression(searchPattern, fileName, ignoreCase: true))
+            yield break;
+        }
+
+        string prefixWithSlash = prefix.Length == 0 ? string.Empty : prefix + "/";
+        bool matchAllRec = searchPattern == "*";
+        string[] all = _sortedPaths;
+
+        int startIndex = 0;
+        if (prefixWithSlash.Length > 0)
+        {
+            startIndex = Array.BinarySearch(all, prefixWithSlash, VfsPathNormalizer.Comparer);
+            if (startIndex < 0)
+            {
+                startIndex = ~startIndex;
+            }
+        }
+
+        for (int i = startIndex; i < all.Length; i++)
+        {
+            string normalizedPath = all[i];
+            if (prefixWithSlash.Length > 0 && !normalizedPath.StartsWith(prefixWithSlash, StringComparison.OrdinalIgnoreCase))
+            {
+                break;
+            }
+
+            if (matchAllRec || FileSystemName.MatchesSimpleExpression(searchPattern, VfsPathNormalizer.GetFileName(normalizedPath), ignoreCase: true))
             {
                 yield return normalizedPath;
             }
@@ -247,7 +275,38 @@ public sealed class HepArchiveVfs : IVirtualFileSystem
             AddDirectoryHierarchy(VfsPathNormalizer.GetDirectoryName(normalized));
         }
 
+        BuildEnumerationCaches();
         return header;
+    }
+
+    private void BuildEnumerationCaches()
+    {
+        string[] sorted = new string[_entryIndex.Count];
+        _entryIndex.Keys.CopyTo(sorted, 0);
+        Array.Sort(sorted, VfsPathNormalizer.Comparer);
+        _sortedPaths = sorted;
+
+        var byDirLists = new Dictionary<string, List<string>>(VfsPathNormalizer.Comparer);
+        for (int i = 0; i < sorted.Length; i++)
+        {
+            string path = sorted[i];
+            string dir = VfsPathNormalizer.GetDirectoryName(path);
+            if (!byDirLists.TryGetValue(dir, out List<string>? list))
+            {
+                list = [];
+                byDirLists[dir] = list;
+            }
+
+            list.Add(path);
+        }
+
+        var directMap = new Dictionary<string, string[]>(byDirLists.Count, VfsPathNormalizer.Comparer);
+        foreach (KeyValuePair<string, List<string>> kv in byDirLists)
+        {
+            directMap[kv.Key] = [.. kv.Value];
+        }
+
+        _directFilesByDir = directMap;
     }
 
     private void AddDirectoryHierarchy(string normalizedDir)

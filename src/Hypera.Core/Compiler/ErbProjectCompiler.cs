@@ -2431,6 +2431,7 @@ public sealed class ErbProjectCompiler
                 case BuiltinInstructionKind.DEBUGPRINTFORM:
                 case BuiltinInstructionKind.DEBUGPRINTFORML:
                 {
+                    int guardPc = _module.Emit(Instruction.Simple(OpCode.BeginDebugGuard, immediate: 0, aux: 0));
                     var m = _emitter.MarkTempRegs();
                     bool isForm = spec.Kind is BuiltinInstructionKind.DEBUGPRINTFORM or BuiltinInstructionKind.DEBUGPRINTFORML;
                     ExprNode sExpr = isForm
@@ -2440,6 +2441,7 @@ public sealed class ErbProjectCompiler
                     OpCode op = (spec.PrintFlags & PrintModifierFlags.NewLine) != 0 ? OpCode.PrintLine : OpCode.Print;
                     _module.Emit(Instruction.Reg1(op, sr, aux: (ushort)spec.PrintFlags));
                     _emitter.ReleaseTempRegs(m);
+                    _module.PatchImmediate(guardPc, _module.CurrentPc);
                     return;
                 }
 
@@ -5552,6 +5554,14 @@ public sealed class ErbProjectCompiler
 
                     break;
                 }
+            }
+
+            if (spec.Kind == BuiltinInstructionKind.ASSERT)
+            {
+                int guardPc = _module.Emit(Instruction.Simple(OpCode.BeginDebugGuard, immediate: 0, aux: 1));
+                _emitter.EmitBuiltinInstruction(spec.Kind, args);
+                _module.PatchImmediate(guardPc, _module.CurrentPc);
+                return;
             }
 
             _emitter.EmitBuiltinInstruction(spec.Kind, args);

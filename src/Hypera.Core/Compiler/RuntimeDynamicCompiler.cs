@@ -22,6 +22,34 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
     private readonly ErbLexer _lexer;
     private readonly ExpressionParser _exprParser;
     private readonly Dictionary<int, UserFunctionSymbol> _funcSymbolsById = [];
+    private readonly Dictionary<DynamicVarCacheKey, CachedDynamicVarAccess> _dynamicVarCache = new(256);
+    private const int MaxDynamicVarCacheEntries = 8192;
+
+    private readonly record struct DynamicVarCacheKey(int FunctionId, string Expression);
+
+    private enum DynamicVarFastKind : byte
+    {
+        GeneralAst = 0,
+        GlobalScalarInt,
+        GlobalScalarStr,
+        Global1DConstInt,
+        Global1DConstStr,
+        Global1DLocalIntSub,
+        Global1DLocalStrSub,
+        Global1DStaticIntSub,
+        Global1DStaticStrSub,
+    }
+
+    private sealed class CachedDynamicVarAccess
+    {
+        public required VariableAccessExpr Ast { get; init; }
+        public required DynamicVarFastKind FastKind { get; init; }
+        public required VariableValueKind ValueKind { get; init; }
+        public required bool IsReadOnly { get; init; }
+        public int SlotId { get; init; }
+        public long ConstIndex0 { get; init; }
+        public int SubscriptSlotIndex { get; init; }
+    }
 
     public RuntimeDynamicCompiler(BytecodeModule module, SymbolTable? symbols = null)
     {
@@ -193,49 +221,176 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
     public long GetVariableInt(EmueraEngine engine, CallFrame? activeFrame, string variableExpression)
     {
         ArgumentNullException.ThrowIfNull(engine);
-        VariableAccessExpr va = ParseDynamicVariableAccess(variableExpression, activeFrame, requireWritable: false);
-        if (va.ValueKind != VariableValueKind.Int)
+        CachedDynamicVarAccess cached = GetOrParseDynamicVariableAccess(variableExpression, activeFrame);
+        if (cached.ValueKind != VariableValueKind.Int)
         {
             throw new InvalidOperationException($"Variable '{variableExpression}' is not an integer variable.");
         }
 
-        return ReadVariableInt(va, engine, activeFrame);
+        VariableStore? fastVars = engine.FastVariables;
+        if (fastVars is not null)
+        {
+            switch (cached.FastKind)
+            {
+                case DynamicVarFastKind.GlobalScalarInt:
+                    return fastVars.GetInt0D(cached.SlotId);
+
+                case DynamicVarFastKind.Global1DConstInt:
+                    return fastVars.GetInt1D(cached.SlotId, cached.ConstIndex0);
+
+                case DynamicVarFastKind.Global1DLocalIntSub when activeFrame is not null && (uint)cached.SubscriptSlotIndex < (uint)activeFrame.LocalSlots.Length:
+                {
+                    long[]? arr = activeFrame.LocalSlots[cached.SubscriptSlotIndex].IntArray;
+                    if (arr is { Length: > 0 })
+                    {
+                        return fastVars.GetInt1D(cached.SlotId, arr[0]);
+                    }
+
+                    break;
+                }
+
+                case DynamicVarFastKind.Global1DStaticIntSub:
+                    return fastVars.GetInt1D(cached.SlotId, fastVars.GetInt0D(cached.SubscriptSlotIndex));
+            }
+        }
+
+        return ReadVariableInt(cached.Ast, engine, activeFrame);
     }
 
     public string GetVariableStr(EmueraEngine engine, CallFrame? activeFrame, string variableExpression)
     {
         ArgumentNullException.ThrowIfNull(engine);
-        VariableAccessExpr va = ParseDynamicVariableAccess(variableExpression, activeFrame, requireWritable: false);
-        if (va.ValueKind != VariableValueKind.Str)
+        CachedDynamicVarAccess cached = GetOrParseDynamicVariableAccess(variableExpression, activeFrame);
+        if (cached.ValueKind != VariableValueKind.Str)
         {
             throw new InvalidOperationException($"Variable '{variableExpression}' is not a string variable.");
         }
 
-        return ReadVariableStr(va, engine, activeFrame);
+        VariableStore? fastVars = engine.FastVariables;
+        if (fastVars is not null)
+        {
+            switch (cached.FastKind)
+            {
+                case DynamicVarFastKind.GlobalScalarStr:
+                    return fastVars.GetStr0D(cached.SlotId);
+
+                case DynamicVarFastKind.Global1DConstStr:
+                    return fastVars.GetStr1D(cached.SlotId, cached.ConstIndex0);
+
+                case DynamicVarFastKind.Global1DLocalStrSub when activeFrame is not null && (uint)cached.SubscriptSlotIndex < (uint)activeFrame.LocalSlots.Length:
+                {
+                    long[]? arr = activeFrame.LocalSlots[cached.SubscriptSlotIndex].IntArray;
+                    if (arr is { Length: > 0 })
+                    {
+                        return fastVars.GetStr1D(cached.SlotId, arr[0]);
+                    }
+
+                    break;
+                }
+
+                case DynamicVarFastKind.Global1DStaticStrSub:
+                    return fastVars.GetStr1D(cached.SlotId, fastVars.GetInt0D(cached.SubscriptSlotIndex));
+            }
+        }
+
+        return ReadVariableStr(cached.Ast, engine, activeFrame);
     }
 
     public void SetVariableInt(EmueraEngine engine, CallFrame? activeFrame, string variableExpression, long value)
     {
         ArgumentNullException.ThrowIfNull(engine);
-        VariableAccessExpr va = ParseDynamicVariableAccess(variableExpression, activeFrame, requireWritable: true);
-        if (va.ValueKind != VariableValueKind.Int)
+        CachedDynamicVarAccess cached = GetOrParseDynamicVariableAccess(variableExpression, activeFrame);
+        if (cached.IsReadOnly)
+        {
+            throw new InvalidOperationException($"Variable '{cached.Ast.Variable.Name}' is read-only/constant and cannot be modified.");
+        }
+
+        if (cached.ValueKind != VariableValueKind.Int)
         {
             throw new InvalidOperationException($"Variable '{variableExpression}' is not an integer variable.");
         }
 
-        WriteVariableInt(va, value, engine, activeFrame);
+        VariableStore? fastVars = engine.FastVariables;
+        if (fastVars is not null)
+        {
+            switch (cached.FastKind)
+            {
+                case DynamicVarFastKind.GlobalScalarInt:
+                    fastVars.SetInt0D(cached.SlotId, value);
+                    return;
+
+                case DynamicVarFastKind.Global1DConstInt:
+                    fastVars.SetInt1D(cached.SlotId, cached.ConstIndex0, value);
+                    return;
+
+                case DynamicVarFastKind.Global1DLocalIntSub when activeFrame is not null && (uint)cached.SubscriptSlotIndex < (uint)activeFrame.LocalSlots.Length:
+                {
+                    long[]? arr = activeFrame.LocalSlots[cached.SubscriptSlotIndex].IntArray;
+                    if (arr is { Length: > 0 })
+                    {
+                        fastVars.SetInt1D(cached.SlotId, arr[0], value);
+                        return;
+                    }
+
+                    break;
+                }
+
+                case DynamicVarFastKind.Global1DStaticIntSub:
+                    fastVars.SetInt1D(cached.SlotId, fastVars.GetInt0D(cached.SubscriptSlotIndex), value);
+                    return;
+            }
+        }
+
+        WriteVariableInt(cached.Ast, value, engine, activeFrame);
     }
 
     public void SetVariableStr(EmueraEngine engine, CallFrame? activeFrame, string variableExpression, string value)
     {
         ArgumentNullException.ThrowIfNull(engine);
-        VariableAccessExpr va = ParseDynamicVariableAccess(variableExpression, activeFrame, requireWritable: true);
-        if (va.ValueKind != VariableValueKind.Str)
+        CachedDynamicVarAccess cached = GetOrParseDynamicVariableAccess(variableExpression, activeFrame);
+        if (cached.IsReadOnly)
+        {
+            throw new InvalidOperationException($"Variable '{cached.Ast.Variable.Name}' is read-only/constant and cannot be modified.");
+        }
+
+        if (cached.ValueKind != VariableValueKind.Str)
         {
             throw new InvalidOperationException($"Variable '{variableExpression}' is not a string variable.");
         }
 
-        WriteVariableStr(va, value ?? string.Empty, engine, activeFrame);
+        string safeValue = value ?? string.Empty;
+        VariableStore? fastVars = engine.FastVariables;
+        if (fastVars is not null)
+        {
+            switch (cached.FastKind)
+            {
+                case DynamicVarFastKind.GlobalScalarStr:
+                    fastVars.SetStr0D(cached.SlotId, safeValue);
+                    return;
+
+                case DynamicVarFastKind.Global1DConstStr:
+                    fastVars.SetStr1D(cached.SlotId, cached.ConstIndex0, safeValue);
+                    return;
+
+                case DynamicVarFastKind.Global1DLocalStrSub when activeFrame is not null && (uint)cached.SubscriptSlotIndex < (uint)activeFrame.LocalSlots.Length:
+                {
+                    long[]? arr = activeFrame.LocalSlots[cached.SubscriptSlotIndex].IntArray;
+                    if (arr is { Length: > 0 })
+                    {
+                        fastVars.SetStr1D(cached.SlotId, arr[0], safeValue);
+                        return;
+                    }
+
+                    break;
+                }
+
+                case DynamicVarFastKind.Global1DStaticStrSub:
+                    fastVars.SetStr1D(cached.SlotId, fastVars.GetInt0D(cached.SubscriptSlotIndex), safeValue);
+                    return;
+            }
+        }
+
+        WriteVariableStr(cached.Ast, safeValue, engine, activeFrame);
     }
 
     public long VariableExists(EmueraEngine engine, CallFrame? activeFrame, string variableName)
@@ -385,6 +540,101 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
     // =========================================================================
     // Direct AST Evaluation Engine (Against EmueraEngine + CallFrame)
     // =========================================================================
+
+    private CachedDynamicVarAccess GetOrParseDynamicVariableAccess(string variableExpression, CallFrame? activeFrame)
+    {
+        var key = new DynamicVarCacheKey(activeFrame?.FunctionId ?? -1, variableExpression);
+        if (_dynamicVarCache.TryGetValue(key, out CachedDynamicVarAccess? cached))
+        {
+            return cached;
+        }
+
+        VariableAccessExpr va = ParseDynamicVariableAccess(variableExpression, activeFrame, requireWritable: false);
+        CachedDynamicVarAccess entry = BuildCachedDynamicVarAccess(va, activeFrame);
+
+        if (_dynamicVarCache.Count >= MaxDynamicVarCacheEntries)
+        {
+            _dynamicVarCache.Clear();
+        }
+
+        _dynamicVarCache[key] = entry;
+        return entry;
+    }
+
+    private CachedDynamicVarAccess BuildCachedDynamicVarAccess(VariableAccessExpr va, CallFrame? activeFrame)
+    {
+        ResolvedVariable v = va.Variable;
+        bool isReadOnly = v.IsConst || v.IsReadOnly;
+        DynamicVarFastKind fastKind = DynamicVarFastKind.GeneralAst;
+        long constIndex0 = 0;
+        int subSlotIndex = -1;
+
+        bool isDirectGlobalOrFuncStatic =
+            !v.IsCharaData
+            && v.SlotId >= 0
+            && v.ArrayRank <= 1
+            && v.Scope is VariableScopeKind.BuiltinStatic or VariableScopeKind.GlobalDim or VariableScopeKind.GlobalDimSavedata or VariableScopeKind.FunctionStatic;
+
+        if (isDirectGlobalOrFuncStatic)
+        {
+            bool isStr = v.ValueKind == VariableValueKind.Str;
+            if (va.Subscripts.Length == 0)
+            {
+                fastKind = isStr ? DynamicVarFastKind.GlobalScalarStr : DynamicVarFastKind.GlobalScalarInt;
+            }
+            else if (va.Subscripts.Length == 1)
+            {
+                ExprNode sub = va.Subscripts[0];
+                if (sub is IntLiteralExpr lit)
+                {
+                    fastKind = isStr ? DynamicVarFastKind.Global1DConstStr : DynamicVarFastKind.Global1DConstInt;
+                    constIndex0 = lit.Value;
+                }
+                else if (sub is VariableAccessExpr subVa && subVa.Subscripts.Length == 0 && subVa.ValueKind == VariableValueKind.Int)
+                {
+                    ResolvedVariable sv = subVa.Variable;
+                    if (sv.Scope == VariableScopeKind.FunctionDynamic && activeFrame is not null)
+                    {
+                        StringComparison cmp = _options.IgnoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+                        FrameLocalStorage[] locals = activeFrame.LocalSlots;
+                        for (int i = 0; i < locals.Length; i++)
+                        {
+                            FrameLocalStorage loc = locals[i];
+                            if (loc.Scope == VariableScopeKind.FunctionDynamic
+                                && loc.ValueKind == VariableValueKind.Int
+                                && loc.Offset == 0
+                                && loc.IntArray is { Length: > 0 }
+                                && string.Equals(loc.Name, sv.Name, cmp))
+                            {
+                                fastKind = isStr ? DynamicVarFastKind.Global1DLocalStrSub : DynamicVarFastKind.Global1DLocalIntSub;
+                                subSlotIndex = i;
+                                break;
+                            }
+                        }
+                    }
+                    else if (!sv.IsCharaData
+                             && sv.SlotId >= 0
+                             && sv.ArrayRank <= 1
+                             && sv.Scope is VariableScopeKind.BuiltinStatic or VariableScopeKind.GlobalDim or VariableScopeKind.GlobalDimSavedata or VariableScopeKind.FunctionStatic)
+                    {
+                        fastKind = isStr ? DynamicVarFastKind.Global1DStaticStrSub : DynamicVarFastKind.Global1DStaticIntSub;
+                        subSlotIndex = sv.SlotId;
+                    }
+                }
+            }
+        }
+
+        return new CachedDynamicVarAccess
+        {
+            Ast = va,
+            FastKind = fastKind,
+            ValueKind = va.ValueKind,
+            IsReadOnly = isReadOnly,
+            SlotId = v.SlotId,
+            ConstIndex0 = constIndex0,
+            SubscriptSlotIndex = subSlotIndex,
+        };
+    }
 
     private VariableAccessExpr ParseDynamicVariableAccess(string variableExpression, CallFrame? activeFrame, bool requireWritable)
     {
@@ -706,7 +956,29 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         {
             int charaIdx = subs.Length >= 1 ? checked((int)subs[0]) : 0;
             ReadOnlySpan<long> rem = subs.Length >= 2 ? subs[1..] : default;
+            if (engine.FastCharacters is CharacterStore fc)
+            {
+                return rem.Length switch
+                {
+                    0 => fc.GetInt0D(charaIdx, v.SlotId),
+                    1 => fc.GetInt1D(charaIdx, v.SlotId, rem[0]),
+                    2 => fc.GetInt2D(charaIdx, v.SlotId, rem[0], rem[1]),
+                    _ => fc.GetInt(charaIdx, v.SlotId, rem),
+                };
+            }
+
             return engine.RequireCharactersInterface().GetInt(charaIdx, v.SlotId, rem);
+        }
+
+        if (engine.FastVariables is VariableStore fv)
+        {
+            return subs.Length switch
+            {
+                0 => fv.GetInt0D(v.SlotId),
+                1 => fv.GetInt1D(v.SlotId, subs[0]),
+                2 => fv.GetInt2D(v.SlotId, subs[0], subs[1]),
+                _ => fv.GetInt(v.SlotId, subs),
+            };
         }
 
         return engine.RequireVariablesInterface().GetInt(v.SlotId, subs);
@@ -732,7 +1004,27 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         {
             int charaIdx = subs.Length >= 1 ? checked((int)subs[0]) : 0;
             ReadOnlySpan<long> rem = subs.Length >= 2 ? subs[1..] : default;
+            if (engine.FastCharacters is CharacterStore fc)
+            {
+                return rem.Length switch
+                {
+                    0 => fc.GetStr0D(charaIdx, v.SlotId),
+                    1 => fc.GetStr1D(charaIdx, v.SlotId, rem[0]),
+                    _ => fc.GetStr(charaIdx, v.SlotId, rem),
+                };
+            }
+
             return engine.RequireCharactersInterface().GetStr(charaIdx, v.SlotId, rem);
+        }
+
+        if (engine.FastVariables is VariableStore fv)
+        {
+            return subs.Length switch
+            {
+                0 => fv.GetStr0D(v.SlotId),
+                1 => fv.GetStr1D(v.SlotId, subs[0]),
+                _ => fv.GetStr(v.SlotId, subs),
+            };
         }
 
         return engine.RequireVariablesInterface().GetStr(v.SlotId, subs);
@@ -753,8 +1045,30 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         {
             int charaIdx = subs.Length >= 1 ? checked((int)subs[0]) : 0;
             ReadOnlySpan<long> rem = subs.Length >= 2 ? subs[1..] : default;
+            if (engine.FastCharacters is CharacterStore fc)
+            {
+                switch (rem.Length)
+                {
+                    case 0: fc.SetInt0D(charaIdx, v.SlotId, value); return;
+                    case 1: fc.SetInt1D(charaIdx, v.SlotId, rem[0], value); return;
+                    case 2: fc.SetInt2D(charaIdx, v.SlotId, rem[0], rem[1], value); return;
+                    default: fc.SetInt(charaIdx, v.SlotId, value, rem); return;
+                }
+            }
+
             engine.RequireCharactersInterface().SetInt(charaIdx, v.SlotId, value, rem);
             return;
+        }
+
+        if (engine.FastVariables is VariableStore fv)
+        {
+            switch (subs.Length)
+            {
+                case 0: fv.SetInt0D(v.SlotId, value); return;
+                case 1: fv.SetInt1D(v.SlotId, subs[0], value); return;
+                case 2: fv.SetInt2D(v.SlotId, subs[0], subs[1], value); return;
+                default: fv.SetInt(v.SlotId, value, subs); return;
+            }
         }
 
         engine.RequireVariablesInterface().SetInt(v.SlotId, value, subs);
@@ -775,8 +1089,28 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         {
             int charaIdx = subs.Length >= 1 ? checked((int)subs[0]) : 0;
             ReadOnlySpan<long> rem = subs.Length >= 2 ? subs[1..] : default;
+            if (engine.FastCharacters is CharacterStore fc)
+            {
+                switch (rem.Length)
+                {
+                    case 0: fc.SetStr0D(charaIdx, v.SlotId, value); return;
+                    case 1: fc.SetStr1D(charaIdx, v.SlotId, rem[0], value); return;
+                    default: fc.SetStr(charaIdx, v.SlotId, value, rem); return;
+                }
+            }
+
             engine.RequireCharactersInterface().SetStr(charaIdx, v.SlotId, value, rem);
             return;
+        }
+
+        if (engine.FastVariables is VariableStore fv)
+        {
+            switch (subs.Length)
+            {
+                case 0: fv.SetStr0D(v.SlotId, value); return;
+                case 1: fv.SetStr1D(v.SlotId, subs[0], value); return;
+                default: fv.SetStr(v.SlotId, value, subs); return;
+            }
         }
 
         engine.RequireVariablesInterface().SetStr(v.SlotId, value, subs);

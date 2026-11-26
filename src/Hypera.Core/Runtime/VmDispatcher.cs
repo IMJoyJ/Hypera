@@ -872,6 +872,27 @@ internal static class VmDispatcher
                         intRegs[insn.A] = engine.ActiveDynamicEvaluator.VariableExists(engine, frame, strRegs[insn.B]);
                         break;
 
+                    case OpCode.BeginDebugGuard:
+                    {
+                        bool isAssert = insn.Aux != 0;
+                        bool enabled = isAssert
+                            ? engine.Options.UseDebugCommand
+                            : (engine.Options.UseDebugCommand || engine.AlwaysCaptureDebugPrint);
+                        if (!enabled)
+                        {
+                            pc = insn.Immediate;
+                            break;
+                        }
+
+                        if (!isAssert && !engine.Options.UseDebugCommand && engine.AlwaysCaptureDebugPrint)
+                        {
+                            frame.ProgramCounter = pc;
+                            frame.PassiveDebugGuardEndPc = insn.Immediate;
+                        }
+
+                        break;
+                    }
+
                     default:
                         frame.ProgramCounter = pc;
                         throw new NotSupportedException($"Unsupported VM opcode '{insn.Op}' (0x{(ushort)insn.Op:X4}).");
