@@ -373,6 +373,12 @@ public sealed partial class EmueraEngine : IDisposable
             return; // Ignore stale out-of-generation input events safely.
         }
 
+        // Capture undo checkpoint ONLY on numeric/string INPUT* prompts (never WAIT / TWAIT / AWAIT).
+        EngineUndoCheckpoint? uncommittedCheckpoint = ShouldCaptureUndoCheckpoint(PendingInputRequest)
+            ? PushUndoCheckpointBeforeInput()
+            : null;
+        bool prevTimeout = FastVariables?.LastInputWasTimeout ?? false;
+
         if (FastVariables is not null)
         {
             FastVariables.LastInputWasTimeout = response.IsTimeout;
@@ -381,6 +387,7 @@ public sealed partial class EmueraEngine : IDisposable
 
         if (SystemFlow.IsAwaitingSystemInput)
         {
+            CommitUndoCheckpoint(uncommittedCheckpoint);
             PendingInputRequest = null;
             _pendingScriptInputMeta = null;
             AdvanceButtonGeneration();
@@ -392,8 +399,16 @@ public sealed partial class EmueraEngine : IDisposable
         if (_pendingScriptInputMeta is not null && !TryProcessScriptInput(response, _pendingScriptInputMeta))
         {
             // Invalid input (e.g. non-matching button in BINPUT/ONEBINPUT or empty non-numeric INPUT without default): stay in WaitingInput!
+            if (FastVariables is not null)
+            {
+                FastVariables.LastInputWasTimeout = prevTimeout;
+            }
+
+            DiscardUncommittedCheckpoint(uncommittedCheckpoint);
             return;
         }
+
+        CommitUndoCheckpoint(uncommittedCheckpoint);
 
         bool shouldAdvanceGeneration = _pendingScriptInputMeta?.Kind != InputRequestKind.TimedWait;
         PendingInputRequest = null;
@@ -1737,6 +1752,8 @@ public sealed partial class EmueraEngine : IDisposable
             _writableStorage.WriteAllBytes(relPath, EraSaveSerializer.Save(eraSnap, fmt));
             RecordDiagnostic("IO", $"SAVEDATA slot {slotNo} -> '{relPath}'");
         }
+
+        ClearUndoHistory();
     }
 
     internal bool LoadFromSlot(int slotNo)
@@ -1749,12 +1766,14 @@ public sealed partial class EmueraEngine : IDisposable
             {
                 EraSaveSnapshot loaded = EraSaveSerializer.Load(_writableStorage.ReadAllBytes(relPath));
                 ApplyEraSaveSnapshot(vars, loaded, slotNo);
+                ClearUndoHistory();
                 return true;
             }
         }
 
         if (vars.TryLoadFromMemorySlot(slotNo))
         {
+            ClearUndoHistory();
             return true;
         }
 
@@ -1807,6 +1826,8 @@ public sealed partial class EmueraEngine : IDisposable
                 RecordDiagnostic("IO", $"DELDATA slot {slotNo} -> '{relPath}'");
             }
         }
+
+        ClearUndoHistory();
     }
 
     internal void SaveGlobal()
@@ -2580,6 +2601,7 @@ public sealed partial class EmueraEngine : IDisposable
         }
 
         _disposed = true;
+        ClearUndoHistory();
         Graphics.Dispose();
         Sprites.Dispose();
         Fonts.Dispose();

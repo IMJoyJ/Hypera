@@ -130,7 +130,7 @@ public sealed class CallFrame
         return false;
     }
 
-    internal CallFrame CloneSnapshot()
+    internal CallFrame CloneSnapshot(Dictionary<object, object>? liveToClonedArrayMap = null)
     {
         var copy = new CallFrame(
             FunctionId,
@@ -147,15 +147,33 @@ public sealed class CallFrame
             IsMethodFunction = IsMethodFunction,
             DiscardCallerRegisterWrite = DiscardCallerRegisterWrite,
             RepeatEnd = RepeatEnd,
-            LocalSlots = CloneLocalSlots(LocalSlots),
+            LocalSlots = CloneLocalSlots(LocalSlots, liveToClonedArrayMap),
         };
 
         IntRegisters.AsSpan().CopyTo(copy.IntRegisters);
         StrRegisters.AsSpan().CopyTo(copy.StrRegisters);
+
+        if (_activeStrForm is not null)
+        {
+            copy._activeStrForm = new StringBuilder(_activeStrForm.ToString());
+        }
+
+        if (_nestedStrForms is { Count: > 0 })
+        {
+            StringBuilder[] arr = _nestedStrForms.ToArray();
+            copy._nestedStrForms = new Stack<StringBuilder>(arr.Length);
+            for (int i = arr.Length - 1; i >= 0; i--)
+            {
+                copy._nestedStrForms.Push(new StringBuilder(arr[i].ToString()));
+            }
+        }
+
         return copy;
     }
 
-    private static FrameLocalStorage[] CloneLocalSlots(FrameLocalStorage[] source)
+    private static FrameLocalStorage[] CloneLocalSlots(
+        FrameLocalStorage[] source,
+        Dictionary<object, object>? liveToClonedArrayMap)
     {
         if (source.Length == 0)
         {
@@ -166,6 +184,22 @@ public sealed class CallFrame
         for (int i = 0; i < source.Length; i++)
         {
             FrameLocalStorage s = source[i];
+            long[]? clonedInt = s.Scope == VariableScopeKind.Reference ? s.IntArray : (long[]?)s.IntArray?.Clone();
+            string[]? clonedStr = s.Scope == VariableScopeKind.Reference ? s.StrArray : (string[]?)s.StrArray?.Clone();
+
+            if (liveToClonedArrayMap is not null && s.Scope != VariableScopeKind.Reference)
+            {
+                if (s.IntArray is not null && clonedInt is not null)
+                {
+                    liveToClonedArrayMap[s.IntArray] = clonedInt;
+                }
+
+                if (s.StrArray is not null && clonedStr is not null)
+                {
+                    liveToClonedArrayMap[s.StrArray] = clonedStr;
+                }
+            }
+
             cloned[i] = new FrameLocalStorage
             {
                 LocalSlotIndex = s.LocalSlotIndex,
@@ -179,8 +213,8 @@ public sealed class CallFrame
                 Offset = s.Offset,
                 TotalLength = s.TotalLength,
                 IsBoundRef = s.IsBoundRef,
-                IntArray = s.Scope == VariableScopeKind.Reference ? s.IntArray : (long[]?)s.IntArray?.Clone(),
-                StrArray = s.Scope == VariableScopeKind.Reference ? s.StrArray : (string[]?)s.StrArray?.Clone(),
+                IntArray = clonedInt,
+                StrArray = clonedStr,
             };
         }
 

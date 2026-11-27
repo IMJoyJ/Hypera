@@ -133,6 +133,112 @@ public sealed class VariableSlotStorage
         _backingInitialized = false;
     }
 
+    internal sealed record SlotUndoSnapshot(
+        int SlotId,
+        int Rank,
+        int Dim0,
+        int Dim1,
+        int Dim2,
+        int TotalLength,
+        bool BackingInitialized,
+        long[]? DenseInt,
+        long[]?[]? IntPages,
+        string?[]? DenseStr,
+        string?[]?[]? StrPages);
+
+    internal SlotUndoSnapshot CaptureUndoSnapshot(Dictionary<object, object>? liveToClonedArrayMap)
+    {
+        long[]? denseIntCopy = null;
+        if (_denseInt is not null)
+        {
+            denseIntCopy = new long[_denseInt.Length];
+            _denseInt.AsSpan().CopyTo(denseIntCopy);
+            if (liveToClonedArrayMap is not null)
+            {
+                liveToClonedArrayMap[_denseInt] = denseIntCopy;
+            }
+        }
+
+        long[]?[]? intPagesCopy = null;
+        if (_intPages is not null)
+        {
+            intPagesCopy = new long[]?[_intPages.Length];
+            for (int i = 0; i < _intPages.Length; i++)
+            {
+                long[]? page = _intPages[i];
+                if (page is not null)
+                {
+                    var pCopy = new long[page.Length];
+                    page.AsSpan().CopyTo(pCopy);
+                    intPagesCopy[i] = pCopy;
+                }
+            }
+        }
+
+        string?[]? denseStrCopy = null;
+        if (_denseStr is not null)
+        {
+            denseStrCopy = new string?[_denseStr.Length];
+            _denseStr.AsSpan().CopyTo(denseStrCopy);
+            if (liveToClonedArrayMap is not null)
+            {
+                liveToClonedArrayMap[_denseStr] = denseStrCopy;
+            }
+        }
+
+        string?[]?[]? strPagesCopy = null;
+        if (_strPages is not null)
+        {
+            strPagesCopy = new string?[]?[_strPages.Length];
+            for (int i = 0; i < _strPages.Length; i++)
+            {
+                string?[]? page = _strPages[i];
+                if (page is not null)
+                {
+                    var pCopy = new string?[page.Length];
+                    page.AsSpan().CopyTo(pCopy);
+                    strPagesCopy[i] = pCopy;
+                }
+            }
+        }
+
+        return new SlotUndoSnapshot(
+            SlotId,
+            Rank,
+            Dim0,
+            Dim1,
+            Dim2,
+            TotalLength,
+            _backingInitialized,
+            denseIntCopy,
+            intPagesCopy,
+            denseStrCopy,
+            strPagesCopy);
+    }
+
+    internal void RestoreUndoSnapshot(SlotUndoSnapshot snap)
+    {
+        Rank = snap.Rank;
+        Dim0 = snap.Dim0;
+        Dim1 = snap.Dim1;
+        Dim2 = snap.Dim2;
+        TotalLength = snap.TotalLength;
+        _backingInitialized = snap.BackingInitialized;
+        _denseInt = snap.DenseInt;
+        _intPages = snap.IntPages;
+        _denseStr = snap.DenseStr;
+        _strPages = snap.StrPages;
+    }
+
+    internal void ResetToUnallocated()
+    {
+        _denseInt = null;
+        _intPages = null;
+        _denseStr = null;
+        _strPages = null;
+        _backingInitialized = false;
+    }
+
     internal void ResizeAndClear(ReadOnlySpan<int> dims)
     {
         int rank = dims.Length;
@@ -3488,6 +3594,151 @@ public sealed class VariableStore : IVariableStore
             case "EXPNAME": ExpNameSlotId = slotId; break;
             case "PALAMNAME": PalamNameSlotId = slotId; break;
         }
+    }
+
+    private static readonly DataTableStore s_emptyDataTables = new();
+    private static readonly XmlStore s_emptyXmls = new();
+    private static readonly MapStore s_emptyMaps = new();
+
+    internal sealed record VariableStoreUndoSnapshot(
+        List<VariableSlotStorage.SlotUndoSnapshot> AllocatedSlots,
+        HashSet<int> AllocatedSlotIds,
+        CharacterStore.CharacterStoreUndoSnapshot Characters,
+        SfmtRandomSnapshot SfmtRandom,
+        DataTableStore? DataTables,
+        XmlStore? Xmls,
+        MapStore? Maps,
+        long ContextLineCount,
+        bool LastInputWasTimeout,
+        string WindowTitle,
+        long LastLoadNo,
+        long LastLoadVersion,
+        string LastLoadText);
+
+    internal VariableStoreUndoSnapshot CaptureUndoSnapshot(Dictionary<object, object>? liveToClonedArrayMap)
+    {
+        var allocatedSlots = new List<VariableSlotStorage.SlotUndoSnapshot>(128);
+        var allocatedIds = new HashSet<int>(128);
+
+        for (int i = 0; i < _hotSlots.Length; i++)
+        {
+            VariableSlotStorage? slot = _hotSlots[i];
+            if (slot is not null &&
+                !slot.IsCharaData &&
+                slot.CalcKind == BuiltinCalcKind.None &&
+                !slot.IsConst &&
+                slot.HasAllocatedStorage)
+            {
+                allocatedSlots.Add(slot.CaptureUndoSnapshot(liveToClonedArrayMap));
+                allocatedIds.Add(slot.SlotId);
+            }
+        }
+
+        foreach (VariableSlotStorage slot in _coldSlots.Values)
+        {
+            if (!slot.IsCharaData &&
+                slot.CalcKind == BuiltinCalcKind.None &&
+                !slot.IsConst &&
+                slot.HasAllocatedStorage)
+            {
+                allocatedSlots.Add(slot.CaptureUndoSnapshot(liveToClonedArrayMap));
+                allocatedIds.Add(slot.SlotId);
+            }
+        }
+
+        return new VariableStoreUndoSnapshot(
+            AllocatedSlots: allocatedSlots,
+            AllocatedSlotIds: allocatedIds,
+            Characters: _characters.CaptureCowSnapshot(),
+            SfmtRandom: Random.CaptureSfmtSnapshot(),
+            DataTables: DataTables.Count > 0 ? DataTables.CloneSnapshot() : null,
+            Xmls: Xmls.Count > 0 ? Xmls.CloneSnapshot() : null,
+            Maps: Maps.Count > 0 ? Maps.CloneSnapshot() : null,
+            ContextLineCount: ContextLineCount,
+            LastInputWasTimeout: LastInputWasTimeout,
+            WindowTitle: WindowTitle,
+            LastLoadNo: LastLoadNo,
+            LastLoadVersion: LastLoadVersion,
+            LastLoadText: LastLoadText);
+    }
+
+    internal void RestoreUndoSnapshot(VariableStoreUndoSnapshot snapshot)
+    {
+        // Reset any mutable non-chara slots that were newly allocated after the checkpoint.
+        for (int i = 0; i < _hotSlots.Length; i++)
+        {
+            VariableSlotStorage? slot = _hotSlots[i];
+            if (slot is not null &&
+                !slot.IsCharaData &&
+                slot.CalcKind == BuiltinCalcKind.None &&
+                !slot.IsConst &&
+                slot.HasAllocatedStorage &&
+                !snapshot.AllocatedSlotIds.Contains(slot.SlotId))
+            {
+                slot.ResetToUnallocated();
+            }
+        }
+
+        foreach (VariableSlotStorage slot in _coldSlots.Values)
+        {
+            if (!slot.IsCharaData &&
+                slot.CalcKind == BuiltinCalcKind.None &&
+                !slot.IsConst &&
+                slot.HasAllocatedStorage &&
+                !snapshot.AllocatedSlotIds.Contains(slot.SlotId))
+            {
+                slot.ResetToUnallocated();
+            }
+        }
+
+        // Restore all captured slots.
+        for (int i = 0; i < snapshot.AllocatedSlots.Count; i++)
+        {
+            VariableSlotStorage.SlotUndoSnapshot slotSnap = snapshot.AllocatedSlots[i];
+            if (TryGetSlot(slotSnap.SlotId) is { } targetSlot)
+            {
+                targetSlot.RestoreUndoSnapshot(slotSnap);
+            }
+        }
+
+        _characters.RestoreCowSnapshot(snapshot.Characters);
+
+        // Restore SFMT-19937 deterministic RNG state ONLY; intentionally leaves System.Random (UseNewRandom / RandNew) untouched.
+        Random.RestoreSfmtSnapshot(snapshot.SfmtRandom);
+
+        if (snapshot.DataTables is not null)
+        {
+            DataTables.RestoreFrom(snapshot.DataTables);
+        }
+        else if (DataTables.Count > 0)
+        {
+            DataTables.RestoreFrom(s_emptyDataTables);
+        }
+
+        if (snapshot.Xmls is not null)
+        {
+            Xmls.RestoreFrom(snapshot.Xmls);
+        }
+        else if (Xmls.Count > 0)
+        {
+            Xmls.RestoreFrom(s_emptyXmls);
+        }
+
+        if (snapshot.Maps is not null)
+        {
+            Maps.RestoreFrom(snapshot.Maps);
+        }
+        else if (Maps.Count > 0)
+        {
+            Maps.RestoreFrom(s_emptyMaps);
+        }
+
+        ContextLineCount = snapshot.ContextLineCount;
+        LastInputWasTimeout = snapshot.LastInputWasTimeout;
+        WindowTitle = snapshot.WindowTitle;
+        LastLoadNo = snapshot.LastLoadNo;
+        LastLoadVersion = snapshot.LastLoadVersion;
+        LastLoadText = snapshot.LastLoadText;
     }
 
     private static void ThrowReadOnly(string name) =>

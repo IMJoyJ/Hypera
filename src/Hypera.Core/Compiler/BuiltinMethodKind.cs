@@ -303,7 +303,9 @@ public enum BuiltinMethodKind : ushort
     DT_TOXML,
     DT_FROMXML,
 
-    // Internal compiler helper for dynamic string-keyword array subscript resolution (e.g. ABL:(LOCALS:0))
+    // Internal compiler helpers (1000+)
     ResolveKeywordIndex = 1000,
     RepeatString = 1001,
+    /// <summary>Compile-time variant of RAND emitted when CompilerOptions.UseNewRandom is true (non-rollbackable live RNG).</summary>
+    RandNew = 1002,
 }

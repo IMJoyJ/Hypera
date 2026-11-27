@@ -9,8 +9,32 @@ namespace Hypera.Rendering;
 /// </summary>
 public sealed class GraphicsManager : IDisposable
 {
+    internal sealed class GraphicsUndoDelta : IDisposable
+    {
+        private bool _disposed;
+
+        public Dictionary<int, GraphicsSurface?> OriginalSurfaces { get; } = [];
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            foreach (GraphicsSurface? s in OriginalSurfaces.Values)
+            {
+                s?.Dispose();
+            }
+
+            OriginalSurfaces.Clear();
+        }
+    }
+
     private readonly Dictionary<int, GraphicsSurface> _surfaces = [];
     private readonly Dictionary<int, byte[]> _memorySavedImages = [];
+    private GraphicsUndoDelta? _activeUndoDelta;
     private readonly FontRegistry _fontRegistry;
     private readonly GlyphMeasurer _glyphMeasurer;
     private readonly string? _saveDirectory;
@@ -74,8 +98,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
-        DisposeSurface(id);
-        _surfaces[id] = new GraphicsSurface(id, width, height, DefaultForeColor, DefaultFontName, DefaultFontSize);
+        ReplaceSurfaceInternal(id, new GraphicsSurface(id, width, height, DefaultForeColor, DefaultFontName, DefaultFontSize));
         return true;
     }
 
@@ -119,8 +142,7 @@ public sealed class GraphicsManager : IDisposable
             }
         }
 
-        DisposeSurface(id);
-        _surfaces[id] = new GraphicsSurface(id, chosen, DefaultForeColor, DefaultFontName, DefaultFontSize);
+        ReplaceSurfaceInternal(id, new GraphicsSurface(id, chosen, DefaultForeColor, DefaultFontName, DefaultFontSize));
         return true;
     }
 
@@ -136,11 +158,80 @@ public sealed class GraphicsManager : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_surfaces.Remove(id, out GraphicsSurface? surface))
         {
-            surface.Dispose();
+            if (_activeUndoDelta is not null && !_activeUndoDelta.OriginalSurfaces.ContainsKey(id))
+            {
+                // Zero-copy ownership transfer into active undo delta.
+                _activeUndoDelta.OriginalSurfaces[id] = surface;
+            }
+            else
+            {
+                surface.Dispose();
+            }
+
             return true;
         }
 
         return false;
+    }
+
+    internal GraphicsUndoDelta BeginUndoDelta()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var delta = new GraphicsUndoDelta();
+        _activeUndoDelta = delta;
+        return delta;
+    }
+
+    internal void DetachUndoDelta() => _activeUndoDelta = null;
+
+    internal void RestoreUndoDelta(GraphicsUndoDelta delta)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _activeUndoDelta = null;
+        foreach (KeyValuePair<int, GraphicsSurface?> kv in delta.OriginalSurfaces)
+        {
+            if (_surfaces.Remove(kv.Key, out GraphicsSurface? current))
+            {
+                current.Dispose();
+            }
+
+            if (kv.Value is not null)
+            {
+                _surfaces[kv.Key] = kv.Value;
+            }
+        }
+
+        // Ownership of restored surfaces has returned to _surfaces.
+        delta.OriginalSurfaces.Clear();
+    }
+
+    private void ReplaceSurfaceInternal(int id, GraphicsSurface replacement)
+    {
+        if (_surfaces.Remove(id, out GraphicsSurface? existing))
+        {
+            if (_activeUndoDelta is not null && !_activeUndoDelta.OriginalSurfaces.ContainsKey(id))
+            {
+                _activeUndoDelta.OriginalSurfaces[id] = existing;
+            }
+            else
+            {
+                existing.Dispose();
+            }
+        }
+        else
+        {
+            _activeUndoDelta?.OriginalSurfaces.TryAdd(id, null);
+        }
+
+        _surfaces[id] = replacement;
+    }
+
+    private void RecordBeforeInPlaceMutation(int id, GraphicsSurface surface)
+    {
+        if (_activeUndoDelta is not null && !_activeUndoDelta.OriginalSurfaces.ContainsKey(id))
+        {
+            _activeUndoDelta.OriginalSurfaces[id] = surface.Clone();
+        }
     }
 
     public int GetWidth(int id) => TryGetSurface(id, out GraphicsSurface s) ? s.Width : 0;
@@ -153,6 +244,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.Clear(argb);
         return true;
     }
@@ -164,12 +256,21 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.ClearRect(x, y, width, height, argb);
         return true;
     }
 
-    public bool SetColor(int id, uint argb, int x, int y) =>
-        TryGetSurface(id, out GraphicsSurface s) && s.SetPixelColor(x, y, argb);
+    public bool SetColor(int id, uint argb, int x, int y)
+    {
+        if (!TryGetSurface(id, out GraphicsSurface s))
+        {
+            return false;
+        }
+
+        RecordBeforeInPlaceMutation(id, s);
+        return s.SetPixelColor(x, y, argb);
+    }
 
     public long GetColor(int id, int x, int y) =>
         TryGetSurface(id, out GraphicsSurface s) ? s.GetPixelColor(x, y) : 0L;
@@ -181,6 +282,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.SetBrush(argb);
         return true;
     }
@@ -195,6 +297,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.SetPen(argb, width);
         return true;
     }
@@ -212,6 +315,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.SetDashStyle(style, cap);
         return true;
     }
@@ -223,6 +327,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.SetFont(familyName, size, style);
         return true;
     }
@@ -241,6 +346,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.DrawLine(x1, y1, x2, y2);
         return true;
     }
@@ -252,6 +358,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.FillRectangle(x, y, width, height);
         return true;
     }
@@ -263,6 +370,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.DrawText(text, x, y, _fontRegistry, samplingMode);
         return true;
     }
@@ -286,6 +394,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(destId, dst);
         float[]? cm = emueraColorMatrix5x5 is not null
             ? GraphicsSurface.ConvertEmueraColorMatrix5x5(emueraColorMatrix5x5)
             : null;
@@ -302,6 +411,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(destId, dst);
         dst.DrawGraphicsWithMask(src, mask, destX, destY);
         return true;
     }
@@ -313,6 +423,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(destId, dst);
         dst.DrawGraphicsWithRotate(src, angleDegrees, pivotX, pivotY);
         return true;
     }
@@ -324,6 +435,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.RotateInPlace(angleDegrees, pivotX, pivotY);
         return true;
     }
@@ -346,6 +458,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(destId, dst);
         int w = destWidth ?? frame.SourceRect.Width;
         int h = destHeight ?? frame.SourceRect.Height;
         float[]? cm = emueraColorMatrix5x5 is not null
@@ -370,6 +483,7 @@ public sealed class GraphicsManager : IDisposable
             return false;
         }
 
+        RecordBeforeInPlaceMutation(id, s);
         s.FromPixelArray(pixels);
         return true;
     }
@@ -451,6 +565,7 @@ public sealed class GraphicsManager : IDisposable
         }
 
         _disposed = true;
+        _activeUndoDelta = null;
         foreach (GraphicsSurface s in _surfaces.Values)
         {
             s.Dispose();

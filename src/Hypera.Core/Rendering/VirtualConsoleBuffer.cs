@@ -84,7 +84,7 @@ public sealed class VirtualConsoleBuffer
     private readonly GlyphMeasurer _measurer;
     private readonly SpriteRegistry? _sprites;
 
-    private readonly record struct PendingStyledRun(
+    internal readonly record struct PendingStyledRun(
         string Text,
         string FontFamily,
         uint ForeColorRgba,
@@ -942,6 +942,107 @@ public sealed class VirtualConsoleBuffer
             ReplaceBackslashWithYen: ReplaceBackslashWithYen,
             ButtonWrap: ButtonWrap,
             ExpandTabs: ExpandTabs);
+
+    internal sealed record ConsoleBufferUndoSnapshot(
+        ConsoleLine[] PhysicalLines,
+        BackgroundImageLayer[] BackgroundImages,
+        CbgLayer[] CbgLayers,
+        HtmlIslandLayer[] IslandLayers,
+        string PendingHtml,
+        PendingStyledRun[] PendingStyledRuns,
+        long NextLogicalLineId,
+        long ButtonGeneration,
+        int LogicalLineCount,
+        long TotalPhysicalLineNo,
+        int ScrollOffsetLines,
+        bool PendingInPlaceReplacement,
+        int? CbgButtonMapGraphicsId,
+        TooltipState Tooltip,
+        LogicalViewport Viewport,
+        string CurrentFontFamily,
+        uint CurrentForeColorRgba,
+        uint CurrentBackColorRgba,
+        uint FocusColorRgba,
+        TextAlignment Alignment,
+        FontStyleFlags FontStyle,
+        PixelSamplingMode SamplingMode,
+        bool ReplaceBackslashWithYen,
+        bool ButtonWrap,
+        bool ExpandTabs,
+        bool LastOutputWasInPlaceReplacement);
+
+    internal ConsoleBufferUndoSnapshot CaptureUndoSnapshot() =>
+        new(
+            PhysicalLines: _physicalLines.ToArray(),
+            BackgroundImages: _backgroundImages.ToArray(),
+            CbgLayers: _cbgLayers.ToArray(),
+            IslandLayers: _islandLayers.ToArray(),
+            PendingHtml: _pendingHtmlBuffer.ToString(),
+            PendingStyledRuns: _pendingStyledRuns.ToArray(),
+            NextLogicalLineId: _nextLogicalLineId,
+            ButtonGeneration: _buttonGeneration,
+            LogicalLineCount: _logicalLineCount,
+            TotalPhysicalLineNo: _totalPhysicalLineNo,
+            ScrollOffsetLines: _scrollOffsetLines,
+            PendingInPlaceReplacement: _pendingInPlaceReplacement,
+            CbgButtonMapGraphicsId: _cbgButtonMapGraphicsId,
+            Tooltip: _tooltip,
+            Viewport: Viewport,
+            CurrentFontFamily: CurrentFontFamily,
+            CurrentForeColorRgba: CurrentForeColorRgba,
+            CurrentBackColorRgba: CurrentBackColorRgba,
+            FocusColorRgba: FocusColorRgba,
+            Alignment: Alignment,
+            FontStyle: FontStyle,
+            SamplingMode: SamplingMode,
+            ReplaceBackslashWithYen: ReplaceBackslashWithYen,
+            ButtonWrap: ButtonWrap,
+            ExpandTabs: ExpandTabs,
+            LastOutputWasInPlaceReplacement: LastOutputWasInPlaceReplacement);
+
+    internal void RestoreUndoSnapshot(ConsoleBufferUndoSnapshot snapshot)
+    {
+        _physicalLines.Clear();
+        _physicalLines.AddRange(snapshot.PhysicalLines);
+        _backgroundImages.Clear();
+        _backgroundImages.AddRange(snapshot.BackgroundImages);
+        _cbgLayers.Clear();
+        _cbgLayers.AddRange(snapshot.CbgLayers);
+        _islandLayers.Clear();
+        _islandLayers.AddRange(snapshot.IslandLayers);
+
+        _pendingHtmlBuffer.Clear();
+        if (snapshot.PendingHtml.Length > 0)
+        {
+            _pendingHtmlBuffer.Append(snapshot.PendingHtml);
+        }
+
+        _pendingStyledRuns.Clear();
+        _pendingStyledRuns.AddRange(snapshot.PendingStyledRuns);
+
+        _nextLogicalLineId = snapshot.NextLogicalLineId;
+        _buttonGeneration = snapshot.ButtonGeneration;
+        _logicalLineCount = snapshot.LogicalLineCount;
+        _totalPhysicalLineNo = snapshot.TotalPhysicalLineNo;
+        _scrollOffsetLines = snapshot.ScrollOffsetLines;
+        _pendingInPlaceReplacement = snapshot.PendingInPlaceReplacement;
+        _cbgButtonMapGraphicsId = snapshot.CbgButtonMapGraphicsId;
+        _tooltip = snapshot.Tooltip;
+        Viewport = snapshot.Viewport;
+        CurrentFontFamily = snapshot.CurrentFontFamily;
+        CurrentForeColorRgba = snapshot.CurrentForeColorRgba;
+        CurrentBackColorRgba = snapshot.CurrentBackColorRgba;
+        FocusColorRgba = snapshot.FocusColorRgba;
+        Alignment = snapshot.Alignment;
+        FontStyle = snapshot.FontStyle;
+        SamplingMode = snapshot.SamplingMode;
+        ReplaceBackslashWithYen = snapshot.ReplaceBackslashWithYen;
+        ButtonWrap = snapshot.ButtonWrap;
+        ExpandTabs = snapshot.ExpandTabs;
+        LastOutputWasInPlaceReplacement = snapshot.LastOutputWasInPlaceReplacement;
+
+        InvalidatePendingCache();
+    }
 
     private void TrimLogIfNeeded()
     {

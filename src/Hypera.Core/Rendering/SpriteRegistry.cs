@@ -59,6 +59,17 @@ public sealed class SpriteDefinition
             Height = frame.SourceRect.Height;
         }
     }
+
+    internal SpriteDefinition Clone()
+    {
+        var copy = new SpriteDefinition(Name, Width, Height, PosX, PosY, IsAnimated, IsDynamic);
+        for (int i = 0; i < _frames.Count; i++)
+        {
+            copy._frames.Add(_frames[i]);
+        }
+
+        return copy;
+    }
 }
 
 /// <summary>
@@ -78,8 +89,14 @@ public sealed class SpriteRegistry : IDisposable
         public required LinkedListNode<string> LruNode { get; init; }
     }
 
+    internal sealed class SpriteUndoDelta
+    {
+        public Dictionary<string, SpriteDefinition?> OriginalSprites { get; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
     private readonly object _cacheSync = new();
     private readonly Dictionary<string, SpriteDefinition> _sprites = new(StringComparer.OrdinalIgnoreCase);
+    private SpriteUndoDelta? _activeUndoDelta;
     private readonly Dictionary<string, DecodedCacheEntry> _decodedFileCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly LinkedList<string> _lruOrder = new();
     private readonly Dictionary<string, ImageHeaderInfo> _headerCache = new(StringComparer.OrdinalIgnoreCase);
@@ -162,7 +179,50 @@ public sealed class SpriteRegistry : IDisposable
         }
     }
 
+    internal SpriteUndoDelta BeginUndoDelta()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var delta = new SpriteUndoDelta();
+        _activeUndoDelta = delta;
+        return delta;
+    }
+
+    internal void DetachUndoDelta() => _activeUndoDelta = null;
+
+    internal void RestoreUndoDelta(SpriteUndoDelta delta)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _activeUndoDelta = null;
+        foreach (KeyValuePair<string, SpriteDefinition?> kv in delta.OriginalSprites)
+        {
+            if (kv.Value is not null)
+            {
+                SetSpriteRaw(kv.Key, kv.Value);
+            }
+            else
+            {
+                RemoveSpriteRaw(kv.Key);
+            }
+        }
+    }
+
+    private void RecordSpriteBeforeMutation(string key)
+    {
+        if (_activeUndoDelta is not null && !_activeUndoDelta.OriginalSprites.ContainsKey(key))
+        {
+            _activeUndoDelta.OriginalSprites[key] = _sprites.TryGetValue(key, out SpriteDefinition? existing)
+                ? existing.Clone()
+                : null;
+        }
+    }
+
     private void SetSpriteInternal(string key, SpriteDefinition def)
+    {
+        RecordSpriteBeforeMutation(key);
+        SetSpriteRaw(key, def);
+    }
+
+    private void SetSpriteRaw(string key, SpriteDefinition def)
     {
         if (_sprites.TryGetValue(key, out SpriteDefinition? previous) && previous.IsAnimated)
         {
@@ -177,6 +237,17 @@ public sealed class SpriteRegistry : IDisposable
     }
 
     private bool RemoveSpriteInternal(string key)
+    {
+        if (!_sprites.ContainsKey(key))
+        {
+            return false;
+        }
+
+        RecordSpriteBeforeMutation(key);
+        return RemoveSpriteRaw(key);
+    }
+
+    private bool RemoveSpriteRaw(string key)
     {
         if (_sprites.Remove(key, out SpriteDefinition? removed))
         {
@@ -395,8 +466,9 @@ public sealed class SpriteRegistry : IDisposable
         int delayMs = 100)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (string.IsNullOrWhiteSpace(name) ||
-            !_sprites.TryGetValue(name.Trim(), out SpriteDefinition? def) ||
+        string key = name.Trim();
+        if (string.IsNullOrWhiteSpace(key) ||
+            !_sprites.TryGetValue(key, out SpriteDefinition? def) ||
             !def.IsAnimated ||
             width <= 0 ||
             height <= 0)
@@ -404,6 +476,7 @@ public sealed class SpriteRegistry : IDisposable
             return false;
         }
 
+        RecordSpriteBeforeMutation(key);
         def.AddFrame(new SpriteFrameSpec(null, graphicsId, SKRectI.Create(x, y, width, height), posX, posY, Math.Max(1, delayMs)));
         return true;
     }
@@ -474,6 +547,14 @@ public sealed class SpriteRegistry : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!onlyDynamic)
         {
+            if (_activeUndoDelta is not null)
+            {
+                foreach (string k in _sprites.Keys)
+                {
+                    RecordSpriteBeforeMutation(k);
+                }
+            }
+
             _sprites.Clear();
             _animatedSpriteCount = 0;
             return;
@@ -506,6 +587,7 @@ public sealed class SpriteRegistry : IDisposable
             return false;
         }
 
+        RecordSpriteBeforeMutation(name.Trim());
         d.PosX = posX;
         d.PosY = posY;
         return true;
@@ -518,6 +600,7 @@ public sealed class SpriteRegistry : IDisposable
             return false;
         }
 
+        RecordSpriteBeforeMutation(name.Trim());
         d.PosX += deltaX;
         d.PosY += deltaY;
         return true;

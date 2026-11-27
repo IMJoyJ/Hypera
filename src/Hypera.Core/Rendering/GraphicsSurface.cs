@@ -643,6 +643,20 @@ public sealed class GraphicsSurface : IDisposable
             _ => isScaled ? SkiaFrameCompositor.SmoothSampling : SkiaFrameCompositor.CrispSampling,
         };
 
+    internal GraphicsSurface Clone()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        SKBitmap copy = _bitmap.Copy();
+        var cloned = new GraphicsSurface(Id, copy, BrushColor, Font.FamilyName, (int)MathF.Round(Font.Size));
+        cloned.BrushColor = BrushColor;
+        cloned.PenColor = PenColor;
+        cloned.PenWidth = PenWidth;
+        cloned.DashStyle = DashStyle;
+        cloned.DashCap = DashCap;
+        cloned.Font = Font.Copy();
+        return cloned;
+    }
+
     public void Dispose()
     {
         if (_disposed)

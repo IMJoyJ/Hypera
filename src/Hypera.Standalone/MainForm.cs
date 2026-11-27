@@ -21,6 +21,7 @@ public sealed class MainForm : Form
 {
     private readonly StandaloneLaunchOptions _initialOptions;
     private readonly MenuStrip _menuStrip;
+    private readonly ToolStripMenuItem _undoMenuItem;
     private readonly ToolStripMenuItem _muteMenuItem;
     private readonly ToolStripMenuItem _fullscreenMenuItem;
     private readonly Panel _viewportHostPanel;
@@ -58,6 +59,7 @@ public sealed class MainForm : Form
     private bool _menuWasVisibleBeforeFullscreen;
     private string _windowPrefPath;
     private WindowStatePreference _windowPref;
+    private UndoPreference _undoPref;
     private bool _desiredMaximized;
     private bool _hasPersistedNormalBounds;
     private bool _isWindowShown;
@@ -71,7 +73,9 @@ public sealed class MainForm : Form
         _windowPrefPath = WindowStatePreferenceStore.ResolveFilePath(
             initialOptions.Target.SaveDirectory,
             AppContext.BaseDirectory);
-        _windowPref = WindowStatePreferenceStore.Load(_windowPrefPath);
+        HyperaHostConfig hostConfig = WindowStatePreferenceStore.LoadConfig(_windowPrefPath);
+        _windowPref = hostConfig.Window ?? WindowStatePreference.Default;
+        _undoPref = hostConfig.Undo ?? UndoPreference.Default;
         _desiredMaximized = _windowPref.IsMaximized;
         _hasPersistedNormalBounds = _windowPref.HasNormalSize;
 
@@ -125,12 +129,17 @@ public sealed class MainForm : Form
         ]);
 
         var editMenu = new ToolStripMenuItem("&Edit");
+        _undoMenuItem = new ToolStripMenuItem("&Undo Last Input", null, OnUndoLastInputClick)
+        {
+            ShortcutKeys = Keys.Alt | Keys.Left,
+            Enabled = false,
+        };
         var copyLogItem = new ToolStripMenuItem("&Copy Console Text", null, OnCopyConsoleTextClick)
         {
             ShortcutKeys = Keys.Control | Keys.Shift | Keys.C,
         };
         var clearInputItem = new ToolStripMenuItem("Clear Input Box", null, OnClearInputClick);
-        editMenu.DropDownItems.AddRange([copyLogItem, clearInputItem]);
+        editMenu.DropDownItems.AddRange([_undoMenuItem, new ToolStripSeparator(), copyLogItem, clearInputItem]);
 
         var viewMenu = new ToolStripMenuItem("&View");
         var scrollBottomItem = new ToolStripMenuItem("Scroll to Bottom", null, OnScrollToBottomClick)
@@ -829,6 +838,9 @@ public sealed class MainForm : Form
         _windowPrefPath = WindowStatePreferenceStore.ResolveFilePath(
             session.Target.SaveDirectory,
             AppContext.BaseDirectory);
+        HyperaHostConfig sessionConfig = WindowStatePreferenceStore.LoadConfig(_windowPrefPath);
+        _undoPref = sessionConfig.Undo ?? UndoPreference.Default;
+        session.Engine.MaxUndoSteps = _undoPref.NormalizedMaxSteps;
 
         if (!_isFullscreen)
         {
@@ -1100,6 +1112,21 @@ public sealed class MainForm : Form
         {
             _statusLabel.Text = text;
         }
+
+        UpdateUndoMenuState(engine);
+    }
+
+    private void UpdateUndoMenuState(EmueraEngine? engine)
+    {
+        if (engine is null || _isLoading || engine.MaxUndoSteps <= 0)
+        {
+            _undoMenuItem.Enabled = false;
+            _undoMenuItem.Text = "&Undo Last Input";
+            return;
+        }
+
+        _undoMenuItem.Enabled = engine.CanUndo;
+        _undoMenuItem.Text = $"&Undo Last Input ({engine.UndoCount}/{engine.MaxUndoSteps})";
     }
 
     private string FormatWaitingStatus(InputRequest req)
@@ -1309,6 +1336,18 @@ public sealed class MainForm : Form
 
     private void OnGlobalKeyDown(object? sender, KeyEventArgs e)
     {
+        if (e.Modifiers == Keys.Control &&
+            e.KeyCode == Keys.Z &&
+            !_isLoading &&
+            !(_inputTextBox.Focused && _inputTextBox.TextLength > 0) &&
+            _session?.Engine.CanUndo == true)
+        {
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            PerformManualUndo();
+            return;
+        }
+
         _session?.Engine.SetKeyState((int)e.KeyCode, true);
 
         // If user starts typing while the Skia canvas has focus, route smoothly to the Emuera input box
@@ -1329,6 +1368,22 @@ public sealed class MainForm : Form
         _session?.Engine.SetKeyState((int)e.KeyCode, false);
     }
 
+    private void OnUndoLastInputClick(object? sender, EventArgs e) => PerformManualUndo();
+
+    private void PerformManualUndo()
+    {
+        if (_isLoading || _session is null || !_session.Engine.CanUndo)
+        {
+            return;
+        }
+
+        if (_skiaView.TryUndoEngine())
+        {
+            _inputTextBox.Clear();
+            FocusInputTextBox();
+        }
+    }
+
     private void OnEngineFaulted(object? sender, Exception ex)
     {
         if (_session is null)
@@ -1336,13 +1391,51 @@ public sealed class MainForm : Form
             return;
         }
 
-        string details = StandaloneGameSession.FormatRuntimeFault(ex, _session.Engine);
+        EmueraEngine engine = _session.Engine;
+        string details = StandaloneGameSession.FormatRuntimeFault(ex, engine);
+        bool canUndo = engine.CanUndo;
+        bool autoRollback = _undoPref.AutoRollbackOnError && canUndo;
+
         BeginInvoke(() =>
         {
-            using var dlg = new DiagnosticsDialog("Hypera Runtime Fault", details, showRestartButton: true);
-            if (dlg.ShowDialog(this) == DialogResult.Retry)
+            if (IsDisposed || _session is null || !ReferenceEquals(_session.Engine, engine))
+            {
+                return;
+            }
+
+            if (autoRollback && _skiaView.TryUndoEngine())
+            {
+                _inputTextBox.Clear();
+                string banner = "[Auto-Rollback] Engine state has been restored to before your last input. Close this dialog to continue.\r\n\r\n";
+                using var dlg = new DiagnosticsDialog(
+                    "Hypera Runtime Fault (Auto-Rolled Back)",
+                    banner + details,
+                    showRestartButton: true);
+                if (dlg.ShowDialog(this) == DialogResult.Retry)
+                {
+                    RestartCurrentTarget();
+                }
+                else
+                {
+                    FocusInputTextBox();
+                }
+
+                return;
+            }
+
+            using var fallbackDlg = new DiagnosticsDialog(
+                "Hypera Runtime Fault",
+                details,
+                showRestartButton: true,
+                showUndoButton: canUndo);
+            DialogResult res = fallbackDlg.ShowDialog(this);
+            if (res == DialogResult.Retry)
             {
                 RestartCurrentTarget();
+            }
+            else if (res == DialogResult.Ignore)
+            {
+                PerformManualUndo();
             }
         });
     }

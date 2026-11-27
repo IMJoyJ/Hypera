@@ -1222,7 +1222,10 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
 
         ushort aux = BytecodeAbi.PackBuiltinArgTags(tags);
         OpCode op = bm.Method.ReturnKind == VariableValueKind.Str ? OpCode.BuiltinCallStr : OpCode.BuiltinCallInt;
-        insn = Instruction.Reg4(op, 0, intBase, strBase, (ushort)count, (int)bm.Method.Kind, aux);
+        BuiltinMethodKind emittedKind = bm.Method.Kind == BuiltinMethodKind.RAND && engine.Module.CompilerOptions.UseNewRandom
+            ? BuiltinMethodKind.RandNew
+            : bm.Method.Kind;
+        insn = Instruction.Reg4(op, 0, intBase, strBase, (ushort)count, (int)emittedKind, aux);
     }
 
     private long EvalUserMethodInt(UserMethodCallExpr um, EmueraEngine engine, CallFrame? activeFrame)

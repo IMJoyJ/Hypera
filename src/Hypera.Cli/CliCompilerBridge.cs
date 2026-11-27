@@ -11,20 +11,23 @@ namespace Hypera.Cli;
 /// </summary>
 public static class CliCompilerBridge
 {
-    public static BytecodeModule CompileDirectory(string gameDirectory)
+    public static BytecodeModule CompileDirectory(string gameDirectory, bool? useNewRandomOverride = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(gameDirectory);
         using var vfs = new PhysicalDirectoryVfs(gameDirectory);
-        return CompileVfs(vfs);
+        return CompileVfs(vfs, useNewRandomOverride);
     }
 
-    public static BytecodeModule CompileVfs(IVirtualFileSystem vfs)
+    public static BytecodeModule CompileVfs(IVirtualFileSystem vfs, bool? useNewRandomOverride = null)
     {
         ArgumentNullException.ThrowIfNull(vfs);
         ConfigLoadResult config = ConfigLoader.Default.Load(vfs);
-        GameData gameData = CsvGameDataLoader.Default.Load(vfs, config.CompilerOptions);
-        CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, config.CompilerOptions.IgnoreCase);
-        var compiler = new ErbProjectCompiler(config.CompilerOptions, external);
+        Configuration.CompilerOptions compilerOptions = useNewRandomOverride.HasValue
+            ? config.CompilerOptions with { UseNewRandom = useNewRandomOverride.Value }
+            : config.CompilerOptions;
+        GameData gameData = CsvGameDataLoader.Default.Load(vfs, compilerOptions);
+        CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, compilerOptions.IgnoreCase);
+        var compiler = new ErbProjectCompiler(compilerOptions, external);
         return compiler.CompileProject(vfs, throwOnError: true).Module;
     }
 }

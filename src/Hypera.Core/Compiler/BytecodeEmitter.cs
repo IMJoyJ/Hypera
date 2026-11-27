@@ -1186,7 +1186,10 @@ internal sealed class FunctionBytecodeEmitter
 
         ushort aux = BytecodeAbi.PackBuiltinArgTags(tags);
         OpCode callOp = bm.Method.ReturnKind == VariableValueKind.Str ? OpCode.BuiltinCallStr : OpCode.BuiltinCallInt;
-        _module.Emit(Instruction.Reg4(callOp, dstReg, intBase, strBase, (ushort)bm.Arguments.Length, (int)bm.Method.Kind, aux));
+        BuiltinMethodKind emittedKind = bm.Method.Kind == BuiltinMethodKind.RAND && _module.Symbols.Options.UseNewRandom
+            ? BuiltinMethodKind.RandNew
+            : bm.Method.Kind;
+        _module.Emit(Instruction.Reg4(callOp, dstReg, intBase, strBase, (ushort)bm.Arguments.Length, (int)emittedKind, aux));
         ReleaseTempRegs(mark);
     }
 

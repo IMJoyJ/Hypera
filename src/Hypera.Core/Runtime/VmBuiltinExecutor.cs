@@ -541,11 +541,16 @@ internal static partial class VmBuiltinExecutor
                 throw new KeyNotFoundException($"Unknown CSV/ERD keyword '{key}' for variable '{varName}'.");
             }
 
-            // Math & RNG
+            // Math & RNG (two distinct compile-time instructions: RAND=SFMT rollbackable, RandNew=System.Random live)
             case BuiltinMethodKind.RAND:
                 return w.Count <= 1
-                    ? vars.Random.NextInt64(w.GetInt(0))
-                    : vars.Random.NextInt64(w.GetInt(0, 0L), w.GetInt(1));
+                    ? vars.Random.NextSfmtInt64(w.GetInt(0))
+                    : vars.Random.NextSfmtInt64(w.GetInt(0, 0L), w.GetInt(1));
+
+            case BuiltinMethodKind.RandNew:
+                return w.Count <= 1
+                    ? vars.Random.NextNewInt64(w.GetInt(0))
+                    : vars.Random.NextNewInt64(w.GetInt(0, 0L), w.GetInt(1));
 
             case BuiltinMethodKind.ABS:
                 return SpanBuiltins.Abs(w.GetInt(0));

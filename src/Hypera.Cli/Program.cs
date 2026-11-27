@@ -99,7 +99,7 @@ public static class Program
     {
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: hypera compile <game-directory> [-o <output.heb>]");
+            Console.Error.WriteLine("Usage: hypera compile <game-directory> [-o <output.heb>] [--new-random | --old-random]");
             return 2;
         }
 
@@ -110,13 +110,19 @@ public static class Program
             return 2;
         }
 
+        if (!TryParseRandomModeOverride(args[1..], out bool? useNewRandomOverride, out string? randomModeError))
+        {
+            Console.Error.WriteLine($"[hypera] {randomModeError}");
+            return 2;
+        }
+
         string outputPath = ParseOptionValue(args[1..], "-o", "--output")
             ?? Path.Combine(Path.GetFullPath(sourceDir), "game.heb");
 
         BytecodeModule module;
         try
         {
-            module = CliCompilerBridge.CompileDirectory(sourceDir);
+            module = CliCompilerBridge.CompileDirectory(sourceDir, useNewRandomOverride);
         }
         catch (EmueraCompileException ex)
         {
@@ -139,7 +145,7 @@ public static class Program
     {
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: hypera pack <game-directory> [-o <output.hep>] [--no-compress] [--compiled-only] [--exclude <path>]...");
+            Console.Error.WriteLine("Usage: hypera pack <game-directory> [-o <output.hep>] [--no-compress] [--compiled-only] [--new-random | --old-random] [--exclude <path>]...");
             return 2;
         }
 
@@ -147,6 +153,12 @@ public static class Program
         if (!Directory.Exists(sourceDir))
         {
             Console.Error.WriteLine($"[hypera] Directory not found: '{sourceDir}'.");
+            return 2;
+        }
+
+        if (!TryParseRandomModeOverride(args[1..], out bool? useNewRandomOverride, out string? randomModeError))
+        {
+            Console.Error.WriteLine($"[hypera] {randomModeError}");
             return 2;
         }
 
@@ -160,7 +172,7 @@ public static class Program
         BytecodeModule? module;
         try
         {
-            module = CliCompilerBridge.CompileDirectory(sourceDir);
+            module = CliCompilerBridge.CompileDirectory(sourceDir, useNewRandomOverride);
         }
         catch (EmueraCompileException ex)
         {
@@ -330,14 +342,30 @@ public static class Program
         return version is not null ? $"{version.Major}.{version.Minor}.{version.Build}" : "1.0.0";
     }
 
+    private static bool TryParseRandomModeOverride(string[] args, out bool? useNewRandom, out string? error)
+    {
+        bool hasNew = args.Contains("--new-random", StringComparer.OrdinalIgnoreCase);
+        bool hasOld = args.Contains("--old-random", StringComparer.OrdinalIgnoreCase);
+        if (hasNew && hasOld)
+        {
+            useNewRandom = null;
+            error = "Cannot specify both '--new-random' and '--old-random' at the same time.";
+            return false;
+        }
+
+        useNewRandom = hasNew ? true : hasOld ? false : null;
+        error = null;
+        return true;
+    }
+
     private static void PrintUsage()
     {
         Console.WriteLine("Hypera Engine CLI (hypera)");
         Console.WriteLine();
         Console.WriteLine("Usage:");
         Console.WriteLine("  hypera run <path> [--headless-frames <dir>]            Run a game directory, .heb, .hep, or .zip");
-        Console.WriteLine("  hypera compile <dir> [-o <out.heb>]                    Compile scripts to .heb bytecode");
-        Console.WriteLine("  hypera pack <dir> [-o <out.hep>] [--compiled-only] [--exclude <p>]  Pack into a .hep archive");
+        Console.WriteLine("  hypera compile <dir> [-o <out.heb>] [--new-random|--old-random]  Compile scripts to .heb bytecode");
+        Console.WriteLine("  hypera pack <dir> [-o <out.hep>] [--compiled-only] [--new-random|--old-random] [--exclude <p>]  Pack into a .hep archive");
         Console.WriteLine("  hypera bundle <heb-or-hep> --host <exe> -o <Game.exe>  Create single-file HYPRBNDL executable");
     }
 }

@@ -12,7 +12,8 @@ public sealed class DiagnosticsDialog : Form
     public DiagnosticsDialog(
         string title,
         string bodyText,
-        bool showRestartButton = false)
+        bool showRestartButton = false,
+        bool showUndoButton = false)
     {
         Text = title;
         StartPosition = FormStartPosition.CenterParent;
@@ -95,6 +96,21 @@ public sealed class DiagnosticsDialog : Form
                 ForeColor = Color.White,
             };
             buttonPanel.Controls.Add(restartBtn);
+        }
+
+        if (showUndoButton)
+        {
+            var undoBtn = new Button
+            {
+                Text = "Undo Last Input",
+                DialogResult = DialogResult.Ignore,
+                Width = 128,
+                Height = 28,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(148, 96, 36),
+                ForeColor = Color.White,
+            };
+            buttonPanel.Controls.Add(undoBtn);
         }
 
         Controls.Add(textBox);

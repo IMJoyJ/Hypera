@@ -29,14 +29,28 @@ public sealed record WindowStatePreference(
 }
 
 /// <summary>
+/// Persisted desktop host undo / state-rollback configuration under <c>"undo"</c> in <c>config.json</c>.
+/// </summary>
+public sealed record UndoPreference(
+    int MaxSteps = 1,
+    bool AutoRollbackOnError = true)
+{
+    public static UndoPreference Default { get; } = new(MaxSteps: 1, AutoRollbackOnError: true);
+
+    [JsonIgnore]
+    public int NormalizedMaxSteps => Math.Max(0, MaxSteps);
+}
+
+/// <summary>
 /// Extensible root desktop host configuration persisted in <c>config.json</c>.
-/// Keeps window layout isolated under the <c>"window"</c> section so future options
-/// can be added cleanly alongside it without breaking existing user files.
+/// Keeps window layout under <c>"window"</c> and rollback preferences under <c>"undo"</c>
+/// so future options can be added cleanly alongside them without breaking existing user files.
 /// </summary>
 public sealed record HyperaHostConfig(
-    WindowStatePreference? Window = null)
+    WindowStatePreference? Window = null,
+    UndoPreference? Undo = null)
 {
-    public static HyperaHostConfig Default { get; } = new(WindowStatePreference.Default);
+    public static HyperaHostConfig Default { get; } = new(WindowStatePreference.Default, UndoPreference.Default);
 
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtensionData { get; init; }
@@ -118,6 +132,10 @@ public static class WindowStatePreferenceStore
             // Preserve any sibling top-level sections already present in config.json.
             JsonObject root = TryReadExistingRootObject(fullPath) ?? new JsonObject();
             root["window"] = JsonSerializer.SerializeToNode(preference, s_jsonOptions);
+            if (!ContainsKeyIgnoreCase(root, "undo"))
+            {
+                root["undo"] = JsonSerializer.SerializeToNode(UndoPreference.Default, s_jsonOptions);
+            }
 
             string json = root.ToJsonString(s_jsonOptions);
             WriteAtomicUtf8(fullPath, json);
@@ -147,9 +165,11 @@ public static class WindowStatePreferenceStore
                 Directory.CreateDirectory(parentDir);
             }
 
-            HyperaHostConfig normalized = config.Window is null
-                ? config with { Window = WindowStatePreference.Default }
-                : config;
+            HyperaHostConfig normalized = config with
+            {
+                Window = config.Window ?? WindowStatePreference.Default,
+                Undo = config.Undo ?? UndoPreference.Default,
+            };
             string json = JsonSerializer.Serialize(normalized, s_jsonOptions);
             WriteAtomicUtf8(fullPath, json);
             return true;
@@ -177,21 +197,26 @@ public static class WindowStatePreferenceStore
                 WindowStatePreference? win = windowElem.ValueKind == JsonValueKind.Object
                     ? windowElem.Deserialize<WindowStatePreference>(s_jsonOptions)
                     : WindowStatePreference.Default;
+                UndoPreference undo = parsed?.Undo ?? UndoPreference.Default;
                 return parsed is not null
-                    ? parsed with { Window = win ?? WindowStatePreference.Default }
-                    : new HyperaHostConfig(win ?? WindowStatePreference.Default);
+                    ? parsed with { Window = win ?? WindowStatePreference.Default, Undo = undo }
+                    : new HyperaHostConfig(win ?? WindowStatePreference.Default, undo);
             }
 
             // Defensively support flat legacy schema if a user renamed hypera.window.json -> config.json.
             if (LooksLikeFlatWindowSchema(doc.RootElement))
             {
                 WindowStatePreference? flat = doc.RootElement.Deserialize<WindowStatePreference>(s_jsonOptions);
-                return new HyperaHostConfig(flat ?? WindowStatePreference.Default);
+                return new HyperaHostConfig(flat ?? WindowStatePreference.Default, UndoPreference.Default);
             }
 
             HyperaHostConfig? rootOnly = JsonSerializer.Deserialize<HyperaHostConfig>(json, s_jsonOptions);
             return rootOnly is not null
-                ? rootOnly with { Window = rootOnly.Window ?? WindowStatePreference.Default }
+                ? rootOnly with
+                {
+                    Window = rootOnly.Window ?? WindowStatePreference.Default,
+                    Undo = rootOnly.Undo ?? UndoPreference.Default,
+                }
                 : HyperaHostConfig.Default;
         }
         catch

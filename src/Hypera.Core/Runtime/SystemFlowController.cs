@@ -139,6 +139,42 @@ public sealed class EventDispatchCursor
         _currentTier = 1;
     }
 
+    private EventDispatchCursor(
+        string eventName,
+        int callerStackDepth,
+        List<EventHandlerEntry>[] priorityTiers,
+        bool hasOnly,
+        int currentTier,
+        int indexInTier,
+        EventHandlerEntry? activeHandler)
+    {
+        EventName = eventName;
+        CallerStackDepth = callerStackDepth;
+        _priorityTiers = priorityTiers;
+        _hasOnly = hasOnly;
+        _currentTier = currentTier;
+        _indexInTier = indexInTier;
+        ActiveHandler = activeHandler;
+    }
+
+    internal EventDispatchCursor CloneSnapshot()
+    {
+        var tiersCopy = new List<EventHandlerEntry>[_priorityTiers.Length];
+        for (int i = 0; i < _priorityTiers.Length; i++)
+        {
+            tiersCopy[i] = [.. _priorityTiers[i]];
+        }
+
+        return new EventDispatchCursor(
+            EventName,
+            CallerStackDepth,
+            tiersCopy,
+            _hasOnly,
+            _currentTier,
+            _indexInTier,
+            ActiveHandler);
+    }
+
     public string EventName { get; }
     public int CallerStackDepth { get; }
     public EventHandlerEntry? ActiveHandler { get; private set; }
@@ -1250,6 +1286,85 @@ public sealed class SystemFlowController
         {
             if (chars.NowExSlotId >= 0) chars.ClearCharacterSlot(c, chars.NowExSlotId);
         }
+    }
+
+    internal sealed record SystemFlowUndoSnapshot(
+        SystemFlowState State,
+        SystemPhaseKind CurrentPhase,
+        bool IsAwaitingSystemInput,
+        int[] ComAbleMap,
+        int LastCheckedComCode,
+        int LastAddedDisplayCom,
+        int PrintedComColumns,
+        long DoTrainCom,
+        bool NeedWaitAfterEventComEnd,
+        long[] CallTrainCommands,
+        bool IsCallTrainActive,
+        SuspendedSystemSnapshot? SuspendedModalState,
+        int SaveDialogPage,
+        int PendingSaveTargetSlot,
+        bool[] SlotAvailableFlags);
+
+    internal SystemFlowUndoSnapshot CaptureUndoSnapshot()
+    {
+        SuspendedSystemSnapshot? modalCopy = null;
+        if (_suspendedModalState is { } m)
+        {
+            var frames = new List<CallFrame>(m.SavedCallStack.Count);
+            for (int i = 0; i < m.SavedCallStack.Count; i++)
+            {
+                frames.Add(m.SavedCallStack[i].CloneSnapshot());
+            }
+
+            var events = new List<EventDispatchCursor>(m.SavedEventStack.Count);
+            for (int i = 0; i < m.SavedEventStack.Count; i++)
+            {
+                events.Add(m.SavedEventStack[i].CloneSnapshot());
+            }
+
+            modalCopy = new SuspendedSystemSnapshot(m.FlowState, m.CurrentPhase, frames, events);
+        }
+
+        return new SystemFlowUndoSnapshot(
+            State: State,
+            CurrentPhase: CurrentPhase,
+            IsAwaitingSystemInput: IsAwaitingSystemInput,
+            ComAbleMap: _comAbleMap.Length > 0 ? [.. _comAbleMap] : [],
+            LastCheckedComCode: _lastCheckedComCode,
+            LastAddedDisplayCom: _lastAddedDisplayCom,
+            PrintedComColumns: _printedComColumns,
+            DoTrainCom: _doTrainCom,
+            NeedWaitAfterEventComEnd: _needWaitAfterEventComEnd,
+            CallTrainCommands: _callTrainCommands.Count > 0 ? _callTrainCommands.ToArray() : [],
+            IsCallTrainActive: _isCallTrainActive,
+            SuspendedModalState: modalCopy,
+            SaveDialogPage: _saveDialogPage,
+            PendingSaveTargetSlot: _pendingSaveTargetSlot,
+            SlotAvailableFlags: [.. _slotAvailableFlags]);
+    }
+
+    internal void RestoreUndoSnapshot(SystemFlowUndoSnapshot snapshot)
+    {
+        State = snapshot.State;
+        CurrentPhase = snapshot.CurrentPhase;
+        IsAwaitingSystemInput = snapshot.IsAwaitingSystemInput;
+        _comAbleMap = snapshot.ComAbleMap.Length > 0 ? [.. snapshot.ComAbleMap] : [];
+        _lastCheckedComCode = snapshot.LastCheckedComCode;
+        _lastAddedDisplayCom = snapshot.LastAddedDisplayCom;
+        _printedComColumns = snapshot.PrintedComColumns;
+        _doTrainCom = snapshot.DoTrainCom;
+        _needWaitAfterEventComEnd = snapshot.NeedWaitAfterEventComEnd;
+        _callTrainCommands.Clear();
+        for (int i = 0; i < snapshot.CallTrainCommands.Length; i++)
+        {
+            _callTrainCommands.Enqueue(snapshot.CallTrainCommands[i]);
+        }
+
+        _isCallTrainActive = snapshot.IsCallTrainActive;
+        _suspendedModalState = snapshot.SuspendedModalState;
+        _saveDialogPage = snapshot.SaveDialogPage;
+        _pendingSaveTargetSlot = snapshot.PendingSaveTargetSlot;
+        _slotAvailableFlags = [.. snapshot.SlotAvailableFlags];
     }
 
     private void ClearSourceArraysAfterCheck()

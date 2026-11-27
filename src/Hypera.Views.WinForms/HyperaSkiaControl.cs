@@ -277,6 +277,40 @@ public class HyperaSkiaControl : SKControl
     }
 
     /// <summary>
+    /// Rolls back the attached engine to the previous <c>INPUT*</c> checkpoint, clearing any fault/completion
+    /// flags and immediately refreshing the Skia viewport.
+    /// </summary>
+    public bool TryUndoEngine()
+    {
+        if (_engine is not { CanUndo: true } engine)
+        {
+            return false;
+        }
+
+        if (!engine.TryUndo())
+        {
+            return false;
+        }
+
+        _faultRaised = false;
+        _completionRaised = false;
+        _trackedGenerationId = -1;
+        _hasTimeoutDeadline = false;
+        _timeoutDeadlineTimestamp = 0;
+        _awaitResumeTimestamp = 0;
+        _frozenRedrawScene = null;
+        _lastRenderedScene = null;
+        _scrollbackOffset = 0;
+        engine.ConsoleBuffer.ScrollOffsetLines = 0;
+        _lastObservedFlushSeq = engine.RedrawFlushSequence;
+        ClearHoverState();
+        _pendingHoverRefresh = true;
+        Invalidate();
+        ContentUpdated?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
+    /// <summary>
     /// Submits a line of text (from the host input box or canvas buffer) to the waiting engine.
     /// Returns true if accepted by the engine.
     /// </summary>

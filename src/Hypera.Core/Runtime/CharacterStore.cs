@@ -38,8 +38,9 @@ public sealed class CharacterStore : ICharacterStore
         public required long[]?[] IntSlots { get; init; }
         public required string?[]?[] StrSlots { get; init; }
         public bool IsSp { get; set; }
+        public uint CowEpoch { get; set; }
 
-        public CharacterRecord CloneDeep()
+        public CharacterRecord CloneDeep(uint cowEpoch = 0)
         {
             var rawIntCopy = new long[]?[IntSlots.Length];
             for (int i = 0; i < IntSlots.Length; i++)
@@ -70,11 +71,18 @@ public sealed class CharacterStore : ICharacterStore
                 IntSlots = rawIntCopy,
                 StrSlots = strCopy,
                 IsSp = IsSp,
+                CowEpoch = cowEpoch,
             };
         }
     }
 
+    internal sealed record CharacterStoreUndoSnapshot(
+        CharacterRecord[] Characters,
+        CharacterSlotSchema[] IntSchemas,
+        CharacterSlotSchema[] StrSchemas);
+
     private readonly List<CharacterRecord> _characters = [];
+    private uint _cowEpoch;
     private readonly Dictionary<int, CharacterTemplate> _templates = [];
     private readonly Dictionary<int, CharacterTemplate> _spTemplates = [];
     private readonly List<CharacterSlotSchema> _intSchemas = [];
@@ -229,13 +237,14 @@ public sealed class CharacterStore : ICharacterStore
 
         for (int c = 0; c < _characters.Count; c++)
         {
+            CharacterRecord rec = EnsureMutableRecord(c);
             if (updated.ValueKind == VariableValueKind.Int)
             {
-                _characters[c].IntSlots[updated.DenseCharaVarIndex] = null;
+                rec.IntSlots[updated.DenseCharaVarIndex] = null;
             }
             else
             {
-                _characters[c].StrSlots[updated.DenseCharaVarIndex] = null;
+                rec.StrSlots[updated.DenseCharaVarIndex] = null;
             }
         }
     }
@@ -485,14 +494,14 @@ public sealed class CharacterStore : ICharacterStore
             return;
         }
 
-        _characters[destIndex] = _characters[sourceIndex].CloneDeep();
+        _characters[destIndex] = _characters[sourceIndex].CloneDeep(_cowEpoch);
     }
 
     public int AddCopyCharacter(int sourceIndex)
     {
         ValidateCharacterIndex(sourceIndex);
         int newIdx = _characters.Count;
-        _characters.Add(_characters[sourceIndex].CloneDeep());
+        _characters.Add(_characters[sourceIndex].CloneDeep(_cowEpoch));
         return newIdx;
     }
 
@@ -810,7 +819,7 @@ public sealed class CharacterStore : ICharacterStore
         }
 
         // Virtual StainDefault handles null arrays with zero allocation
-        _characters[characterIndex].IntSlots[stainSchema.DenseCharaVarIndex] = null;
+        EnsureMutableRecord(characterIndex).IntSlots[stainSchema.DenseCharaVarIndex] = null;
     }
 
     public void ClearCharacterSlot(int characterIndex, int slotId)
@@ -821,7 +830,7 @@ public sealed class CharacterStore : ICharacterStore
             return;
         }
 
-        CharacterRecord rec = _characters[characterIndex];
+        CharacterRecord rec = EnsureMutableRecord(characterIndex);
         if (schema.ValueKind == VariableValueKind.Int)
         {
             if (slotId == RelationSlotId && _replaceConfig.RelationDef != 0)
@@ -882,7 +891,7 @@ public sealed class CharacterStore : ICharacterStore
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetIntSchemaOrThrow(slotId);
         int flat = ComputeSubFlatIndex(schema, indices);
-        WriteRecordInt(_characters[characterIndex], schema, flat, value);
+        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, flat, value);
     }
 
     public string GetStr(int characterIndex, int slotId, ReadOnlySpan<long> indices = default)
@@ -898,7 +907,7 @@ public sealed class CharacterStore : ICharacterStore
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetStrSchemaOrThrow(slotId);
         int flat = ComputeSubFlatIndex(schema, indices);
-        WriteRecordStr(_characters[characterIndex], schema, flat, value);
+        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, flat, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -914,7 +923,7 @@ public sealed class CharacterStore : ICharacterStore
     {
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetIntSchemaOrThrow(slotId);
-        WriteRecordInt(_characters[characterIndex], schema, 0, value);
+        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, 0, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -952,7 +961,7 @@ public sealed class CharacterStore : ICharacterStore
                 ThrowSubIndexOutOfRange(schema, idx0);
             }
 
-            WriteRecordInt(_characters[characterIndex], schema, 0, value);
+            WriteRecordInt(EnsureMutableRecord(characterIndex), schema, 0, value);
             return;
         }
 
@@ -961,7 +970,7 @@ public sealed class CharacterStore : ICharacterStore
             ThrowSubIndexOutOfRange(schema, idx0);
         }
 
-        WriteRecordInt(_characters[characterIndex], schema, (int)idx0, value);
+        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, (int)idx0, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -987,7 +996,7 @@ public sealed class CharacterStore : ICharacterStore
             ThrowSubIndexOutOfRange(schema, idx0);
         }
 
-        WriteRecordInt(_characters[characterIndex], schema, ((int)idx0 * schema.Dim1) + (int)idx1, value);
+        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, ((int)idx0 * schema.Dim1) + (int)idx1, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1003,7 +1012,7 @@ public sealed class CharacterStore : ICharacterStore
     {
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetStrSchemaOrThrow(slotId);
-        WriteRecordStr(_characters[characterIndex], schema, 0, value);
+        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, 0, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1041,7 +1050,7 @@ public sealed class CharacterStore : ICharacterStore
                 ThrowSubIndexOutOfRange(schema, idx0);
             }
 
-            WriteRecordStr(_characters[characterIndex], schema, 0, value);
+            WriteRecordStr(EnsureMutableRecord(characterIndex), schema, 0, value);
             return;
         }
 
@@ -1050,7 +1059,7 @@ public sealed class CharacterStore : ICharacterStore
             ThrowSubIndexOutOfRange(schema, idx0);
         }
 
-        WriteRecordStr(_characters[characterIndex], schema, (int)idx0, value);
+        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, (int)idx0, value);
     }
 
     public string GetStr2D(int characterIndex, int slotId, long idx0, long idx1)
@@ -1074,21 +1083,21 @@ public sealed class CharacterStore : ICharacterStore
             ThrowSubIndexOutOfRange(schema, idx0);
         }
 
-        WriteRecordStr(_characters[characterIndex], schema, ((int)idx0 * schema.Dim1) + (int)idx1, value);
+        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, ((int)idx0 * schema.Dim1) + (int)idx1, value);
     }
 
     public long[] GetRawIntArray(int characterIndex, int slotId)
     {
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetIntSchemaOrThrow(slotId);
-        return EnsureFullIntArray(_characters[characterIndex], schema);
+        return EnsureFullIntArray(EnsureMutableRecord(characterIndex), schema);
     }
 
     public string[] GetRawStrArray(int characterIndex, int slotId)
     {
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetStrSchemaOrThrow(slotId);
-        return EnsureFullStrArray(_characters[characterIndex], schema);
+        return EnsureFullStrArray(EnsureMutableRecord(characterIndex), schema);
     }
 
     public Span<long> GetIntSpan(int characterIndex, int slotId) => GetRawIntArray(characterIndex, slotId).AsSpan();
@@ -1212,10 +1221,10 @@ public sealed class CharacterStore : ICharacterStore
         ReadRecordStr(_characters[characterIndex], schema, flat);
 
     internal void WriteFlatInt(int characterIndex, CharacterSlotSchema schema, int flat, long value) =>
-        WriteRecordInt(_characters[characterIndex], schema, flat, value);
+        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, flat, value);
 
     internal void WriteFlatStr(int characterIndex, CharacterSlotSchema schema, int flat, string? value) =>
-        WriteRecordStr(_characters[characterIndex], schema, flat, value);
+        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, flat, value);
 
     // -------------------------------------------------------------------------
     // CVARSET / CMATCH / SUMCARRAY / MAXCARRAY / MINCARRAY / INRANGECARRAY
@@ -1234,7 +1243,7 @@ public sealed class CharacterStore : ICharacterStore
         int flat = ComputeSubFlatIndex(schema, subIndices);
         for (int c = startChara; c < actualEnd; c++)
         {
-            WriteRecordInt(_characters[c], schema, flat, value);
+            WriteRecordInt(EnsureMutableRecord(c), schema, flat, value);
         }
     }
 
@@ -1251,7 +1260,7 @@ public sealed class CharacterStore : ICharacterStore
         int flat = ComputeSubFlatIndex(schema, subIndices);
         for (int c = startChara; c < actualEnd; c++)
         {
-            WriteRecordStr(_characters[c], schema, flat, value);
+            WriteRecordStr(EnsureMutableRecord(c), schema, flat, value);
         }
     }
 
@@ -1441,11 +1450,136 @@ public sealed class CharacterStore : ICharacterStore
         }
     }
 
+    internal CharacterStoreUndoSnapshot CaptureCowSnapshot()
+    {
+        AdvanceCowEpoch();
+        return new CharacterStoreUndoSnapshot(
+            _characters.ToArray(),
+            _intSchemas.ToArray(),
+            _strSchemas.ToArray());
+    }
+
+    internal void RestoreCowSnapshot(CharacterStoreUndoSnapshot snapshot)
+    {
+        _characters.Clear();
+        _characters.AddRange(snapshot.Characters);
+
+        bool schemaChanged = snapshot.IntSchemas.Length != _intSchemas.Count || snapshot.StrSchemas.Length != _strSchemas.Count;
+        if (!schemaChanged)
+        {
+            for (int i = 0; i < snapshot.IntSchemas.Length; i++)
+            {
+                if (!ReferenceEquals(snapshot.IntSchemas[i], _intSchemas[i]))
+                {
+                    schemaChanged = true;
+                    break;
+                }
+            }
+        }
+
+        if (!schemaChanged)
+        {
+            for (int i = 0; i < snapshot.StrSchemas.Length; i++)
+            {
+                if (!ReferenceEquals(snapshot.StrSchemas[i], _strSchemas[i]))
+                {
+                    schemaChanged = true;
+                    break;
+                }
+            }
+        }
+
+        if (schemaChanged)
+        {
+            _intSchemas.Clear();
+            _intSchemas.AddRange(snapshot.IntSchemas);
+            _strSchemas.Clear();
+            _strSchemas.AddRange(snapshot.StrSchemas);
+            _schemasByName.Clear();
+            Array.Clear(_slotLookup);
+            foreach (CharacterSlotSchema s in _intSchemas)
+            {
+                _schemasByName[s.Name] = s;
+                EnsureSlotLookupCapacity(s.GlobalSlotId);
+                _slotLookup[s.GlobalSlotId] = s;
+            }
+
+            foreach (CharacterSlotSchema s in _strSchemas)
+            {
+                _schemasByName[s.Name] = s;
+                EnsureSlotLookupCapacity(s.GlobalSlotId);
+                _slotLookup[s.GlobalSlotId] = s;
+            }
+        }
+
+        AdvanceCowEpoch();
+    }
+
+    internal bool TrySplitLiveCharacterForRef(object arrayRef, out object? newLiveArray)
+    {
+        for (int c = 0; c < _characters.Count; c++)
+        {
+            CharacterRecord rec = _characters[c];
+            for (int i = 0; i < rec.IntSlots.Length; i++)
+            {
+                if (ReferenceEquals(rec.IntSlots[i], arrayRef))
+                {
+                    CharacterRecord mutable = EnsureMutableRecord(c);
+                    newLiveArray = mutable.IntSlots[i];
+                    return newLiveArray is not null;
+                }
+            }
+
+            for (int i = 0; i < rec.StrSlots.Length; i++)
+            {
+                if (ReferenceEquals(rec.StrSlots[i], arrayRef))
+                {
+                    CharacterRecord mutable = EnsureMutableRecord(c);
+                    newLiveArray = mutable.StrSlots[i];
+                    return newLiveArray is not null;
+                }
+            }
+        }
+
+        newLiveArray = null;
+        return false;
+    }
+
+    private void AdvanceCowEpoch()
+    {
+        if (_cowEpoch == uint.MaxValue)
+        {
+            for (int i = 0; i < _characters.Count; i++)
+            {
+                _characters[i].CowEpoch = 0;
+            }
+
+            _cowEpoch = 1;
+            return;
+        }
+
+        _cowEpoch++;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private CharacterRecord EnsureMutableRecord(int characterIndex)
+    {
+        CharacterRecord rec = _characters[characterIndex];
+        if (rec.CowEpoch != _cowEpoch)
+        {
+            rec = rec.CloneDeep(_cowEpoch);
+            _characters[characterIndex] = rec;
+        }
+
+        return rec;
+    }
+
     private CharacterRecord AllocateBlankRecord() =>
         new()
         {
             IntSlots = new long[]?[_intSchemas.Count],
             StrSlots = new string?[]?[_strSchemas.Count],
+            CowEpoch = _cowEpoch,
         };
 
     private static void ApplyDefaultStainAndRelation(CharacterRecord record)

@@ -71,20 +71,27 @@ public sealed class SfmtRandom
 
     public long NextInt64(long max)
     {
+        return UseNewRandom ? NextNewInt64(max) : NextSfmtInt64(max);
+    }
+
+    public long NextInt64(long min, long max)
+    {
+        return UseNewRandom ? NextNewInt64(min, max) : NextSfmtInt64(min, max);
+    }
+
+    /// <summary>Draws from the deterministic SFMT-19937 stream (saved &amp; restored on engine state rollback).</summary>
+    public long NextSfmtInt64(long max)
+    {
         if (max <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(max), max, "RAND maximum must be positive.");
         }
 
-        if (UseNewRandom)
-        {
-            return _newRandom.NextInt64(max);
-        }
-
         return (long)(NextUInt64() % (ulong)max);
     }
 
-    public long NextInt64(long min, long max)
+    /// <summary>Draws from the deterministic SFMT-19937 stream (saved &amp; restored on engine state rollback).</summary>
+    public long NextSfmtInt64(long min, long max)
     {
         if (max <= min)
         {
@@ -92,12 +99,43 @@ public sealed class SfmtRandom
         }
 
         ulong span = unchecked((ulong)(max - min));
-        if (UseNewRandom)
+        return unchecked(min + (long)(NextUInt64() % span));
+    }
+
+    /// <summary>Draws from the live .NET Random stream (intentionally NOT restored on engine state rollback).</summary>
+    public long NextNewInt64(long max)
+    {
+        if (max <= 0)
         {
-            return min + (long)((ulong)_newRandom.NextInt64() % span);
+            throw new ArgumentOutOfRangeException(nameof(max), max, "RAND maximum must be positive.");
         }
 
-        return unchecked(min + (long)(NextUInt64() % span));
+        return _newRandom.NextInt64(max);
+    }
+
+    /// <summary>Draws from the live .NET Random stream (intentionally NOT restored on engine state rollback).</summary>
+    public long NextNewInt64(long min, long max)
+    {
+        if (max <= min)
+        {
+            throw new ArgumentOutOfRangeException(nameof(max), max, "RAND maximum must be strictly greater than minimum.");
+        }
+
+        ulong span = unchecked((ulong)(max - min));
+        return min + (long)((ulong)_newRandom.NextInt64() % span);
+    }
+
+    internal SfmtRandomSnapshot CaptureSfmtSnapshot()
+    {
+        var copy = new uint[N32];
+        _sfmt.AsSpan().CopyTo(copy);
+        return new SfmtRandomSnapshot(copy, _idx);
+    }
+
+    internal void RestoreSfmtSnapshot(SfmtRandomSnapshot snapshot)
+    {
+        snapshot.State.AsSpan().CopyTo(_sfmt);
+        _idx = snapshot.Index;
     }
 
     /// <summary>
@@ -224,3 +262,5 @@ public sealed class SfmtRandom
         while (a < N32);
     }
 }
+
+internal sealed record SfmtRandomSnapshot(uint[] State, int Index);
