@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Threading.Channels;
 using Hypera.Bytecode;
 using Hypera.Compiler;
 using Hypera.Data;
@@ -156,6 +157,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         {
             ObjectDisposedException.ThrowIf(session.IsDisposed, session);
             session.Touch();
+            session.MaxStepInstructionsPerTurn = maxInstructions;
 
             if (session.EffectiveStatus == EngineStepStatus.Faulted)
             {
@@ -169,12 +171,14 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 if (session.Host.Engine.Status == EngineStepStatus.Running)
                 {
                     ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, session.AutoRollbackOnError);
+                    session.BumpPumpEpochAndEnsurePump();
                 }
             }
             else if (session.Host.Engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded)
             {
                 session.ClearFaultNotice();
                 ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, session.AutoRollbackOnError);
+                session.BumpPumpEpochAndEnsurePump();
             }
 
             return session.BuildSnapshot();
@@ -202,6 +206,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             if (session.Host.Engine.TryUndo())
             {
                 session.ClearFaultNotice();
+                session.BumpPumpEpochAndEnsurePump();
             }
 
             return session.BuildSnapshot();
@@ -226,12 +231,14 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         {
             ObjectDisposedException.ThrowIf(session.IsDisposed, session);
             session.Touch();
+            session.MaxStepInstructionsPerTurn = maxInstructions;
 
             if (session.EffectiveStatus != EngineStepStatus.Faulted &&
                 session.Host.Engine.Status is EngineStepStatus.Yielded or EngineStepStatus.Running)
             {
                 session.ClearFaultNotice();
                 ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, session.AutoRollbackOnError);
+                session.BumpPumpEpochAndEnsurePump();
             }
 
             return session.BuildSnapshot();
@@ -259,7 +266,13 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             session.Touch();
 
             VirtualConsoleBuffer buffer = session.Host.Engine.ConsoleBuffer;
+            int prevOffset = buffer.ScrollOffsetLines;
             buffer.ScrollOffsetLines = scrollToBottom ? 0 : buffer.ScrollOffsetLines + deltaLines;
+            if (buffer.ScrollOffsetLines != prevOffset)
+            {
+                session.PublishSyntheticFrameLocked(DisplayFrameReason.Manual);
+            }
+
             return session.BuildSnapshot();
         }
         finally
@@ -273,6 +286,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         Guid userId,
         long elapsedAnimationMs = 0,
         long afterAudioEventSequence = 0,
+        bool acknowledgeFrame = true,
         CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -283,6 +297,8 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
 
         EnsureSessionOwner(session, userId);
 
+        long frameSeq;
+        RuntimeSessionRenderState state;
         await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -293,12 +309,14 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
 
             session.Touch();
             EmueraEngine engine = session.Host.Engine;
-            ConsoleScene scene = engine.ConsoleBuffer.CaptureScene(elapsedAnimationMs: elapsedAnimationMs);
+            ConsoleScene scene = engine.ConsoleBuffer.CaptureScene(
+                elapsedAnimationMs: elapsedAnimationMs,
+                includeDynamicAssetVersions: true);
             float[] lineTops = ConsoleHitTester.ComputeVisibleLineTops(scene);
             WebAudioStateSnapshot audio = session.AudioTracker.CaptureState(afterAudioEventSequence);
-            Dictionary<string, long> dynamicVersions = CollectDynamicAssetVersions(scene, engine.Graphics, engine.Sprites);
+            frameSeq = session.CurrentPublishedFrameSequence;
 
-            return new RuntimeSessionRenderState(
+            state = new RuntimeSessionRenderState(
                 Summary: session.BuildSummary(),
                 Scene: scene,
                 VisibleLineTops: lineTops,
@@ -307,14 +325,50 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 CustomFonts: session.CustomFonts,
                 FaultMessage: session.EffectiveFaultMessage,
                 AutoRolledBackOnFault: session.LastFaultAutoRolledBack,
-                DynamicAssetVersions: dynamicVersions,
+                DynamicAssetVersions: scene.DynamicAssetVersions,
                 ScrollOffsetLines: engine.ConsoleBuffer.ScrollOffsetLines,
-                MaxScrollOffsetLines: engine.ConsoleBuffer.MaxScrollOffsetLines);
+                MaxScrollOffsetLines: engine.ConsoleBuffer.MaxScrollOffsetLines,
+                FrameSequence: frameSeq);
         }
         finally
         {
             session.Gate.Release();
         }
+
+        if (acknowledgeFrame && frameSeq > 0)
+        {
+            session.AcknowledgeFrame(frameSeq);
+        }
+
+        return state;
+    }
+
+    public ISessionFrameSubscription SubscribeSessionFrames(
+        Guid sessionId,
+        Guid userId,
+        bool requireExplicitAck = false)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ManagedSession session = RequireActiveSession(sessionId, userId);
+        return session.AddFrameSubscription(requireExplicitAck);
+    }
+
+    public Task AcknowledgeSessionFrameAsync(
+        Guid sessionId,
+        Guid userId,
+        long frameSequence,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (_sessionsById.TryGetValue(sessionId, out ManagedSession? session) && !session.IsDisposed)
+        {
+            EnsureSessionOwner(session, userId);
+            session.AcknowledgeFrame(frameSequence);
+        }
+
+        return Task.CompletedTask;
     }
 
     public async Task<SessionAssetPayload?> ReadSessionAssetAsync(
@@ -367,11 +421,12 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         ManagedSession session = RequireActiveSession(sessionId, userId);
         int maxInstructions = await GetMaxStepInstructionsAsync(cancellationToken).ConfigureAwait(false);
 
-        await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ObjectDisposedException.ThrowIf(session.IsDisposed, session);
             session.Touch();
+            session.MaxStepInstructionsPerTurn = maxInstructions;
 
             EmueraEngine engine = session.Host.Engine;
             ConsoleScene scene = engine.ConsoleBuffer.CaptureScene();
@@ -398,6 +453,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     if (submitted)
                     {
                         ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, session.AutoRollbackOnError);
+                        session.BumpPumpEpochAndEnsurePump();
                     }
                 }
             }
@@ -692,10 +748,13 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     yieldDetector: yieldDetector,
                     customFonts: customFonts,
                     autoRollbackOnError: effectiveAutoRollback,
+                    maxStepInstructionsPerTurn: maxInstructions,
+                    stepWallClockTimeout: _hostOptions.StepWallClockTimeout,
                     pluginManager: pluginManager,
                     extractedPluginsDir: extractedPluginsTempDir);
 
                 ExecuteTurnWithBudgetLocked(managed, maxInstructions, _hostOptions.StepWallClockTimeout, effectiveAutoRollback);
+                managed.EnsureInitialFrameSequence();
 
                 _sessionsById[newSessionId] = managed;
                 _activeSessionByUserApp[(userId, appId)] = newSessionId;
@@ -798,42 +857,135 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         int remaining = Math.Max(1, maxInstructions);
         TimeSpan effectiveTimeout = wallClockTimeout > TimeSpan.Zero ? wallClockTimeout : TimeSpan.FromSeconds(5);
         var sw = Stopwatch.StartNew();
+        long seqBefore = session.CurrentPublishedFrameSequence;
 
-        while (remaining > 0)
+        session.SetSuppressSignalPush(true);
+        try
         {
-            int slice = Math.Min(StepSliceInstructions, remaining);
-            session.YieldDetector.Reset();
-
-            EngineStepStatus status = engine.Step(slice);
-            if (status is EngineStepStatus.WaitingInput or EngineStepStatus.Completed)
+            while (remaining > 0)
             {
-                return;
-            }
+                int slice = Math.Min(StepSliceInstructions, remaining);
+                session.YieldDetector.ResetTurnFlags();
 
-            if (status == EngineStepStatus.Faulted)
-            {
-                string faultMessage = FormatEngineFaultMessage(engine);
-                HandleFaultOrTimeoutLocked(session, faultMessage, autoRollbackOnError);
-                return;
-            }
+                EngineStepStatus status = engine.Step(slice);
+                int executed = Math.Max(1, engine.LastStepInstructionCount);
+                if (status is EngineStepStatus.WaitingInput or EngineStepStatus.Completed)
+                {
+                    break;
+                }
 
-            if (status == EngineStepStatus.Yielded && session.YieldDetector.SnapshotEmitted)
-            {
-                // Explicit script AWAIT / YieldFrame suspension.
-                return;
-            }
+                if (status == EngineStepStatus.Faulted)
+                {
+                    string faultMessage = FormatEngineFaultMessage(engine);
+                    HandleFaultOrTimeoutLocked(session, faultMessage, autoRollbackOnError, engineAlreadyEmittedFault: true);
+                    break;
+                }
 
-            remaining -= slice;
-            if (remaining <= 0 || sw.Elapsed >= effectiveTimeout)
-            {
-                string timeoutMessage = $"Execution aborted: turn exceeded step instruction limit ({maxInstructions}) or timeout ({effectiveTimeout.TotalMilliseconds:F0} ms) — possible infinite loop.";
-                HandleFaultOrTimeoutLocked(session, timeoutMessage, autoRollbackOnError);
-                return;
+                if (status == EngineStepStatus.Yielded && session.YieldDetector.ExplicitYieldEmitted)
+                {
+                    // Explicit script AWAIT / YieldFrame suspension.
+                    break;
+                }
+
+                remaining -= executed;
+                if (remaining <= 0 || sw.Elapsed >= effectiveTimeout)
+                {
+                    string timeoutMessage = $"Execution aborted: turn exceeded step instruction limit ({maxInstructions}) or timeout ({effectiveTimeout.TotalMilliseconds:F0} ms) — possible infinite loop.";
+                    HandleFaultOrTimeoutLocked(session, timeoutMessage, autoRollbackOnError, engineAlreadyEmittedFault: false);
+                    break;
+                }
             }
+        }
+        finally
+        {
+            session.SetSuppressSignalPush(false);
+        }
+
+        if (session.CurrentPublishedFrameSequence > seqBefore)
+        {
+            session.BroadcastLatestSignal();
         }
     }
 
-    private static void HandleFaultOrTimeoutLocked(ManagedSession session, string faultMessage, bool autoRollbackOnError)
+    private static void ExecuteLowRedrawAwaitBatchLocked(
+        ManagedSession session,
+        int maxInstructions,
+        TimeSpan wallClockTimeout,
+        bool autoRollbackOnError)
+    {
+        EmueraEngine engine = session.Host.Engine;
+        int remaining = Math.Max(1, maxInstructions);
+        TimeSpan effectiveTimeout = wallClockTimeout > TimeSpan.Zero ? wallClockTimeout : TimeSpan.FromSeconds(5);
+        var sw = Stopwatch.StartNew();
+        long seqBefore = session.CurrentPublishedFrameSequence;
+
+        session.SetSuppressSignalPush(true);
+        try
+        {
+            while (remaining > 0)
+            {
+                int slice = Math.Min(StepSliceInstructions, remaining);
+                session.YieldDetector.ResetTurnFlags();
+
+                EngineStepStatus status = engine.Step(slice);
+                int executed = Math.Max(1, engine.LastStepInstructionCount);
+                if (status is EngineStepStatus.WaitingInput or EngineStepStatus.Completed)
+                {
+                    break;
+                }
+
+                if (status == EngineStepStatus.Faulted)
+                {
+                    string faultMessage = FormatEngineFaultMessage(engine);
+                    HandleFaultOrTimeoutLocked(session, faultMessage, autoRollbackOnError, engineAlreadyEmittedFault: true);
+                    break;
+                }
+
+                if (status == EngineStepStatus.Yielded && session.YieldDetector.ExplicitYieldEmitted)
+                {
+                    remaining -= executed;
+                    if (remaining <= 0 || sw.Elapsed >= effectiveTimeout)
+                    {
+                        string timeoutMessage = $"Execution aborted: turn exceeded step instruction limit ({maxInstructions}) or timeout ({effectiveTimeout.TotalMilliseconds:F0} ms) — possible infinite loop.";
+                        HandleFaultOrTimeoutLocked(session, timeoutMessage, autoRollbackOnError, engineAlreadyEmittedFault: false);
+                        break;
+                    }
+
+                    if (engine.CurrentRedrawMode != 0 ||
+                        engine.LastAwaitMilliseconds > 1 ||
+                        sw.ElapsedMilliseconds >= 16)
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                remaining -= executed;
+                if (remaining <= 0 || sw.Elapsed >= effectiveTimeout)
+                {
+                    string timeoutMessage = $"Execution aborted: turn exceeded step instruction limit ({maxInstructions}) or timeout ({effectiveTimeout.TotalMilliseconds:F0} ms) — possible infinite loop.";
+                    HandleFaultOrTimeoutLocked(session, timeoutMessage, autoRollbackOnError, engineAlreadyEmittedFault: false);
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            session.SetSuppressSignalPush(false);
+        }
+
+        if (session.CurrentPublishedFrameSequence > seqBefore)
+        {
+            session.BroadcastLatestSignal();
+        }
+    }
+
+    private static void HandleFaultOrTimeoutLocked(
+        ManagedSession session,
+        string faultMessage,
+        bool autoRollbackOnError,
+        bool engineAlreadyEmittedFault)
     {
         EmueraEngine engine = session.Host.Engine;
         if (autoRollbackOnError && engine.CanUndo && engine.TryUndo())
@@ -843,6 +995,10 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         }
 
         session.MarkFaulted(faultMessage);
+        if (!engineAlreadyEmittedFault)
+        {
+            session.PublishSyntheticFrameLocked(DisplayFrameReason.Faulted);
+        }
     }
 
     private static string FormatEngineFaultMessage(EmueraEngine engine)
@@ -1051,107 +1207,6 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         var dst = new SKRect(0, 0, w, h);
         canvas.DrawImage(srcImg, src, dst, SkiaFrameCompositor.CrispSampling);
         return ImageCodecDecoder.EncodeToPng(cropped);
-    }
-
-    private static Dictionary<string, long> CollectDynamicAssetVersions(
-        ConsoleScene scene,
-        GraphicsManager graphics,
-        SpriteRegistry sprites)
-    {
-        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-
-        void RecordKey(string? raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                return;
-            }
-
-            string trimmed = raw.Trim();
-            if (trimmed.StartsWith("g:", StringComparison.OrdinalIgnoreCase) ||
-                trimmed.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase))
-            {
-                int colon = trimmed.IndexOf(':');
-                if (int.TryParse(trimmed[(colon + 1)..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int gId) &&
-                    graphics.TryGetSurfaceVersion(gId, out long surfVer))
-                {
-                    result[trimmed] = surfVer;
-                }
-
-                return;
-            }
-
-            if (trimmed.StartsWith("vfs:", StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            string spriteName = trimmed.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase)
-                ? trimmed["sprite:".Length..].Trim()
-                : trimmed;
-            string canonicalKey = $"sprite:{spriteName}";
-            if (result.ContainsKey(canonicalKey))
-            {
-                return;
-            }
-
-            if (sprites.TryGetAssetVersion(spriteName, graphics, out long spriteVer, out bool isDynamic) && isDynamic)
-            {
-                result[canonicalKey] = spriteVer;
-            }
-        }
-
-        void VisitLines(IReadOnlyList<ConsoleLine> lines)
-        {
-            for (int i = 0; i < lines.Count; i++)
-            {
-                IReadOnlyList<ConsoleRenderPart> parts = lines[i].Parts;
-                for (int p = 0; p < parts.Count; p++)
-                {
-                    ConsoleRenderPart part = parts[p];
-                    if (part.Kind == ConsolePartKind.Image)
-                    {
-                        RecordKey(part.ImageSrc);
-                        RecordKey(part.ImageSrcHover);
-                    }
-                    else if (part.Kind == ConsolePartKind.Div && part.Div is not null)
-                    {
-                        VisitLines(part.Div.Children);
-                    }
-                }
-            }
-        }
-
-        for (int i = 0; i < scene.BackgroundImages.Count; i++)
-        {
-            RecordKey(scene.BackgroundImages[i].SpriteName);
-        }
-
-        for (int i = 0; i < scene.CbgLayers.Count; i++)
-        {
-            CbgLayer cbg = scene.CbgLayers[i];
-            if (!string.IsNullOrWhiteSpace(cbg.SpriteName))
-            {
-                RecordKey(cbg.SpriteName);
-            }
-            else if (cbg.GraphicsId.HasValue)
-            {
-                RecordKey($"g:{cbg.GraphicsId.Value}");
-            }
-
-            if (!string.IsNullOrWhiteSpace(cbg.HoverSpriteName))
-            {
-                RecordKey(cbg.HoverSpriteName);
-            }
-        }
-
-        VisitLines(scene.VisibleLines);
-        for (int i = 0; i < scene.IslandLayers.Count; i++)
-        {
-            VisitLines(scene.IslandLayers[i].Lines);
-        }
-
-        return result;
     }
 
     private static IReadOnlyList<SessionFontDescriptor> DiscoverCustomFonts(IVirtualFileSystem vfs)
@@ -1412,19 +1467,87 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
 
     private sealed class TurnYieldDetector : IDisplaySnapshotSink
     {
-        public bool SnapshotEmitted { get; private set; }
+        public bool RequiresSnapshotMaterialization => false;
 
-        public void Reset() => SnapshotEmitted = false;
+        public bool ExplicitYieldEmitted { get; private set; }
+        public Action<DisplayFrameNotification>? FrameCallback { get; set; }
 
-        public void OnDisplaySnapshot(DisplaySnapshot snapshot) => SnapshotEmitted = true;
+        public void ResetTurnFlags() => ExplicitYieldEmitted = false;
+
+        public void OnFrameReady(DisplayFrameNotification notification)
+        {
+            if (notification.Reason is DisplayFrameReason.Await or DisplayFrameReason.Yield &&
+                notification.EngineStatus == EngineStepStatus.Yielded)
+            {
+                ExplicitYieldEmitted = true;
+            }
+
+            FrameCallback?.Invoke(notification);
+        }
+    }
+
+    private sealed class SessionFrameSubscription : ISessionFrameSubscription
+    {
+        private readonly ManagedSession _session;
+        private readonly Channel<SessionFrameSignal> _channel;
+        private int _disposed;
+
+        public SessionFrameSubscription(
+            ManagedSession session,
+            Guid sessionId,
+            Channel<SessionFrameSignal> channel,
+            bool requireExplicitAck)
+        {
+            _session = session;
+            SessionId = sessionId;
+            _channel = channel;
+            RequireExplicitAck = requireExplicitAck;
+        }
+
+        public Guid SessionId { get; }
+        public bool RequireExplicitAck { get; }
+        public ChannelReader<SessionFrameSignal> Frames => _channel.Reader;
+
+        public void TryPublish(SessionFrameSignal signal) => _channel.Writer.TryWrite(signal);
+
+        public void Complete() => _channel.Writer.TryComplete();
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _channel.Writer.TryComplete();
+                _session.RemoveFrameSubscription(this);
+            }
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Dispose();
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class ManagedSession
     {
         private readonly PluginManager? _pluginManager;
         private readonly string? _extractedPluginsDir;
+        private readonly TimeSpan _stepWallClockTimeout;
+        private readonly object _signalSync = new();
+        private readonly List<SessionFrameSubscription> _subscriptions = [];
+
         private long _lastActiveTicks;
-        private long _uiFrameSequence;
+        private long _publishedFrameSeq;
+        private long _ackedFrameSeq;
+        private long _pumpEpoch;
+        private long _lastYieldedAtTicks;
+        private long _pendingAwaitMs;
+        private EngineStepStatus _observedStatus;
+        private SessionFrameSignal? _latestSignal;
+        private bool _suppressSignalPush;
+        private bool _pumpRunning;
+        private CancellationTokenSource? _pumpCts;
+        private TaskCompletionSource<bool>? _ackWaiterTcs;
         private string? _faultOverrideMessage;
         private bool _forceFaulted;
         private bool _lastFaultAutoRolledBack;
@@ -1443,6 +1566,8 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             TurnYieldDetector yieldDetector,
             IReadOnlyList<SessionFontDescriptor> customFonts,
             bool autoRollbackOnError,
+            int maxStepInstructionsPerTurn,
+            TimeSpan stepWallClockTimeout,
             PluginManager? pluginManager,
             string? extractedPluginsDir)
         {
@@ -1458,12 +1583,16 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             YieldDetector = yieldDetector;
             CustomFonts = customFonts;
             AutoRollbackOnError = autoRollbackOnError;
+            MaxStepInstructionsPerTurn = Math.Max(1, maxStepInstructionsPerTurn);
+            _stepWallClockTimeout = stepWallClockTimeout;
             _pluginManager = pluginManager;
             _extractedPluginsDir = extractedPluginsDir;
 
             DateTime now = DateTime.UtcNow;
             CreatedAtUtc = now;
             _lastActiveTicks = now.Ticks;
+            _observedStatus = host.Engine.Status;
+            yieldDetector.FrameCallback = OnEngineFrameReady;
         }
 
         public Guid SessionId { get; }
@@ -1479,11 +1608,23 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         public IReadOnlyList<SessionFontDescriptor> CustomFonts { get; }
         public DateTime CreatedAtUtc { get; }
         public bool AutoRollbackOnError { get; }
+        public int MaxStepInstructionsPerTurn { get; set; }
         public SemaphoreSlim Gate { get; } = new(1, 1);
 
         public bool IsDisposed => Volatile.Read(ref _disposed);
 
         public DateTime LastActiveAtUtc => new(Interlocked.Read(ref _lastActiveTicks), DateTimeKind.Utc);
+
+        public long CurrentPublishedFrameSequence
+        {
+            get
+            {
+                lock (_signalSync)
+                {
+                    return _publishedFrameSeq;
+                }
+            }
+        }
 
         public EngineStepStatus EffectiveStatus =>
             _forceFaulted ? EngineStepStatus.Faulted : Host.Engine.Status;
@@ -1507,6 +1648,10 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             _forceFaulted = false;
             _faultOverrideMessage = message;
             _lastFaultAutoRolledBack = true;
+            lock (_signalSync)
+            {
+                _observedStatus = EffectiveStatus;
+            }
         }
 
         public void MarkFaulted(string message)
@@ -1514,6 +1659,474 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             _forceFaulted = true;
             _faultOverrideMessage = message;
             _lastFaultAutoRolledBack = false;
+            lock (_signalSync)
+            {
+                _observedStatus = EngineStepStatus.Faulted;
+            }
+        }
+
+        public void EnsureInitialFrameSequence()
+        {
+            lock (_signalSync)
+            {
+                if (_publishedFrameSeq == 0)
+                {
+                    _publishedFrameSeq = 1;
+                    _lastYieldedAtTicks = Stopwatch.GetTimestamp();
+                    _pendingAwaitMs = EffectiveStatus == EngineStepStatus.Yielded
+                        ? Host.Engine.LastAwaitMilliseconds
+                        : 0L;
+                }
+
+                _observedStatus = EffectiveStatus;
+            }
+        }
+
+        public void SetSuppressSignalPush(bool suppress)
+        {
+            lock (_signalSync)
+            {
+                _suppressSignalPush = suppress;
+            }
+        }
+
+        public void BroadcastLatestSignal()
+        {
+            SessionFrameSignal? signal;
+            lock (_signalSync)
+            {
+                signal = _latestSignal;
+            }
+
+            if (signal is not null)
+            {
+                BroadcastSignal(signal);
+            }
+        }
+
+        public void PublishSyntheticFrameLocked(DisplayFrameReason reason)
+        {
+            SessionFrameSignal signal;
+            bool pushNow;
+            EngineStepStatus status = EffectiveStatus;
+            lock (_signalSync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                long seq = ++_publishedFrameSeq;
+                long awaitMs = 0L;
+                if (reason == DisplayFrameReason.Manual && status == EngineStepStatus.Yielded)
+                {
+                    awaitMs = _pendingAwaitMs;
+                }
+                else
+                {
+                    _lastYieldedAtTicks = Stopwatch.GetTimestamp();
+                    _pendingAwaitMs = 0L;
+                }
+
+                _observedStatus = status;
+                signal = new SessionFrameSignal(
+                    SessionId: SessionId,
+                    FrameSequence: seq,
+                    FlushSequence: Host.Engine.RedrawFlushSequence,
+                    Reason: reason,
+                    EngineStatus: status,
+                    RedrawMode: Host.Engine.CurrentRedrawMode,
+                    AwaitMilliseconds: awaitMs);
+                _latestSignal = signal;
+                pushNow = !_suppressSignalPush;
+            }
+
+            if (pushNow)
+            {
+                BroadcastSignal(signal);
+            }
+        }
+
+        public ISessionFrameSubscription AddFrameSubscription(bool requireExplicitAck)
+        {
+            var channel = Channel.CreateBounded<SessionFrameSignal>(new BoundedChannelOptions(1)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false,
+            });
+            var sub = new SessionFrameSubscription(this, SessionId, channel, requireExplicitAck);
+
+            CancellationTokenSource? ctsToCancel;
+            TaskCompletionSource<bool>? waiterToCancel;
+            lock (_signalSync)
+            {
+                if (_disposed)
+                {
+                    sub.Complete();
+                    throw new ObjectDisposedException(nameof(ManagedSession));
+                }
+
+                _subscriptions.Add(sub);
+                (ctsToCancel, waiterToCancel) = EnsureYieldPumpLocked();
+            }
+
+            CancelDetachedHandles(ctsToCancel, waiterToCancel);
+            return sub;
+        }
+
+        public void RemoveFrameSubscription(SessionFrameSubscription subscription)
+        {
+            CancellationTokenSource? ctsToCancel = null;
+            TaskCompletionSource<bool>? waiterToRelease = null;
+            TaskCompletionSource<bool>? waiterToCancel = null;
+
+            lock (_signalSync)
+            {
+                _subscriptions.Remove(subscription);
+                if (!HasExplicitAckSubscriberLocked())
+                {
+                    waiterToRelease = _ackWaiterTcs;
+                    _ackWaiterTcs = null;
+                }
+
+                if (_subscriptions.Count == 0)
+                {
+                    (ctsToCancel, waiterToCancel) = DetachPumpHandlesLocked();
+                }
+                else
+                {
+                    (ctsToCancel, waiterToCancel) = EnsureYieldPumpLocked();
+                }
+            }
+
+            waiterToRelease?.TrySetResult(true);
+            CancelDetachedHandles(ctsToCancel, waiterToCancel);
+        }
+
+        public void AcknowledgeFrame(long frameSequence)
+        {
+            TaskCompletionSource<bool>? waiterToRelease = null;
+            CancellationTokenSource? ctsToCancel = null;
+            TaskCompletionSource<bool>? waiterToCancel = null;
+
+            lock (_signalSync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                if (frameSequence > _ackedFrameSeq)
+                {
+                    _ackedFrameSeq = frameSequence;
+                }
+
+                if (_ackedFrameSeq >= _publishedFrameSeq)
+                {
+                    waiterToRelease = _ackWaiterTcs;
+                    _ackWaiterTcs = null;
+                }
+
+                (ctsToCancel, waiterToCancel) = EnsureYieldPumpLocked();
+            }
+
+            waiterToRelease?.TrySetResult(true);
+            CancelDetachedHandles(ctsToCancel, waiterToCancel);
+        }
+
+        public void BumpPumpEpochAndEnsurePump()
+        {
+            CancellationTokenSource? oldCts;
+            TaskCompletionSource<bool>? oldWaiter;
+            CancellationTokenSource? extraCts;
+            TaskCompletionSource<bool>? extraWaiter;
+
+            lock (_signalSync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _pumpEpoch++;
+                _observedStatus = EffectiveStatus;
+                (oldCts, oldWaiter) = DetachPumpHandlesLocked();
+                (extraCts, extraWaiter) = EnsureYieldPumpLocked();
+            }
+
+            CancelDetachedHandles(oldCts, oldWaiter);
+            CancelDetachedHandles(extraCts, extraWaiter);
+        }
+
+        private void OnEngineFrameReady(DisplayFrameNotification notification)
+        {
+            SessionFrameSignal signal;
+            bool pushNow;
+            EngineStepStatus status = _forceFaulted ? EngineStepStatus.Faulted : notification.EngineStatus;
+            lock (_signalSync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                long seq = ++_publishedFrameSeq;
+                _lastYieldedAtTicks = Stopwatch.GetTimestamp();
+                _pendingAwaitMs = status == EngineStepStatus.Yielded
+                    ? notification.AwaitMilliseconds
+                    : 0L;
+                _observedStatus = status;
+
+                signal = new SessionFrameSignal(
+                    SessionId: SessionId,
+                    FrameSequence: seq,
+                    FlushSequence: notification.FlushSequence,
+                    Reason: notification.Reason,
+                    EngineStatus: status,
+                    RedrawMode: notification.RedrawMode,
+                    AwaitMilliseconds: _pendingAwaitMs);
+                _latestSignal = signal;
+                pushNow = !_suppressSignalPush;
+            }
+
+            if (pushNow)
+            {
+                BroadcastSignal(signal);
+            }
+        }
+
+        private void BroadcastSignal(SessionFrameSignal signal)
+        {
+            SessionFrameSubscription[] snapshot;
+            lock (_signalSync)
+            {
+                if (_disposed || _subscriptions.Count == 0)
+                {
+                    return;
+                }
+
+                snapshot = _subscriptions.ToArray();
+            }
+
+            for (int i = 0; i < snapshot.Length; i++)
+            {
+                snapshot[i].TryPublish(signal);
+            }
+        }
+
+        private bool HasExplicitAckSubscriberLocked()
+        {
+            for (int i = 0; i < _subscriptions.Count; i++)
+            {
+                if (_subscriptions[i].RequireExplicitAck)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private (CancellationTokenSource? Cts, TaskCompletionSource<bool>? Waiter) DetachPumpHandlesLocked()
+        {
+            CancellationTokenSource? cts = _pumpCts;
+            _pumpCts = null;
+            TaskCompletionSource<bool>? waiter = _ackWaiterTcs;
+            _ackWaiterTcs = null;
+            return (cts, waiter);
+        }
+
+        private static void CancelDetachedHandles(CancellationTokenSource? cts, TaskCompletionSource<bool>? waiter)
+        {
+            if (cts is not null)
+            {
+                try
+                {
+                    cts.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Already disposed by RunYieldPumpAsync completion
+                }
+            }
+
+            waiter?.TrySetCanceled();
+        }
+
+        private (CancellationTokenSource? Cts, TaskCompletionSource<bool>? Waiter) EnsureYieldPumpLocked()
+        {
+            bool shouldPump = !_disposed &&
+                              _subscriptions.Count > 0 &&
+                              _observedStatus is EngineStepStatus.Yielded or EngineStepStatus.Running;
+
+            if (!shouldPump)
+            {
+                return DetachPumpHandlesLocked();
+            }
+
+            if (_pumpRunning || _pumpCts is not null)
+            {
+                return (null, null);
+            }
+
+            _pumpCts = new CancellationTokenSource();
+            _pumpRunning = true;
+            CancellationTokenSource ownCts = _pumpCts;
+            _ = Task.Run(() => RunYieldPumpAsync(ownCts), CancellationToken.None);
+            return (null, null);
+        }
+
+        private async Task RunYieldPumpAsync(CancellationTokenSource ownCts)
+        {
+            CancellationToken ct = ownCts.Token;
+            try
+            {
+                while (!ct.IsCancellationRequested && !IsDisposed)
+                {
+                    long targetSeq;
+                    long yieldedAtTicks;
+                    long awaitMs;
+                    long epoch;
+                    bool waitForAck;
+                    Task? ackTask = null;
+
+                    lock (_signalSync)
+                    {
+                        if (_disposed || _subscriptions.Count == 0 ||
+                            _observedStatus is not (EngineStepStatus.Yielded or EngineStepStatus.Running))
+                        {
+                            return;
+                        }
+
+                        targetSeq = _publishedFrameSeq;
+                        yieldedAtTicks = _lastYieldedAtTicks;
+                        awaitMs = _pendingAwaitMs;
+                        epoch = _pumpEpoch;
+                        waitForAck = HasExplicitAckSubscriberLocked() && _ackedFrameSeq < targetSeq;
+                        if (waitForAck)
+                        {
+                            _ackWaiterTcs ??= new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                            ackTask = _ackWaiterTcs.Task;
+                        }
+                    }
+
+                    if (waitForAck && ackTask is not null)
+                    {
+                        using var ackTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        ackTimeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+                        try
+                        {
+                            await ackTask.WaitAsync(ackTimeoutCts.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                        {
+                            // Backpressure safety timeout elapsed; continue so session never stalls permanently.
+                        }
+
+                        continue;
+                    }
+
+                    if (awaitMs > 1)
+                    {
+                        long elapsedTicks = Stopwatch.GetTimestamp() - yieldedAtTicks;
+                        long elapsedMs = (long)(elapsedTicks * 1000.0 / Stopwatch.Frequency);
+                        long remainingDelayMs = awaitMs - Math.Max(0L, elapsedMs);
+                        if (remainingDelayMs > 0)
+                        {
+                            await Task.Delay(TimeSpan.FromMilliseconds(remainingDelayMs), ct).ConfigureAwait(false);
+                        }
+                    }
+                    else if (awaitMs == 1 && Host.Engine.CurrentRedrawMode != 0)
+                    {
+                        long elapsedTicks = Stopwatch.GetTimestamp() - yieldedAtTicks;
+                        if (elapsedTicks * 1000.0 / Stopwatch.Frequency < 1.0)
+                        {
+                            await Task.Delay(1, ct).ConfigureAwait(false);
+                        }
+                    }
+
+                    await Gate.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        if (_disposed || ct.IsCancellationRequested)
+                        {
+                            return;
+                        }
+
+                        lock (_signalSync)
+                        {
+                            if (_disposed || _subscriptions.Count == 0 || _pumpEpoch != epoch)
+                            {
+                                continue;
+                            }
+                        }
+
+                        if (EffectiveStatus is not (EngineStepStatus.Yielded or EngineStepStatus.Running))
+                        {
+                            lock (_signalSync)
+                            {
+                                _observedStatus = EffectiveStatus;
+                            }
+
+                            return;
+                        }
+
+                        Touch();
+                        ClearFaultNotice();
+
+                        if (Host.Engine.CurrentRedrawMode == 0 && awaitMs <= 1)
+                        {
+                            ExecuteLowRedrawAwaitBatchLocked(this, MaxStepInstructionsPerTurn, _stepWallClockTimeout, AutoRollbackOnError);
+                        }
+                        else
+                        {
+                            ExecuteTurnWithBudgetLocked(this, MaxStepInstructionsPerTurn, _stepWallClockTimeout, AutoRollbackOnError);
+                        }
+
+                        lock (_signalSync)
+                        {
+                            _observedStatus = EffectiveStatus;
+                            if (_observedStatus is not (EngineStepStatus.Yielded or EngineStepStatus.Running))
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        Gate.Release();
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on cancel / dispose / external turn jump
+            }
+            finally
+            {
+                lock (_signalSync)
+                {
+                    _pumpRunning = false;
+                    if (ReferenceEquals(_pumpCts, ownCts))
+                    {
+                        _pumpCts = null;
+                    }
+
+                    ownCts.Dispose();
+
+                    if (!_disposed &&
+                        _subscriptions.Count > 0 &&
+                        _observedStatus is EngineStepStatus.Yielded or EngineStepStatus.Running &&
+                        _pumpCts is null)
+                    {
+                        _pumpCts = new CancellationTokenSource();
+                        _pumpRunning = true;
+                        CancellationTokenSource restartCts = _pumpCts;
+                        _ = Task.Run(() => RunYieldPumpAsync(restartCts), CancellationToken.None);
+                    }
+                }
+            }
         }
 
         public RuntimeSessionSummary BuildSummary() =>
@@ -1534,7 +2147,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         public RuntimeSessionSnapshot BuildSnapshot() =>
             new(
                 Summary: BuildSummary(),
-                Display: BuildLayoutPositionedSnapshot(Host.Engine, ++_uiFrameSequence),
+                Display: BuildLayoutPositionedSnapshot(Host.Engine, Math.Max(1L, CurrentPublishedFrameSequence)),
                 FaultMessage: EffectiveFaultMessage,
                 AutoRolledBackOnFault: LastFaultAutoRolledBack);
 
@@ -1690,6 +2303,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
 
         public async ValueTask DisposeAsync()
         {
+            StopSubscriptionsAndPumpOnDispose();
             await Gate.WaitAsync().ConfigureAwait(false);
             try
             {
@@ -1701,16 +2315,41 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             }
         }
 
-        public void DisposeImmediate() => DisposeCoreLocked();
+        public void DisposeImmediate()
+        {
+            StopSubscriptionsAndPumpOnDispose();
+            DisposeCoreLocked();
+        }
+
+        private void StopSubscriptionsAndPumpOnDispose()
+        {
+            SessionFrameSubscription[] subs;
+            CancellationTokenSource? ctsToCancel;
+            TaskCompletionSource<bool>? waiterToCancel;
+            lock (_signalSync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+                (ctsToCancel, waiterToCancel) = DetachPumpHandlesLocked();
+                subs = _subscriptions.ToArray();
+                _subscriptions.Clear();
+            }
+
+            CancelDetachedHandles(ctsToCancel, waiterToCancel);
+            for (int i = 0; i < subs.Length; i++)
+            {
+                subs[i].Complete();
+            }
+        }
 
         private void DisposeCoreLocked()
         {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
+            StopSubscriptionsAndPumpOnDispose();
+            YieldDetector.FrameCallback = null;
             _pluginManager?.Dispose();
             Host.Dispose();
             AudioTracker.Dispose();

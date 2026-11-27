@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using Hypera.Rendering;
 using Hypera.Runtime;
 
@@ -40,6 +41,21 @@ public sealed record SessionAssetPayload(
     bool IsDynamic = false,
     long ContentVersion = 0);
 
+public sealed record SessionFrameSignal(
+    Guid SessionId,
+    long FrameSequence,
+    long FlushSequence,
+    DisplayFrameReason Reason,
+    EngineStepStatus EngineStatus,
+    int RedrawMode,
+    long AwaitMilliseconds);
+
+public interface ISessionFrameSubscription : IAsyncDisposable, IDisposable
+{
+    Guid SessionId { get; }
+    ChannelReader<SessionFrameSignal> Frames { get; }
+}
+
 public sealed record RuntimeSessionRenderState(
     RuntimeSessionSummary Summary,
     ConsoleScene Scene,
@@ -51,7 +67,8 @@ public sealed record RuntimeSessionRenderState(
     bool AutoRolledBackOnFault = false,
     IReadOnlyDictionary<string, long>? DynamicAssetVersions = null,
     int ScrollOffsetLines = 0,
-    int MaxScrollOffsetLines = 0);
+    int MaxScrollOffsetLines = 0,
+    long FrameSequence = 0);
 
 public sealed record SessionHitTestActionResult(
     ConsoleHitTestResult HitTest,
@@ -89,6 +106,18 @@ public interface IRuntimeSessionManager
         Guid userId,
         long elapsedAnimationMs = 0,
         long afterAudioEventSequence = 0,
+        bool acknowledgeFrame = true,
+        CancellationToken cancellationToken = default);
+
+    ISessionFrameSubscription SubscribeSessionFrames(
+        Guid sessionId,
+        Guid userId,
+        bool requireExplicitAck = false);
+
+    Task AcknowledgeSessionFrameAsync(
+        Guid sessionId,
+        Guid userId,
+        long frameSequence,
         CancellationToken cancellationToken = default);
 
     Task<SessionAssetPayload?> ReadSessionAssetAsync(

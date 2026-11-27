@@ -4,6 +4,7 @@ using System.Text;
 using Hypera.Bytecode;
 using Hypera.Compiler;
 using Hypera.Configuration;
+using Hypera.Rendering;
 
 namespace Hypera.Runtime;
 
@@ -44,8 +45,10 @@ internal static class VmDispatcher
 
         int executed = 0;
 
-    ReloadFrame:
-        while (executed < budget)
+        try
+        {
+        ReloadFrame:
+            while (executed < budget)
         {
             if (minCallDepth > 0 && callStack.Count <= minCallDepth)
             {
@@ -721,17 +724,17 @@ internal static class VmDispatcher
 
                     case OpCode.YieldFrame:
                         frame.ProgramCounter = pc;
-                        engine.LastAwaitMilliseconds = 0L;
-                        engine.EmitSnapshotInternal();
+                        engine.EmitYieldFrame(0L, notifyRedrawFlush: false, DisplayFrameReason.Yield);
                         return EngineStepStatus.Yielded;
 
                     case OpCode.AwaitMillis:
                         frame.ProgramCounter = pc;
-                        engine.LastAwaitMilliseconds = insn.A < intRegs.Length && (insn.Aux & 1) != 0
-                            ? Math.Max(0L, intRegs[insn.A])
-                            : Math.Max(0L, insn.Immediate != 0 ? insn.Immediate : (insn.A < intRegs.Length ? intRegs[insn.A] : 0L));
-                        engine.NotifyRedrawFlush();
-                        engine.EmitSnapshotInternal();
+                        engine.EmitYieldFrame(
+                            insn.A < intRegs.Length && (insn.Aux & 1) != 0
+                                ? Math.Max(0L, intRegs[insn.A])
+                                : Math.Max(0L, insn.Immediate != 0 ? insn.Immediate : (insn.A < intRegs.Length ? intRegs[insn.A] : 0L)),
+                            notifyRedrawFlush: true,
+                            DisplayFrameReason.Await);
                         return EngineStepStatus.Yielded;
 
                     // ---------------------------------------------------------
@@ -905,6 +908,11 @@ internal static class VmDispatcher
         return callStack.Count == 0 && !engine.SystemFlow.IsActive
             ? EngineStepStatus.Completed
             : EngineStepStatus.Yielded;
+        }
+        finally
+        {
+            engine.AccumulateStepInstructions(executed);
+        }
     }
 
     // -------------------------------------------------------------------------

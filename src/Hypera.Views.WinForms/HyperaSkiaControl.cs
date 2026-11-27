@@ -49,6 +49,7 @@ public class HyperaSkiaControl : SKControl
     private bool _hasTimeoutDeadline;
     private long _awaitResumeTimestamp;
     private long _lastAnimationRedrawMs;
+    private long _lastTimeoutCountdownMs;
     private long _lastPaintElapsedMs;
     private bool _autoSubmitEngineInput = true;
     private bool _focusOnMouseDown = true;
@@ -58,6 +59,7 @@ public class HyperaSkiaControl : SKControl
     private bool _pendingHoverRefresh;
     private int _frameIntervalMs = 16;
     private int _maxStepSliceMs = 12;
+    private bool _loopRequested;
 
     public HyperaSkiaControl()
     {
@@ -78,6 +80,12 @@ public class HyperaSkiaControl : SKControl
             if (ReferenceEquals(_engine, value))
             {
                 return;
+            }
+
+            if (_engine is not null)
+            {
+                _engine.FrameReady -= OnEngineFrameReady;
+                _engine.ExecutionResumed -= OnEngineExecutionResumed;
             }
 
             _engineCompositor?.Dispose();
@@ -104,11 +112,23 @@ public class HyperaSkiaControl : SKControl
             {
                 _engineCompositor = new SkiaFrameCompositor(_engine.Fonts, _engine.Glyphs);
                 _engine.ConsoleBuffer.ScrollOffsetLines = 0;
+                _engine.FrameReady += OnEngineFrameReady;
+                _engine.ExecutionResumed += OnEngineExecutionResumed;
                 _animationStopwatch.Restart();
                 _lastAnimationRedrawMs = 0;
+                _lastTimeoutCountdownMs = 0;
+                SyncWaitingInputDeadline(_engine, out _);
+                if (_engine.Status == EngineStepStatus.Yielded &&
+                    _engine.LastAwaitMilliseconds > 1 &&
+                    !(_engine.IsMouseSkip || _engine.IsMessageSkip))
+                {
+                    _awaitResumeTimestamp = Stopwatch.GetTimestamp() +
+                        (long)(_engine.LastAwaitMilliseconds * (Stopwatch.Frequency / 1000.0));
+                }
             }
 
             Cursor = Cursors.Default;
+            UpdateFrameTimerState();
             Invalidate();
             ContentUpdated?.Invoke(this, EventArgs.Empty);
         }
@@ -156,7 +176,7 @@ public class HyperaSkiaControl : SKControl
         set
         {
             _frameIntervalMs = Math.Max(4, value);
-            _frameTimer.Interval = _frameIntervalMs;
+            UpdateFrameTimerState();
         }
     }
 
@@ -170,7 +190,7 @@ public class HyperaSkiaControl : SKControl
 
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public bool IsLoopRunning => _frameTimer.Enabled;
+    public bool IsLoopRunning => _loopRequested;
 
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -252,14 +272,13 @@ public class HyperaSkiaControl : SKControl
 
     public void StartLoop()
     {
-        if (!_frameTimer.Enabled)
-        {
-            _frameTimer.Start();
-        }
+        _loopRequested = true;
+        UpdateFrameTimerState();
     }
 
     public void StopLoop()
     {
+        _loopRequested = false;
         if (_frameTimer.Enabled)
         {
             _frameTimer.Stop();
@@ -305,6 +324,7 @@ public class HyperaSkiaControl : SKControl
         _lastObservedFlushSeq = engine.RedrawFlushSequence;
         ClearHoverState();
         _pendingHoverRefresh = true;
+        UpdateFrameTimerState();
         Invalidate();
         ContentUpdated?.Invoke(this, EventArgs.Empty);
         return true;
@@ -492,6 +512,12 @@ public class HyperaSkiaControl : SKControl
                 scene,
                 engine.Graphics,
                 engine.Sprites);
+            if (_loopRequested && !_isTicking && engine.CurrentRedrawMode != 0 && !_frameTimer.Enabled &&
+                scene.ContainsAnimatedSprites(engine.Sprites))
+            {
+                UpdateFrameTimerState();
+            }
+
             return;
         }
 
@@ -772,6 +798,7 @@ public class HyperaSkiaControl : SKControl
                     ClearHoverState();
                     _lastObservedFlushSeq = engine.RedrawFlushSequence;
                     _frozenRedrawScene = null;
+                    _lastRenderedScene = null;
                     needsRepaint = true;
                     if (engine.Status == EngineStepStatus.WaitingInput)
                     {
@@ -787,48 +814,30 @@ public class HyperaSkiaControl : SKControl
                 contentChanged = true;
             }
 
-            if (engine.Status == EngineStepStatus.WaitingInput && engine.PendingInputRequest is { } req)
+            if (SyncWaitingInputDeadline(engine, out bool newlyTracked))
             {
-                if (_trackedGenerationId != req.GenerationId)
+                if (newlyTracked)
                 {
-                    _trackedGenerationId = req.GenerationId;
-                    if (req.TimeoutMilliseconds.HasValue)
-                    {
-                        _hasTimeoutDeadline = true;
-                        long delayMs = Math.Max(0L, req.TimeoutMilliseconds.Value);
-                        _timeoutDeadlineTimestamp = Stopwatch.GetTimestamp() +
-                            (long)(delayMs * (Stopwatch.Frequency / 1000.0));
-                    }
-                    else
-                    {
-                        _hasTimeoutDeadline = false;
-                        _timeoutDeadlineTimestamp = 0;
-                    }
-
                     _frozenRedrawScene = null;
                     _lastObservedFlushSeq = engine.RedrawFlushSequence;
                     _pendingHoverRefresh = true;
+                    _lastTimeoutCountdownMs = elapsedMs;
                     contentChanged = true;
                     needsRepaint = true;
                 }
-                else if (_hasTimeoutDeadline && elapsedMs - _lastAnimationRedrawMs >= 100)
+                else if (_hasTimeoutDeadline && elapsedMs - _lastTimeoutCountdownMs >= 100)
                 {
                     // Refresh status countdown while timed wait / TINPUT is active.
+                    _lastTimeoutCountdownMs = elapsedMs;
                     contentChanged = true;
                 }
-            }
-            else
-            {
-                _trackedGenerationId = -1;
-                _hasTimeoutDeadline = false;
-                _timeoutDeadlineTimestamp = 0;
             }
 
             int animeInterval = Math.Max(33, engine.AnimeTimerIntervalMs);
             if (!needsRepaint &&
                 engine.CurrentRedrawMode != 0 &&
                 elapsedMs - _lastAnimationRedrawMs >= animeInterval &&
-                HasPotentialAnimation(engine))
+                HasVisibleAnimatedSprites(engine))
             {
                 needsRepaint = true;
             }
@@ -844,32 +853,273 @@ public class HyperaSkiaControl : SKControl
                 ContentUpdated?.Invoke(this, EventArgs.Empty);
             }
 
-            if (engine.Status == EngineStepStatus.Faulted && !_faultRaised)
-            {
-                _faultRaised = true;
-                EngineFaulted?.Invoke(this, engine.FaultException ?? new InvalidOperationException("Engine faulted."));
-            }
-            else if (engine.Status == EngineStepStatus.Completed && !_completionRaised)
-            {
-                _completionRaised = true;
-                if (engine.RestartRequested)
-                {
-                    EngineRestartRequested?.Invoke(this, EventArgs.Empty);
-                }
-                else
-                {
-                    EngineCompleted?.Invoke(this, EventArgs.Empty);
-                }
-            }
+            RaiseTerminalEngineEventsIfNeeded(engine);
         }
         finally
         {
             _isTicking = false;
+            UpdateFrameTimerState();
         }
     }
 
-    private static bool HasPotentialAnimation(EmueraEngine engine) =>
-        engine.Sprites.HasAnimatedSprites;
+    private void OnEngineFrameReady(DisplayFrameNotification notification)
+    {
+        if (IsDisposed || _isTicking)
+        {
+            return;
+        }
+
+        if (IsHandleCreated && InvokeRequired)
+        {
+            try
+            {
+                BeginInvoke(() => HandleExternalFrameReady(notification));
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            return;
+        }
+
+        HandleExternalFrameReady(notification);
+    }
+
+    private void HandleExternalFrameReady(DisplayFrameNotification notification)
+    {
+        if (IsDisposed || _engine is not { } engine)
+        {
+            return;
+        }
+
+        if (engine.Status is not (EngineStepStatus.Faulted or EngineStepStatus.Completed))
+        {
+            _faultRaised = false;
+            _completionRaised = false;
+        }
+
+        if (notification.Reason == DisplayFrameReason.Await &&
+            notification.EngineStatus == EngineStepStatus.Yielded &&
+            notification.AwaitMilliseconds > 1 &&
+            !(engine.IsMouseSkip || engine.IsMessageSkip))
+        {
+            _awaitResumeTimestamp = Stopwatch.GetTimestamp() +
+                (long)(notification.AwaitMilliseconds * (Stopwatch.Frequency / 1000.0));
+        }
+        else if (engine.Status != EngineStepStatus.Yielded)
+        {
+            _awaitResumeTimestamp = 0;
+        }
+
+        bool isWaiting = SyncWaitingInputDeadline(engine, out bool newlyTracked);
+        if (isWaiting && newlyTracked)
+        {
+            _pendingHoverRefresh = true;
+            _lastTimeoutCountdownMs = _animationStopwatch.ElapsedMilliseconds;
+        }
+
+        bool shouldRedraw = newlyTracked ||
+                            notification.RedrawMode != 0 ||
+                            notification.Reason is DisplayFrameReason.RedrawFlush
+                                or DisplayFrameReason.Await
+                                or DisplayFrameReason.WaitingInput
+                                or DisplayFrameReason.Completed
+                                or DisplayFrameReason.Faulted
+                                or DisplayFrameReason.Undo;
+        if (shouldRedraw)
+        {
+            _frozenRedrawScene = null;
+            _lastRenderedScene = null;
+            _lastObservedFlushSeq = notification.FlushSequence;
+            Invalidate();
+            ContentUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        RaiseTerminalEngineEventsIfNeeded(engine);
+        UpdateFrameTimerState();
+    }
+
+    private void OnEngineExecutionResumed()
+    {
+        if (IsDisposed || _isTicking)
+        {
+            return;
+        }
+
+        if (IsHandleCreated && InvokeRequired)
+        {
+            try
+            {
+                BeginInvoke(HandleExternalExecutionResumed);
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            return;
+        }
+
+        HandleExternalExecutionResumed();
+    }
+
+    private void HandleExternalExecutionResumed()
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        _awaitResumeTimestamp = 0;
+        UpdateFrameTimerState();
+    }
+
+    private void UpdateFrameTimerState()
+    {
+        if (IsDisposed || !_loopRequested || _engine is not { } engine)
+        {
+            if (_frameTimer.Enabled)
+            {
+                _frameTimer.Stop();
+            }
+
+            return;
+        }
+
+        int desiredIntervalMs = ComputeDesiredTimerIntervalMs(engine);
+        if (desiredIntervalMs <= 0)
+        {
+            if (_frameTimer.Enabled)
+            {
+                _frameTimer.Stop();
+            }
+
+            return;
+        }
+
+        if (!_frameTimer.Enabled)
+        {
+            _frameTimer.Interval = desiredIntervalMs;
+            _frameTimer.Start();
+        }
+        else if (_frameTimer.Interval != desiredIntervalMs)
+        {
+            _frameTimer.Stop();
+            _frameTimer.Interval = desiredIntervalMs;
+            _frameTimer.Start();
+        }
+    }
+
+    private int ComputeDesiredTimerIntervalMs(EmueraEngine engine)
+    {
+        bool skipNow = engine.IsMouseSkip || engine.IsMessageSkip;
+        if (skipNow || (engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded && _awaitResumeTimestamp == 0))
+        {
+            return _frameIntervalMs;
+        }
+
+        int desired = int.MaxValue;
+        long nowTs = Stopwatch.GetTimestamp();
+
+        if (engine.Status == EngineStepStatus.Yielded && _awaitResumeTimestamp > 0)
+        {
+            long remTicks = _awaitResumeTimestamp - nowTs;
+            int remMs = remTicks <= 0
+                ? 1
+                : (int)Math.Clamp((long)Math.Ceiling(remTicks * 1000.0 / Stopwatch.Frequency), 1L, 60_000L);
+            desired = Math.Min(desired, remMs);
+        }
+
+        if (_hasTimeoutDeadline)
+        {
+            long remTicks = _timeoutDeadlineTimestamp - nowTs;
+            int remMs = remTicks <= 0
+                ? 1
+                : (int)Math.Clamp((long)Math.Ceiling(remTicks * 1000.0 / Stopwatch.Frequency), 1L, 60_000L);
+            // Status label shows 0.1s countdown; refresh at 100ms cadence instead of 16ms polling.
+            desired = Math.Min(desired, Math.Min(remMs, 100));
+        }
+
+        if (engine.CurrentRedrawMode != 0 && HasVisibleAnimatedSprites(engine))
+        {
+            int animeInterval = Math.Max(33, engine.AnimeTimerIntervalMs);
+            desired = Math.Min(desired, animeInterval);
+        }
+
+        return desired == int.MaxValue ? 0 : Math.Max(1, desired);
+    }
+
+    private bool SyncWaitingInputDeadline(EmueraEngine engine, out bool newlyTracked)
+    {
+        if (engine.Status == EngineStepStatus.WaitingInput && engine.PendingInputRequest is { } req)
+        {
+            if (_trackedGenerationId != req.GenerationId)
+            {
+                _trackedGenerationId = req.GenerationId;
+                if (req.TimeoutMilliseconds.HasValue)
+                {
+                    _hasTimeoutDeadline = true;
+                    long delayMs = Math.Max(0L, req.TimeoutMilliseconds.Value);
+                    _timeoutDeadlineTimestamp = Stopwatch.GetTimestamp() +
+                        (long)(delayMs * (Stopwatch.Frequency / 1000.0));
+                }
+                else
+                {
+                    _hasTimeoutDeadline = false;
+                    _timeoutDeadlineTimestamp = 0;
+                }
+
+                newlyTracked = true;
+                return true;
+            }
+
+            newlyTracked = false;
+            return true;
+        }
+
+        _trackedGenerationId = -1;
+        _hasTimeoutDeadline = false;
+        _timeoutDeadlineTimestamp = 0;
+        newlyTracked = false;
+        return false;
+    }
+
+    private void RaiseTerminalEngineEventsIfNeeded(EmueraEngine engine)
+    {
+        if (engine.Status == EngineStepStatus.Faulted && !_faultRaised)
+        {
+            _faultRaised = true;
+            EngineFaulted?.Invoke(this, engine.FaultException ?? new InvalidOperationException("Engine faulted."));
+        }
+        else if (engine.Status == EngineStepStatus.Completed && !_completionRaised)
+        {
+            _completionRaised = true;
+            if (engine.RestartRequested)
+            {
+                EngineRestartRequested?.Invoke(this, EventArgs.Empty);
+            }
+            else
+            {
+                EngineCompleted?.Invoke(this, EventArgs.Empty);
+            }
+        }
+    }
+
+    private bool HasVisibleAnimatedSprites(EmueraEngine engine)
+    {
+        if (!engine.Sprites.HasAnimatedSprites)
+        {
+            return false;
+        }
+
+        ConsoleScene scene = _lastRenderedScene ?? _frozenRedrawScene ?? engine.ConsoleBuffer.CaptureScene();
+        return scene.ContainsAnimatedSprites(engine.Sprites);
+    }
 
     private void UpdateHoverState(EmueraEngine engine, LogicalPoint pt, bool inside)
     {
@@ -1151,6 +1401,13 @@ public class HyperaSkiaControl : SKControl
     {
         if (disposing)
         {
+            _loopRequested = false;
+            if (_engine is not null)
+            {
+                _engine.FrameReady -= OnEngineFrameReady;
+                _engine.ExecutionResumed -= OnEngineExecutionResumed;
+            }
+
             _frameTimer.Stop();
             _frameTimer.Tick -= OnFrameTimerTick;
             _frameTimer.Dispose();

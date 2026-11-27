@@ -140,7 +140,8 @@ public sealed partial class EmueraEngine : IDisposable
             Options.ForeColorRgba,
             Options.BackColorRgba,
             Options.FocusColorRgba,
-            Options.MaxLog);
+            Options.MaxLog,
+            Graphics);
         ConsoleBuffer.ButtonWrap = Options.ButtonWrap;
         ConsoleBuffer.ExpandTabs = Options.TextDrawingMode == TextDrawingMode.GRAPHICS;
         ConsoleBuffer.AutoButtonDetected = (caption, intValue) => RegisterButtonDescriptor(caption, isInt: true, intValue);
@@ -156,8 +157,11 @@ public sealed partial class EmueraEngine : IDisposable
     public IVariableStore? Variables { get; }
     public ICharacterStore? Characters { get; }
     public IAudioBackend Audio { get; }
-    public IDisplaySnapshotSink? DisplaySink { get; }
+    public IDisplaySnapshotSink? DisplaySink { get; set; }
     public LogicalViewport Viewport { get; private set; }
+    public event Action<DisplayFrameNotification>? FrameReady;
+    public event Action? ExecutionResumed;
+    public long CurrentFrameSequence => Volatile.Read(ref _frameSequence);
 
     public VariableStore? FastVariables { get; }
     public CharacterStore? FastCharacters { get; }
@@ -207,6 +211,7 @@ public sealed partial class EmueraEngine : IDisposable
     public IReadOnlyList<CallFrame> CallStack => _callStack;
 
     public long LastAwaitMilliseconds { get; internal set; }
+    public int LastStepInstructionCount { get; private set; }
     public long RedrawFlushSequence { get; private set; }
     public bool RestartRequested { get; private set; }
     public bool IsSkipDisplay { get; internal set; }
@@ -219,10 +224,31 @@ public sealed partial class EmueraEngine : IDisposable
         if ((rawMode & 2) != 0 || CurrentRedrawMode != 0)
         {
             NotifyRedrawFlush();
+            EmitSnapshotInternal(DisplayFrameReason.RedrawFlush);
         }
     }
 
     internal void NotifyRedrawFlush() => RedrawFlushSequence++;
+
+    internal void AccumulateStepInstructions(int count)
+    {
+        if (count > 0)
+        {
+            LastStepInstructionCount += count;
+        }
+    }
+
+    internal void EmitYieldFrame(long awaitMilliseconds, bool notifyRedrawFlush, DisplayFrameReason reason)
+    {
+        LastAwaitMilliseconds = awaitMilliseconds;
+        Status = EngineStepStatus.Yielded;
+        if (notifyRedrawFlush)
+        {
+            NotifyRedrawFlush();
+        }
+
+        EmitSnapshotInternal(reason);
+    }
     public uint CurrentForeColorRgba { get; private set; }
     public uint CurrentBackColorRgba { get; private set; }
     public int CurrentFontStyle { get; internal set; }
@@ -300,6 +326,7 @@ public sealed partial class EmueraEngine : IDisposable
 
         int budget = maxInstructions > 0 ? maxInstructions : Options.DefaultStepInstructionBudget;
         LastAwaitMilliseconds = 0L;
+        LastStepInstructionCount = 0;
         Status = EngineStepStatus.Running;
 
         int passiveDebugRecoveries = 0;
@@ -309,6 +336,12 @@ public sealed partial class EmueraEngine : IDisposable
             {
                 EngineStepStatus nextStatus = VmDispatcher.ExecuteStep(this, budget);
                 Status = nextStatus;
+                if (nextStatus == EngineStepStatus.Completed)
+                {
+                    NotifyRedrawFlush();
+                    EmitSnapshotInternal(DisplayFrameReason.Completed);
+                }
+
                 return Status;
             }
             catch (Exception ex) when (passiveDebugRecoveries < 64 && TryRecoverFromPassiveDebugPrintFault(ex))
@@ -320,6 +353,8 @@ public sealed partial class EmueraEngine : IDisposable
                 FaultException = ex;
                 Status = EngineStepStatus.Faulted;
                 RecordDiagnostic("FAULT", $"{ex.GetType().Name}: {ex.Message}", includeCallerLocation: true);
+                NotifyRedrawFlush();
+                EmitSnapshotInternal(DisplayFrameReason.Faulted);
                 return Status;
             }
         }
@@ -393,6 +428,11 @@ public sealed partial class EmueraEngine : IDisposable
             AdvanceButtonGeneration();
             Status = EngineStepStatus.Running;
             SystemFlow.DeliverSystemInput(response);
+            if (Status == EngineStepStatus.Running)
+            {
+                ExecutionResumed?.Invoke();
+            }
+
             return;
         }
 
@@ -419,6 +459,7 @@ public sealed partial class EmueraEngine : IDisposable
         }
 
         Status = EngineStepStatus.Running;
+        ExecutionResumed?.Invoke();
     }
 
     public void AppendDisplayOperation(DisplayOperation operation)
@@ -440,13 +481,16 @@ public sealed partial class EmueraEngine : IDisposable
     public DisplaySnapshot CaptureSnapshot()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        return new DisplaySnapshot(
-            ++_frameSequence,
+        return BuildDisplaySnapshotWithSequence(Interlocked.Increment(ref _frameSequence));
+    }
+
+    private DisplaySnapshot BuildDisplaySnapshotWithSequence(long frameSequence) =>
+        new(
+            frameSequence,
             Viewport,
             CurrentBackColorRgba,
             [.. _displayOperations],
             PendingInputRequest);
-    }
 
     public IReadOnlyList<SourceLocation> GetSourceStackTrace()
     {
@@ -1067,7 +1111,7 @@ public sealed partial class EmueraEngine : IDisposable
             ActiveButtons: SnapshotActiveButtonsForGeneration());
         Status = EngineStepStatus.WaitingInput;
         NotifyRedrawFlush();
-        EmitSnapshotInternal();
+        EmitSnapshotInternal(DisplayFrameReason.WaitingInput);
     }
 
     internal bool IssueScriptInput(
@@ -1158,7 +1202,7 @@ public sealed partial class EmueraEngine : IDisposable
             CanSkipWithMessageSkip: (flags & WaitInputFlags.CanSkipWithMessageSkip) != 0);
         Status = EngineStepStatus.WaitingInput;
         NotifyRedrawFlush();
-        EmitSnapshotInternal();
+        EmitSnapshotInternal(DisplayFrameReason.WaitingInput);
         return true;
     }
 
@@ -2591,7 +2635,38 @@ public sealed partial class EmueraEngine : IDisposable
         return Module.SourceMap.TryLookup(pc, out SourceLocation loc) ? loc.LineNo : 0L;
     }
 
-    internal void EmitSnapshotInternal() => DisplaySink?.OnDisplaySnapshot(CaptureSnapshot());
+    internal void EmitSnapshotInternal(DisplayFrameReason reason = DisplayFrameReason.Manual)
+    {
+        long frameSeq = Interlocked.Increment(ref _frameSequence);
+        IDisplaySnapshotSink? sink = DisplaySink;
+        Action<DisplayFrameNotification>? frameReady = FrameReady;
+        if (sink is null && frameReady is null)
+        {
+            return;
+        }
+
+        var notification = new DisplayFrameNotification(
+            FrameSequence: frameSeq,
+            FlushSequence: RedrawFlushSequence,
+            Reason: reason,
+            EngineStatus: Status,
+            RedrawMode: CurrentRedrawMode,
+            AwaitMilliseconds: LastAwaitMilliseconds,
+            PendingInput: PendingInputRequest);
+
+        if (sink is not null)
+        {
+            if (sink.RequiresSnapshotMaterialization)
+            {
+                DisplaySnapshot snapshot = BuildDisplaySnapshotWithSequence(frameSeq);
+                sink.OnDisplaySnapshot(snapshot);
+            }
+
+            sink.OnFrameReady(notification);
+        }
+
+        frameReady?.Invoke(notification);
+    }
 
     public void Dispose()
     {

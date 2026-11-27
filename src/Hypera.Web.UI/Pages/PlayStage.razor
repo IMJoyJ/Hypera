@@ -2,6 +2,7 @@
 @using System.Diagnostics
 @using System.Globalization
 @using System.Text
+@using System.Threading.Channels
 @implements IAsyncDisposable
 @inject UiSessionState Ui
 @inject IAppCatalogService CatalogService
@@ -465,7 +466,14 @@
     private bool _showTimeoutBadge;
 
     private CancellationTokenSource? _animCts;
-    private CancellationTokenSource? _yieldCts;
+    private readonly SemaphoreSlim _stateRefreshGate = new(1, 1);
+    private ISessionFrameSubscription? _frameSub;
+    private CancellationTokenSource? _frameListenerCts;
+    private Guid _subscribedSessionId;
+    private long _lastRenderedFrameSeq;
+    private Guid _pendingAckSessionId;
+    private long _pendingAckFrameSeq;
+    private volatile bool _listenerStopped;
     private bool _disposed;
 
     private string VolumeIcon =>
@@ -571,20 +579,34 @@
             await TryJsVoidAsync("hyperaPlayer.registerPlayKeyAndFullscreenHooks", _selfRef);
         }
 
-        if (_renderState is null)
+        if (_renderState is not null)
         {
-            return;
+            LogicalViewport vp = _renderState.Scene.Viewport;
+            bool isFs = Ui.IsFullscreen;
+            if (vp.LogicalWidth != _lastScaledW || vp.LogicalHeight != _lastScaledH || isFs != _lastScaledFullscreen)
+            {
+                _lastScaledW = vp.LogicalWidth;
+                _lastScaledH = vp.LogicalHeight;
+                _lastScaledFullscreen = isFs;
+                int padPx = isFs ? 0 : 4;
+                await TryJsVoidAsync("hyperaPlayer.attachStageScaler", _wrapperRef, _stageRef, vp.LogicalWidth, vp.LogicalHeight, padPx);
+            }
         }
 
-        LogicalViewport vp = _renderState.Scene.Viewport;
-        bool isFs = Ui.IsFullscreen;
-        if (vp.LogicalWidth != _lastScaledW || vp.LogicalHeight != _lastScaledH || isFs != _lastScaledFullscreen)
+        long ackSeq = _pendingAckFrameSeq;
+        Guid ackSid = _pendingAckSessionId;
+        if (ackSeq > 0 && ackSid != Guid.Empty && Ui.IsAuthenticated && !_disposed)
         {
-            _lastScaledW = vp.LogicalWidth;
-            _lastScaledH = vp.LogicalHeight;
-            _lastScaledFullscreen = isFs;
-            int padPx = isFs ? 0 : 4;
-            await TryJsVoidAsync("hyperaPlayer.attachStageScaler", _wrapperRef, _stageRef, vp.LogicalWidth, vp.LogicalHeight, padPx);
+            _pendingAckFrameSeq = 0;
+            _pendingAckSessionId = Guid.Empty;
+            try
+            {
+                await SessionManager.AcknowledgeSessionFrameAsync(ackSid, Ui.CurrentUser!.Id, ackSeq);
+            }
+            catch
+            {
+                // Ignore ack errors if session was already evicted or disposed
+            }
         }
     }
 
@@ -671,6 +693,7 @@
                 QueryLanguageCode);
 
             await RefreshRenderStateAsync(snapshot.Summary.SessionId, resetIfSessionChanged: true);
+            EnsureFrameSubscription(snapshot.Summary.SessionId);
         }
         catch (Exception ex)
         {
@@ -700,13 +723,15 @@
         _error = null;
         _faultBannerDismissed = false;
         CancelTimeout();
-        CancelYieldPump();
         try
         {
             Guid userId = Ui.CurrentUser!.Id;
-            await SessionManager.UndoSessionAsync(_activeSessionId, userId);
             InvalidateDynamicSpriteAndGraphicsCache();
-            await RefreshRenderStateAsync(_activeSessionId);
+            RuntimeSessionSnapshot snap = await SessionManager.UndoSessionAsync(_activeSessionId, userId);
+            if (snap.Display.FrameSequence > Volatile.Read(ref _lastRenderedFrameSeq))
+            {
+                await RefreshRenderStateAsync(_activeSessionId, minFrameSequence: snap.Display.FrameSequence);
+            }
         }
         catch (Exception ex)
         {
@@ -749,8 +774,8 @@
         _busy = true;
         _error = null;
         CancelTimeout();
-        CancelYieldPump();
         StopAnimationLoop();
+        await StopFrameSubscriptionAsync();
         try
         {
             Guid userId = Ui.CurrentUser!.Id;
@@ -762,6 +787,7 @@
 
             await ResetClientSessionResourcesAsync();
             await RefreshRenderStateAsync(snapshot.Summary.SessionId, resetIfSessionChanged: true);
+            EnsureFrameSubscription(snapshot.Summary.SessionId);
         }
         catch (Exception ex)
         {
@@ -802,126 +828,252 @@
         await TryJsVoidAsync("hyperaPlayer.revokeAllAssets");
     }
 
-    private async Task RefreshRenderStateAsync(Guid sessionId, bool resetIfSessionChanged = false)
+    private async Task RefreshRenderStateAsync(
+        Guid sessionId,
+        bool resetIfSessionChanged = false,
+        long minFrameSequence = 0)
     {
         if (!Ui.IsAuthenticated || _disposed)
         {
             return;
         }
 
-        Guid userId = Ui.CurrentUser!.Id;
-        if (resetIfSessionChanged && _activeSessionId != Guid.Empty && _activeSessionId != sessionId)
+        await _stateRefreshGate.WaitAsync();
+        try
         {
-            await ResetClientSessionResourcesAsync();
+            if (!Ui.IsAuthenticated || _disposed)
+            {
+                return;
+            }
+
+            if (minFrameSequence > 0 && minFrameSequence <= Volatile.Read(ref _lastRenderedFrameSeq))
+            {
+                return;
+            }
+
+            Guid userId = Ui.CurrentUser!.Id;
+            if (resetIfSessionChanged && _activeSessionId != Guid.Empty && _activeSessionId != sessionId)
+            {
+                await ResetClientSessionResourcesAsync();
+            }
+
+            RuntimeSessionRenderState? state = await SessionManager.GetSessionRenderStateAsync(
+                sessionId,
+                userId,
+                elapsedAnimationMs: _animationClock.ElapsedMilliseconds,
+                afterAudioEventSequence: _audioSyncedSessionId == sessionId ? _lastAudioEventSeq : 0,
+                acknowledgeFrame: false);
+
+            if (state is null)
+            {
+                _renderState = null;
+                _renderItems = [];
+                return;
+            }
+
+            if (state.AutoRolledBackOnFault)
+            {
+                InvalidateDynamicSpriteAndGraphicsCache();
+            }
+
+            if (!string.Equals(_lastObservedFaultMessage, state.FaultMessage, StringComparison.Ordinal))
+            {
+                _lastObservedFaultMessage = state.FaultMessage;
+                _faultBannerDismissed = false;
+            }
+
+            _renderState = state;
+            _activeSessionId = state.Summary.SessionId;
+            _activeVersionId = state.Summary.VersionId;
+            _activeLanguageCode = state.Summary.LanguageCode;
+            _inputText = string.Empty;
+            _oneCharText = string.Empty;
+            _hoveredItemKey = null;
+
+            await RegisterCustomFontsAsync(sessionId, userId, state.CustomFonts);
+
+            List<StageRenderItem> items = BuildRenderItems(state.Scene, state.VisibleLineTops);
+            IReadOnlyDictionary<string, long>? dynamicVersions = state.Scene.DynamicAssetVersions ?? state.DynamicAssetVersions;
+            await EnsureSceneAssetsLoadedAsync(sessionId, userId, items, dynamicVersions);
+            _renderItems = items;
+
+            await SyncWebAudioAsync(sessionId, userId, state.Audio);
+            ConfigurePendingTimeout(state.PendingInput);
+            UpdateAnimationLoop();
+
+            if (state.FrameSequence > 0)
+            {
+                long updated = Math.Max(Volatile.Read(ref _lastRenderedFrameSeq), state.FrameSequence);
+                Volatile.Write(ref _lastRenderedFrameSeq, updated);
+                _pendingAckSessionId = sessionId;
+                _pendingAckFrameSeq = Math.Max(_pendingAckFrameSeq, state.FrameSequence);
+            }
         }
-
-        RuntimeSessionRenderState? state = await SessionManager.GetSessionRenderStateAsync(
-            sessionId,
-            userId,
-            elapsedAnimationMs: _animationClock.ElapsedMilliseconds,
-            afterAudioEventSequence: _audioSyncedSessionId == sessionId ? _lastAudioEventSeq : 0);
-
-        if (state is null)
+        finally
         {
-            _renderState = null;
-            _renderItems = [];
-            return;
+            _stateRefreshGate.Release();
         }
-
-        if (state.AutoRolledBackOnFault)
-        {
-            InvalidateDynamicSpriteAndGraphicsCache();
-        }
-
-        if (!string.Equals(_lastObservedFaultMessage, state.FaultMessage, StringComparison.Ordinal))
-        {
-            _lastObservedFaultMessage = state.FaultMessage;
-            _faultBannerDismissed = false;
-        }
-
-        _renderState = state;
-        _activeSessionId = state.Summary.SessionId;
-        _activeVersionId = state.Summary.VersionId;
-        _activeLanguageCode = state.Summary.LanguageCode;
-        _inputText = string.Empty;
-        _oneCharText = string.Empty;
-        _hoveredItemKey = null;
-
-        await RegisterCustomFontsAsync(sessionId, userId, state.CustomFonts);
-
-        List<StageRenderItem> items = BuildRenderItems(state.Scene, state.VisibleLineTops);
-        await EnsureSceneAssetsLoadedAsync(sessionId, userId, items, state.DynamicAssetVersions);
-        _renderItems = items;
-
-        await SyncWebAudioAsync(sessionId, userId, state.Audio);
-        ConfigurePendingTimeout(state.PendingInput);
-        ConfigureYieldPump(state.Summary.EngineStatus);
-        UpdateAnimationLoop();
     }
 
-    private void ConfigureYieldPump(EngineStepStatus status)
+    private void EnsureFrameSubscription(Guid sessionId)
     {
-        if (status != EngineStepStatus.Yielded || _disposed)
-        {
-            CancelYieldPump();
-            return;
-        }
-
-        if (_yieldCts is not null)
+        if (_disposed || !Ui.IsAuthenticated || sessionId == Guid.Empty)
         {
             return;
         }
 
-        _yieldCts = new CancellationTokenSource();
-        CancellationToken ct = _yieldCts.Token;
-        Guid sid = _activeSessionId;
-
-        _ = Task.Run(async () =>
+        if (_subscribedSessionId == sessionId && _frameSub is not null && !_listenerStopped)
         {
-            try
+            return;
+        }
+
+        StopFrameSubscriptionImmediate();
+
+        _subscribedSessionId = sessionId;
+        _listenerStopped = false;
+        _frameSub = SessionManager.SubscribeSessionFrames(sessionId, Ui.CurrentUser!.Id, requireExplicitAck: true);
+        _frameListenerCts = new CancellationTokenSource();
+        CancellationToken ct = _frameListenerCts.Token;
+        ISessionFrameSubscription sub = _frameSub;
+
+        _ = Task.Run(() => ListenForSessionFramesAsync(sessionId, sub, ct), ct);
+    }
+
+    private async Task ListenForSessionFramesAsync(
+        Guid sessionId,
+        ISessionFrameSubscription subscription,
+        CancellationToken ct)
+    {
+        try
+        {
+            ChannelReader<SessionFrameSignal> reader = subscription.Frames;
+            while (await reader.WaitToReadAsync(ct))
             {
-                await Task.Delay(33, ct);
+                SessionFrameSignal? latest = null;
+                while (reader.TryRead(out SessionFrameSignal? sig))
+                {
+                    latest = sig;
+                }
+
+                if (latest is null || _disposed || ct.IsCancellationRequested)
+                {
+                    continue;
+                }
+
+                if (latest.FrameSequence <= Volatile.Read(ref _lastRenderedFrameSeq))
+                {
+                    continue;
+                }
+
                 await InvokeAsync(async () =>
                 {
-                    if (_disposed || _busy || _activeSessionId != sid || !Ui.IsAuthenticated)
+                    if (_disposed || ct.IsCancellationRequested || _activeSessionId != sessionId || !Ui.IsAuthenticated)
                     {
-                        CancelYieldPump();
                         return;
                     }
 
-                    CancelYieldPump();
-                    _busy = true;
-                    try
+                    if (latest.FrameSequence <= Volatile.Read(ref _lastRenderedFrameSeq))
                     {
-                        await SessionManager.StepYieldedSessionAsync(sid, Ui.CurrentUser!.Id);
-                        await RefreshRenderStateAsync(sid);
+                        return;
                     }
-                    catch (Exception ex)
-                    {
-                        _error = ex.Message;
-                    }
-                    finally
-                    {
-                        _busy = false;
-                        StateHasChanged();
-                    }
+
+                    await RefreshRenderStateAsync(sessionId, minFrameSequence: latest.FrameSequence);
+                    StateHasChanged();
                 });
             }
-            catch (OperationCanceledException)
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on session switch or component dispose
+        }
+        catch (Exception ex)
+        {
+            if (!_disposed && !ct.IsCancellationRequested)
             {
-                // Expected on cancel/dispose
+                try
+                {
+                    await InvokeAsync(() =>
+                    {
+                        if (!_disposed && !ct.IsCancellationRequested)
+                        {
+                            _error = ex.Message;
+                            StateHasChanged();
+                        }
+                    });
+                }
+                catch
+                {
+                    // Component circuit may already be disconnected during async listener teardown.
+                }
             }
-        }, ct);
+        }
+        finally
+        {
+            if (ReferenceEquals(_frameSub, subscription))
+            {
+                _listenerStopped = true;
+            }
+        }
     }
 
-    private void CancelYieldPump()
+    private void StopFrameSubscriptionImmediate()
     {
-        if (_yieldCts is not null)
+        if (_frameListenerCts is not null)
         {
-            _yieldCts.Cancel();
-            _yieldCts.Dispose();
-            _yieldCts = null;
+            _frameListenerCts.Cancel();
+            _frameListenerCts.Dispose();
+            _frameListenerCts = null;
         }
+
+        if (_frameSub is not null)
+        {
+            _frameSub.Dispose();
+            _frameSub = null;
+        }
+
+        if (_subscribedSessionId != Guid.Empty)
+        {
+            if (_pendingAckSessionId == _subscribedSessionId)
+            {
+                _pendingAckSessionId = Guid.Empty;
+                _pendingAckFrameSeq = 0;
+            }
+
+            Volatile.Write(ref _lastRenderedFrameSeq, 0);
+        }
+
+        _subscribedSessionId = Guid.Empty;
+        _listenerStopped = false;
+    }
+
+    private async Task StopFrameSubscriptionAsync()
+    {
+        if (_frameListenerCts is not null)
+        {
+            await _frameListenerCts.CancelAsync();
+            _frameListenerCts.Dispose();
+            _frameListenerCts = null;
+        }
+
+        if (_frameSub is not null)
+        {
+            await _frameSub.DisposeAsync();
+            _frameSub = null;
+        }
+
+        if (_subscribedSessionId != Guid.Empty)
+        {
+            if (_pendingAckSessionId == _subscribedSessionId)
+            {
+                _pendingAckSessionId = Guid.Empty;
+                _pendingAckFrameSeq = 0;
+            }
+
+            Volatile.Write(ref _lastRenderedFrameSeq, 0);
+        }
+
+        _subscribedSessionId = Guid.Empty;
+        _listenerStopped = false;
     }
 
     private async Task RegisterCustomFontsAsync(
@@ -1216,10 +1368,37 @@
         return null;
     }
 
+    private bool HasVisibleAnimatedAssets()
+    {
+        for (int i = 0; i < _renderItems.Count; i++)
+        {
+            StageRenderItem item = _renderItems[i];
+            if (item.Kind != StageItemKind.Image)
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(item.AssetKey) &&
+                _assetCache.TryGetValue(item.AssetKey, out AssetCacheEntry? asset) &&
+                asset.IsAnimated)
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(item.HoverAssetKey) &&
+                _assetCache.TryGetValue(item.HoverAssetKey, out AssetCacheEntry? hoverAsset) &&
+                hoverAsset.IsAnimated)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private void UpdateAnimationLoop()
     {
-        bool needsAnimation = _assetCache.Values.Any(static a => a.IsAnimated);
-        if (!needsAnimation)
+        if (!HasVisibleAnimatedAssets())
         {
             StopAnimationLoop();
             return;
@@ -1246,6 +1425,14 @@
             {
                 // Expected on stop/dispose
             }
+            catch (ObjectDisposedException)
+            {
+                // Component circuit disposed
+            }
+            catch (InvalidOperationException)
+            {
+                // Blazor dispatcher unavailable after disconnect
+            }
         }, ct);
     }
 
@@ -1256,10 +1443,29 @@
             return;
         }
 
-        List<string> animatedKeys = _assetCache
-            .Where(static kv => kv.Value.IsAnimated)
-            .Select(static kv => kv.Key)
-            .ToList();
+        var animatedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < _renderItems.Count; i++)
+        {
+            StageRenderItem item = _renderItems[i];
+            if (item.Kind != StageItemKind.Image)
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(item.AssetKey) &&
+                _assetCache.TryGetValue(item.AssetKey, out AssetCacheEntry? asset) &&
+                asset.IsAnimated)
+            {
+                animatedKeys.Add(item.AssetKey);
+            }
+
+            if (!string.IsNullOrEmpty(item.HoverAssetKey) &&
+                _assetCache.TryGetValue(item.HoverAssetKey, out AssetCacheEntry? hoverAsset) &&
+                hoverAsset.IsAnimated)
+            {
+                animatedKeys.Add(item.HoverAssetKey);
+            }
+        }
 
         if (animatedKeys.Count == 0)
         {
@@ -1526,8 +1732,13 @@
         }
 
         string trimmed = raw.Trim();
-        if (trimmed.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase)
-            || trimmed.StartsWith("g:", StringComparison.OrdinalIgnoreCase)
+        if (trimmed.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase))
+        {
+            string name = trimmed["sprite:".Length..].Trim();
+            return name.Length == 0 ? null : $"sprite:{name}";
+        }
+
+        if (trimmed.StartsWith("g:", StringComparison.OrdinalIgnoreCase)
             || trimmed.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase)
             || trimmed.StartsWith("vfs:", StringComparison.OrdinalIgnoreCase))
         {
@@ -1564,19 +1775,30 @@
         _timeoutGenId = pending.GenerationId;
         long totalMs = pending.TimeoutMilliseconds.Value;
         _remainingSeconds = totalMs / 1000.0;
-        _showTimeoutBadge = pending.Kind != InputRequestKind.TimedWait || totalMs >= 1000;
+        bool showBadge = pending.Kind != InputRequestKind.TimedWait || totalMs >= 1000;
+        _showTimeoutBadge = showBadge;
         _timeoutCts = new CancellationTokenSource();
         CancellationToken ct = _timeoutCts.Token;
         long genId = pending.GenerationId;
 
         _ = Task.Run(async () =>
         {
-            var sw = Stopwatch.StartNew();
-            int lastDisplayedTenths = (int)Math.Ceiling(totalMs / 100.0);
             try
             {
-                using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(33));
-                while (await timer.WaitForNextTickAsync(ct))
+                if (!showBadge)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(totalMs), ct);
+                    _remainingSeconds = 0;
+                    await InvokeAsync(async () =>
+                    {
+                        await SubmitResponseAsync(new InputResponse(genId, IsTimeout: true));
+                    });
+                    return;
+                }
+
+                var sw = Stopwatch.StartNew();
+                int lastDisplayedTenths = (int)Math.Ceiling(totalMs / 100.0);
+                while (true)
                 {
                     long leftMs = totalMs - sw.ElapsedMilliseconds;
                     if (leftMs <= 0)
@@ -1591,16 +1813,27 @@
 
                     _remainingSeconds = leftMs / 1000.0;
                     int tenths = (int)Math.Ceiling(leftMs / 100.0);
-                    if (_showTimeoutBadge && tenths != lastDisplayedTenths)
+                    if (tenths != lastDisplayedTenths)
                     {
                         lastDisplayedTenths = tenths;
                         await InvokeAsync(StateHasChanged);
                     }
+
+                    long stepMs = Math.Min(leftMs, 100L);
+                    await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(1L, stepMs)), ct);
                 }
             }
             catch (OperationCanceledException)
             {
                 // Cancelled by user input or dispose
+            }
+            catch (ObjectDisposedException)
+            {
+                // Component circuit disposed
+            }
+            catch (InvalidOperationException)
+            {
+                // Blazor dispatcher unavailable after disconnect
             }
         }, ct);
     }
@@ -1629,12 +1862,19 @@
         _busy = true;
         _error = null;
         CancelTimeout();
-        CancelYieldPump();
         try
         {
             Guid sid = _renderState.Summary.SessionId;
-            await SessionManager.SubmitInputAsync(sid, Ui.CurrentUser!.Id, response);
-            await RefreshRenderStateAsync(sid);
+            EnsureFrameSubscription(sid);
+            RuntimeSessionSnapshot snap = await SessionManager.SubmitInputAsync(sid, Ui.CurrentUser!.Id, response);
+            if (snap.Display.FrameSequence > Volatile.Read(ref _lastRenderedFrameSeq))
+            {
+                await RefreshRenderStateAsync(sid);
+            }
+            else
+            {
+                ConfigurePendingTimeout(_renderState?.PendingInput);
+            }
         }
         catch (Exception ex)
         {
@@ -1710,12 +1950,12 @@
         _busy = true;
         _error = null;
         CancelTimeout();
-        CancelYieldPump();
         try
         {
             Guid sid = _renderState.Summary.SessionId;
             Guid uid = Ui.CurrentUser!.Id;
             int mouseBtn = MapMouseButton(e.Button);
+            EnsureFrameSubscription(sid);
 
             SessionHitTestActionResult hitResult = await SessionManager.HitTestAndClickAsync(
                 sid,
@@ -1725,6 +1965,7 @@
                 mouseBtn,
                 submitIfInteractive: true);
 
+            RuntimeSessionSnapshot latestSnap = hitResult.Snapshot;
             if (!hitResult.InputSubmitted && item.Button is { IsButton: true } btn)
             {
                 var fallback = new InputResponse(
@@ -1733,10 +1974,17 @@
                     IntValue: btn.IsInteger ? btn.IntValue : null,
                     StringValue: btn.StringValue ?? (btn.IsInteger ? btn.IntValue.ToString(CultureInfo.InvariantCulture) : item.Text),
                     HitTest: hitResult.HitTestSlots);
-                await SessionManager.SubmitInputAsync(sid, uid, fallback);
+                latestSnap = await SessionManager.SubmitInputAsync(sid, uid, fallback);
             }
 
-            await RefreshRenderStateAsync(sid);
+            if (latestSnap.Display.FrameSequence > Volatile.Read(ref _lastRenderedFrameSeq))
+            {
+                await RefreshRenderStateAsync(sid);
+            }
+            else
+            {
+                ConfigurePendingTimeout(_renderState?.PendingInput);
+            }
         }
         catch (Exception ex)
         {
@@ -1769,6 +2017,7 @@
             Guid sid = _renderState.Summary.SessionId;
             Guid uid = Ui.CurrentUser!.Id;
             int mouseBtn = MapMouseButton(e.Button);
+            EnsureFrameSubscription(sid);
 
             SessionHitTestActionResult hitResult = await SessionManager.HitTestAndClickAsync(
                 sid,
@@ -1781,8 +2030,14 @@
             if (hitResult.InputSubmitted)
             {
                 CancelTimeout();
-                CancelYieldPump();
-                await RefreshRenderStateAsync(sid);
+                if (hitResult.Snapshot.Display.FrameSequence > Volatile.Read(ref _lastRenderedFrameSeq))
+                {
+                    await RefreshRenderStateAsync(sid);
+                }
+                else
+                {
+                    ConfigurePendingTimeout(_renderState?.PendingInput);
+                }
             }
         }
         catch (Exception ex)
@@ -2089,8 +2344,8 @@
         Ui.Changed -= OnUiChanged;
         HostWindow.FullscreenChanged -= OnHostFullscreenChanged;
         CancelTimeout();
-        CancelYieldPump();
         StopAnimationLoop();
+        await StopFrameSubscriptionAsync();
 
         if (Ui.IsFullscreen || HostWindow.IsFullscreen)
         {

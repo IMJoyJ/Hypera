@@ -66,7 +66,26 @@ public sealed record ConsoleScene(
     int? HoveredCbgButtonValue = null,
     HtmlButtonContext? HoveredButton = null,
     long ElapsedAnimationMs = 0,
-    string? DefaultFontFamily = null);
+    string? DefaultFontFamily = null,
+    IReadOnlyDictionary<string, long>? DynamicAssetVersions = null)
+{
+    /// <summary>
+    /// Computes (or refreshes) the deduplicated <see cref="DynamicAssetVersions"/> side table
+    /// against the supplied <paramref name="graphics"/> and <paramref name="sprites"/> registries.
+    /// </summary>
+    public ConsoleScene WithDynamicAssetVersions(GraphicsManager? graphics, SpriteRegistry? sprites) =>
+        this with
+        {
+            DynamicAssetVersions = DynamicAssetVersionCollector.Collect(this, graphics, sprites),
+        };
+
+    /// <summary>
+    /// Returns <see langword="true"/> when at least one visible layer or line in this scene
+    /// references an animated sprite in <paramref name="sprites"/>.
+    /// </summary>
+    public bool ContainsAnimatedSprites(SpriteRegistry? sprites) =>
+        DynamicAssetVersionCollector.ContainsAnimatedSprites(this, sprites);
+}
 
 /// <summary>
 /// Authoritative instance-scoped virtual console buffer tracking logical &amp; wrapped physical lines,
@@ -83,6 +102,7 @@ public sealed class VirtualConsoleBuffer
     private readonly List<PendingStyledRun> _pendingStyledRuns = [];
     private readonly GlyphMeasurer _measurer;
     private readonly SpriteRegistry? _sprites;
+    private readonly GraphicsManager? _graphics;
 
     internal readonly record struct PendingStyledRun(
         string Text,
@@ -116,12 +136,14 @@ public sealed class VirtualConsoleBuffer
         uint foreColorRgba = 0xC0C0C0FFu,
         uint backColorRgba = 0x000000FFu,
         uint focusColorRgba = 0xFFFF00FFu,
-        int maxLogLines = 5000)
+        int maxLogLines = 5000,
+        GraphicsManager? graphics = null)
     {
         ArgumentNullException.ThrowIfNull(measurer);
         Viewport = viewport;
         _measurer = measurer;
         _sprites = sprites;
+        _graphics = graphics;
         DefaultFontFamily = defaultFontFamily;
         CurrentFontFamily = defaultFontFamily;
         DefaultForeColorRgba = foreColorRgba;
@@ -580,7 +602,8 @@ public sealed class VirtualConsoleBuffer
     public ConsoleScene CaptureScene(
         int? hoveredCbgButtonValue = null,
         HtmlButtonContext? hoveredButton = null,
-        long elapsedAnimationMs = 0)
+        long elapsedAnimationMs = 0,
+        bool includeDynamicAssetVersions = false)
     {
         int effLineH = _measurer.GetEffectiveLineHeight(
             CurrentFontFamily,
@@ -609,6 +632,16 @@ public sealed class VirtualConsoleBuffer
             }
         }
 
+        IReadOnlyDictionary<string, long>? dynamicAssetVersions = includeDynamicAssetVersions
+            ? DynamicAssetVersionCollector.Collect(
+                _backgroundImages,
+                _cbgLayers,
+                visible,
+                _islandLayers,
+                _graphics,
+                _sprites)
+            : null;
+
         return new ConsoleScene(
             Viewport: Viewport,
             BackgroundColorRgba: CurrentBackColorRgba,
@@ -622,7 +655,8 @@ public sealed class VirtualConsoleBuffer
             HoveredCbgButtonValue: hoveredCbgButtonValue,
             HoveredButton: hoveredButton,
             ElapsedAnimationMs: elapsedAnimationMs,
-            DefaultFontFamily: DefaultFontFamily);
+            DefaultFontFamily: DefaultFontFamily,
+            DynamicAssetVersions: dynamicAssetVersions);
     }
 
     private void CommitHtmlLine(string html, bool noWrapOverride)

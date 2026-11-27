@@ -173,7 +173,7 @@ public sealed partial class EmueraEngine
         checkpoint.Dispose();
 
         NotifyRedrawFlush();
-        EmitSnapshotInternal();
+        EmitSnapshotInternal(DisplayFrameReason.Undo);
         return true;
     }
 

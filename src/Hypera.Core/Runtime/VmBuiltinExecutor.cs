@@ -2166,9 +2166,7 @@ internal static partial class VmBuiltinExecutor
                     : null;
 
             case BuiltinInstructionKind.AWAIT:
-                engine.LastAwaitMilliseconds = Math.Max(1L, w.GetInt(0, 1L));
-                engine.NotifyRedrawFlush();
-                engine.EmitSnapshotInternal();
+                engine.EmitYieldFrame(Math.Max(1L, w.GetInt(0, 1L)), notifyRedrawFlush: true, DisplayFrameReason.Await);
                 return EngineStepStatus.Yielded;
 
             case BuiltinInstructionKind.INPUT:

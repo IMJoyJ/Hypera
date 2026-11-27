@@ -46,11 +46,42 @@ public sealed record DisplaySnapshot(
     IReadOnlyList<DisplayOperation> Operations,
     InputRequest? PendingInput = null);
 
+public enum DisplayFrameReason : byte
+{
+    WaitingInput = 0,
+    Await = 1,
+    Yield = 2,
+    RedrawFlush = 3,
+    Completed = 4,
+    Faulted = 5,
+    Undo = 6,
+    Manual = 7,
+}
+
+public readonly record struct DisplayFrameNotification(
+    long FrameSequence,
+    long FlushSequence,
+    DisplayFrameReason Reason,
+    EngineStepStatus EngineStatus,
+    int RedrawMode,
+    long AwaitMilliseconds,
+    InputRequest? PendingInput = null);
+
 /// <summary>
-/// Structured display output sink enabling headless CLI testing and CloudEmuera Web streaming
-/// without coupling the core engine to desktop UI frameworks.
+/// Structured display output &amp; frame-ready sink enabling headless CLI testing, desktop Skia views,
+/// and Web/MAUI streaming without coupling the core engine to UI frameworks.
 /// </summary>
 public interface IDisplaySnapshotSink
 {
-    void OnDisplaySnapshot(DisplaySnapshot snapshot);
+    /// <summary>
+    /// When <see langword="true"/> (default for legacy snapshot-push sinks), the engine materializes a
+    /// full <see cref="DisplaySnapshot"/> copy and invokes <see cref="OnDisplaySnapshot"/>.
+    /// Lightweight frame-driven hosts that pull the latest <see cref="ConsoleScene"/> under backpressure
+    /// can return <see langword="false"/> to eliminate snapshot allocations on intermediate frames.
+    /// </summary>
+    bool RequiresSnapshotMaterialization => true;
+
+    void OnDisplaySnapshot(DisplaySnapshot snapshot) { }
+
+    void OnFrameReady(DisplayFrameNotification notification) { }
 }
