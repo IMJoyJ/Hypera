@@ -345,22 +345,23 @@ public sealed class HyperaGameHost : IDisposable
         SymbolTable symbols;
         bool loadedPrebuilt = false;
 
+        CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, compilerOptions.IgnoreCase) with
+        {
+            IsDebugMode = isDebugMode,
+        };
+
         if (usePrebuiltBytecode && TryLoadPrebuiltBytecode(vfs, out BytecodeModule? embedded) && embedded is not null)
         {
             module = embedded;
-            symbols = RuntimeDynamicCompiler.CreateSharedSymbolTable(module);
+            symbols = RuntimeDynamicCompiler.CreateSharedSymbolTable(module, external);
             loadedPrebuilt = true;
         }
         else
         {
-            CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, compilerOptions.IgnoreCase) with
-            {
-                IsDebugMode = isDebugMode,
-            };
             var compiler = new ErbProjectCompiler(compilerOptions, external);
             CompilationResult compilation = compiler.CompileProject(vfs, throwOnError: true);
             module = compilation.Module;
-            symbols = RuntimeDynamicCompiler.CreateSharedSymbolTable(module);
+            symbols = RuntimeDynamicCompiler.CreateSharedSymbolTable(module, external);
         }
 
         return new SharedGamePackage
@@ -562,7 +563,11 @@ public sealed class HyperaGameHost : IDisposable
 
         // 6. Wire RuntimeDynamicCompiler (IDynamicEvaluator)
         Report(progress, 97, "Preparing dynamic expression evaluator...");
-        var dynamicCompiler = new RuntimeDynamicCompiler(module, sharedSymbols ?? compilation?.Symbols);
+        SymbolTable? dynamicSymbols = sharedSymbols ?? compilation?.Symbols;
+        CompilerExternalContext? dynamicExternal = dynamicSymbols is null
+            ? CompilerExternalContext.FromGameData(gameData, module.CompilerOptions.IgnoreCase, isDebugMode: opts.IsDebugMode)
+            : null;
+        var dynamicCompiler = new RuntimeDynamicCompiler(module, dynamicSymbols, dynamicExternal);
         dynamicCompiler.AttachTo(engine);
         ct.ThrowIfCancellationRequested();
 

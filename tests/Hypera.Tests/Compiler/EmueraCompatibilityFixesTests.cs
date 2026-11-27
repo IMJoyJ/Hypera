@@ -824,4 +824,90 @@ public sealed class EmueraCompatibilityFixesTests
         Assert.Equal(EngineStepStatus.Faulted, engine.Step());
         Assert.IsType<InvalidOperationException>(engine.FaultException);
     }
+
+    [Fact]
+    public void RuntimeDynamicCompiler_LazyHydration_PreservesFunctionIdConstDefaultsAndKeywordSubscripts()
+    {
+        string erh = """
+            #DIM DECK_BUF, 20
+            #DIM CONST CARD_A = 2120
+            #DIM CONST CARD_B = 2121
+            """;
+
+        // Declare several functions BEFORE POOL_COUNT so POOL_COUNT's real FunctionId != 0/1
+        string erb = """
+            @DUMMY_ZERO(REF_ARG)
+            #DIM REF REF_ARG
+            RETURN 999
+
+            @DUMMY_ONE
+            RETURN GETVAR("")
+
+            @MAIN
+            SETVAR @"DECK_BUF:POOL_COUNT(1)", CARD_A
+            SETVAR @"DECK_BUF:POOL_COUNT(0)", CARD_B
+            SETVAR @"DECK_BUF:POOL_COUNT(0)", GETVAR("CARD_A") + 5
+            A:0 = DECK_BUF:0
+            A:1 = DECK_BUF:1
+            A:2 = DECK_BUF:2
+            A:3 = GETVAR("CARD_B")
+            SETVAR "FLAG:CUSTOM_KEY", 77
+            A:4 = GETVAR("FLAG:CUSTOM_KEY")
+            RETURN 0
+
+            @POOL_COUNT(RESET_FLAG)
+            #FUNCTION
+            #DIM CNT
+            #DIM DYNAMIC RESET_FLAG
+            IF RESET_FLAG
+                CNT = 0
+                RETURNF 0
+            ELSE
+                CNT += 1
+                RETURNF CNT
+            ENDIF
+            """;
+
+        var vfs = new CompilerMemoryVfs();
+        vfs.AddFile("ERB/HEADER.ERH", erh);
+        vfs.AddFile("ERB/MAIN.ERB", erb);
+
+        var external = new CompilerExternalContext
+        {
+            KeywordResolver = (string varName, int dimIdx, string kw, out long idx) =>
+            {
+                if (varName.Equals("FLAG", StringComparison.OrdinalIgnoreCase) && dimIdx == 0 && kw == "CUSTOM_KEY")
+                {
+                    idx = 12;
+                    return true;
+                }
+
+                idx = 0;
+                return false;
+            },
+        };
+
+        var compiler = new ErbProjectCompiler(CompilerOptions.Default, external);
+        CompilationResult compiled = compiler.CompileProject(vfs, throwOnError: true);
+
+        // Simulate loading from precompiled .heb bytecode: discard compilation.Symbols and rebuild lazily!
+        SymbolTable lazySymbols = RuntimeDynamicCompiler.CreateSharedSymbolTable(compiled.Module, external);
+        using var engine = new EmueraEngine(compiled.Module, vfs);
+        new RuntimeDynamicCompiler(compiled.Module, lazySymbols).AttachTo(engine);
+
+        FunctionDescriptor mainFn = compiled.Module.Functions.First(f => f.Name.Equals("MAIN", StringComparison.OrdinalIgnoreCase));
+        engine.PushEntryFrame(mainFn);
+        EngineStepStatus st = engine.Step(100_000);
+
+        Assert.Null(engine.FaultException);
+        Assert.Equal(EngineStepStatus.Completed, st);
+        Assert.True(engine.FastVariables!.TryResolveSlot("A", out int aSlot));
+        Assert.True(engine.FastVariables.TryResolveSlot("FLAG", out int flagSlot));
+        Assert.Equal(2120L, engine.FastVariables.GetInt1D(aSlot, 0));
+        Assert.Equal(2121L, engine.FastVariables.GetInt1D(aSlot, 1));
+        Assert.Equal(2125L, engine.FastVariables.GetInt1D(aSlot, 2));
+        Assert.Equal(2121L, engine.FastVariables.GetInt1D(aSlot, 3));
+        Assert.Equal(77L, engine.FastVariables.GetInt1D(aSlot, 4));
+        Assert.Equal(77L, engine.FastVariables.GetInt1D(flagSlot, 12));
+    }
 }

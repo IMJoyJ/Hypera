@@ -228,7 +228,9 @@ internal sealed class FunctionBytecodeEmitter
                     ValueKind: priv.ValueKind,
                     Scope: priv.Scope,
                     Dimensions: priv.Dimensions,
-                    IsConst: priv.IsConst));
+                    IsConst: priv.IsConst,
+                    DefaultIntValues: priv.DefaultIntValues,
+                    DefaultStrValues: priv.DefaultStrValues));
             }
         }
     }

@@ -372,7 +372,8 @@ public sealed partial class SymbolTable
         SourceSpan headerSpan,
         string filePath,
         ImmutableArray<ErbToken> rawParamTokens,
-        DiagnosticBag diagnostics)
+        DiagnosticBag diagnostics,
+        int? explicitFunctionId = null)
     {
         bool ignoreFuncCase = _options.IgnoreCase && !_options.CompatiFunctionNoIgnoreCase;
         bool isEvent = IsEventFunctionName(name, ignoreFuncCase);
@@ -399,13 +400,14 @@ public sealed partial class SymbolTable
                 [name]);
         }
 
+        int assignedId = explicitFunctionId ?? _allFunctions.Count;
         var fn = new UserFunctionSymbol
         {
-            FunctionId = _allFunctions.Count,
+            FunctionId = assignedId,
             Name = name,
             HeaderSpan = headerSpan,
             FilePath = filePath,
-            DefinitionOrder = _allFunctions.Count,
+            DefinitionOrder = assignedId,
             IsEvent = isEvent,
             IsSystem = isSystem,
             PrivateVariables = new Dictionary<string, ResolvedVariable>(_idComparer),

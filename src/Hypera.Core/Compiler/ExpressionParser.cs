@@ -241,7 +241,14 @@ public sealed class ExpressionParser
     {
         ExprNode expr = ParseExpression(
             stream, activeFunction, filePath, diagnostics, stopAtComma: true, stopAtAssign: true, onUserFunctionReferenced: onUserFunctionReferenced);
-        if (expr is not VariableAccessExpr varExpr)
+        VariableAccessExpr? varExpr = expr switch
+        {
+            VariableAccessExpr va => va,
+            IntLiteralExpr { ConstArraySource: { } constIntRef } => constIntRef,
+            StrLiteralExpr { ConstArraySource: { } constStrRef } => constStrRef,
+            _ => null,
+        };
+        if (varExpr is null)
         {
             diagnostics.ReportError("ERA1410", "Expected a variable reference.", expr.Span, filePath);
             return null;
@@ -888,15 +895,13 @@ public sealed class ExpressionParser
             int constLen = variable.Dimensions.Length > 0 ? variable.Dimensions[0] : 1;
             if (constLen == 1 && (!hasNoExplicitSubs || finalSubs.Count <= 1))
             {
-                VariableAccessExpr? constArraySource = hasNoExplicitSubs
-                    ? new VariableAccessExpr(variable, [.. finalSubs], IsBareArrayReference: true, fullSpan)
-                    : null;
+                var constSource = new VariableAccessExpr(variable, [.. finalSubs], IsBareArrayReference: hasNoExplicitSubs, fullSpan);
 
                 if (variable.ValueKind == VariableValueKind.Int && variable.DefaultIntValues.Length == 1)
                 {
                     return new IntLiteralExpr(variable.DefaultIntValues[0], fullSpan)
                     {
-                        ConstArraySource = constArraySource,
+                        ConstArraySource = constSource,
                     };
                 }
 
@@ -904,20 +909,28 @@ public sealed class ExpressionParser
                 {
                     return new StrLiteralExpr(variable.DefaultStrValues[0], fullSpan)
                     {
-                        ConstArraySource = constArraySource,
+                        ConstArraySource = constSource,
                     };
                 }
             }
             else if (!hasNoExplicitSubs && finalSubs is [IntLiteralExpr constIdx])
             {
+                var constSource = new VariableAccessExpr(variable, [.. finalSubs], IsBareArrayReference: false, fullSpan);
+
                 if (variable.ValueKind == VariableValueKind.Int && (ulong)constIdx.Value < (ulong)variable.DefaultIntValues.Length)
                 {
-                    return new IntLiteralExpr(variable.DefaultIntValues[(int)constIdx.Value], fullSpan);
+                    return new IntLiteralExpr(variable.DefaultIntValues[(int)constIdx.Value], fullSpan)
+                    {
+                        ConstArraySource = constSource,
+                    };
                 }
 
                 if (variable.ValueKind == VariableValueKind.Str && (ulong)constIdx.Value < (ulong)variable.DefaultStrValues.Length)
                 {
-                    return new StrLiteralExpr(variable.DefaultStrValues[(int)constIdx.Value], fullSpan);
+                    return new StrLiteralExpr(variable.DefaultStrValues[(int)constIdx.Value], fullSpan)
+                    {
+                        ConstArraySource = constSource,
+                    };
                 }
             }
         }

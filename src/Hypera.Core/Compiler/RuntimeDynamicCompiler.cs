@@ -51,12 +51,12 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         public int SubscriptSlotIndex { get; init; }
     }
 
-    public RuntimeDynamicCompiler(BytecodeModule module, SymbolTable? symbols = null)
+    public RuntimeDynamicCompiler(BytecodeModule module, SymbolTable? symbols = null, CompilerExternalContext? externalContext = null)
     {
         ArgumentNullException.ThrowIfNull(module);
         _module = module;
         _options = module.CompilerOptions;
-        _symbols = symbols ?? CreateSharedSymbolTable(module);
+        _symbols = symbols ?? CreateSharedSymbolTable(module, externalContext);
         _lexer = new ErbLexer(_options, isDebugMode: true, _symbols.TryGetMacroTokens);
         _exprParser = new ExpressionParser(_symbols);
 
@@ -73,10 +73,10 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
     /// Builds a lightweight, shareable <see cref="SymbolTable"/> containing global variables and an
     /// on-demand function hydrator backed by <paramref name="module"/> (avoiding eager allocation of 100k+ function symbols).
     /// </summary>
-    public static SymbolTable CreateSharedSymbolTable(BytecodeModule module)
+    public static SymbolTable CreateSharedSymbolTable(BytecodeModule module, CompilerExternalContext? externalContext = null)
     {
         ArgumentNullException.ThrowIfNull(module);
-        return RebuildSymbolTableFromModule(module);
+        return RebuildSymbolTableFromModule(module, externalContext);
     }
 
     public BytecodeModule Module => _module;
@@ -1377,9 +1377,11 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         return _symbols.TryResolveCallableFunction(frame.FunctionName);
     }
 
-    private static SymbolTable RebuildSymbolTableFromModule(BytecodeModule module)
+    private static SymbolTable RebuildSymbolTableFromModule(BytecodeModule module, CompilerExternalContext? externalContext = null)
     {
-        var external = new CompilerExternalContext { ReplaceConfig = module.ReplaceConfig };
+        CompilerExternalContext external = externalContext is not null
+            ? externalContext with { ReplaceConfig = module.ReplaceConfig }
+            : new CompilerExternalContext { ReplaceConfig = module.ReplaceConfig };
         var st = new SymbolTable(module.CompilerOptions, external);
         var dummyDiag = new DiagnosticBag();
 
@@ -1409,6 +1411,8 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
                     IsSavedata = g.IsSavedata,
                     IsGlobal = g.IsGlobal,
                     IsConst = g.IsConst,
+                    DefaultIntValues = g.DefaultIntValues.IsDefault ? [] : g.DefaultIntValues,
+                    DefaultStrValues = g.DefaultStrValues.IsDefault ? [] : g.DefaultStrValues,
                 };
                 st.TryAddGlobalUserVariable(rv, default, null, dummyDiag);
                 rv.SlotId = g.SlotId;
@@ -1444,8 +1448,13 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
                         return existing[i];
                     }
                 }
-
-                return existing[0];
+            }
+            else if (module.TryGetFunctionByName(fd.Name, out FunctionDescriptor? primary)
+                     && primary is not null
+                     && primary.FunctionId != fd.FunctionId)
+            {
+                // Always hydrate the primary callable definition first so index 0 remains the callable target.
+                HydrateFunctionDescriptorLocked(module, st, primary);
             }
 
             return HydrateFunctionDescriptorLocked(module, st, fd);
@@ -1458,7 +1467,13 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         FunctionDescriptor fd)
     {
         var dummyDiag = new DiagnosticBag();
-        UserFunctionSymbol fn = st.RegisterFunction(fd.Name, default, "<module>", [], dummyDiag);
+        UserFunctionSymbol fn = st.RegisterFunction(
+            fd.Name,
+            default,
+            "<module>",
+            [],
+            dummyDiag,
+            explicitFunctionId: fd.FunctionId);
         fn.EntryPc = fd.EntryPc;
         fn.InstructionCount = fd.InstructionCount;
         fn.IntRegisterCount = fd.IntRegisterCount;
@@ -1480,6 +1495,8 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
                 Dimensions = lv.Dimensions,
                 IsByRef = lv.Scope == VariableScopeKind.Reference,
                 IsConst = lv.IsConst,
+                DefaultIntValues = lv.DefaultIntValues.IsDefault ? [] : lv.DefaultIntValues,
+                DefaultStrValues = lv.DefaultStrValues.IsDefault ? [] : lv.DefaultStrValues,
                 OwnerFunctionName = fd.Name,
             };
         }
