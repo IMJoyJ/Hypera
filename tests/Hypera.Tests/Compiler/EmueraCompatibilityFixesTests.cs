@@ -910,4 +910,107 @@ public sealed class EmueraCompatibilityFixesTests
         Assert.Equal(77L, engine.FastVariables.GetInt1D(aSlot, 4));
         Assert.Equal(77L, engine.FastVariables.GetInt1D(flagSlot, 12));
     }
+
+    [Fact]
+    public void ChkData_ReturnsUpstreamStatusCodes_And_ZeroedSystemDefaultsSurviveSaveLoad()
+    {
+        const string erb = """
+            @SYSTEM_TITLE
+            CALL TEST_CHKDATA
+            CALL TEST_SAVE_ZERO_DEFAULTS
+            QUIT
+
+            @TEST_CHKDATA
+            CHKDATA 0
+            GLOBAL:0 = RESULT
+            GLOBALS:0 = %RESULTS%
+            CHKDATA 1
+            GLOBAL:1 = RESULT
+            CHKDATA 2
+            GLOBAL:2 = RESULT
+            CHKDATA 3
+            GLOBAL:3 = RESULT
+            CHKDATA 4
+            GLOBAL:4 = RESULT
+            RETURN 0
+
+            @TEST_SAVE_ZERO_DEFAULTS
+            TARGET = 0
+            ASSI = 0
+            SAVEDATA 5, "ZeroDefaults"
+            TARGET = 7
+            ASSI = 3
+            LOADDATA 5
+            RETURN 0
+
+            @EVENTLOAD
+            B:0 = TARGET
+            B:1 = ASSI
+            QUIT
+            """;
+
+        string tempDir = Path.Combine(Path.GetTempPath(), "hypera_chkdata_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var vfs = new CompilerMemoryVfs();
+            vfs.AddFile("CSV/GameBase.csv", "コード,7153\nバージョン,900\nバージョン違い認める,600\n");
+            vfs.AddFile("emuera.config", "セーブデータをバイナリ形式で保存する:YES\nセーブデータをSAVフォルダ内に作成する:YES\n");
+            vfs.AddFile("ERB/MAIN.ERB", erb);
+
+            string savDir = Path.Combine(tempDir, "sav");
+            Directory.CreateDirectory(savDir);
+
+            // Slot 0: valid old version (800 >= AllowVersion 600)
+            File.WriteAllBytes(Path.Combine(savDir, "save00.sav"),
+                Hypera.Persistence.EraSaveSerializer.Save(new Hypera.Persistence.EraSaveSnapshot
+                {
+                    Header = new Hypera.Persistence.EraSaveHeader(7153L, 800L, "ValidSlot0", Hypera.Persistence.EraSaveFileType.Normal),
+                }, Hypera.Persistence.EraSaveFormat.Binary));
+            // Slot 1: missing
+            // Slot 2: wrong game code
+            File.WriteAllBytes(Path.Combine(savDir, "save02.sav"),
+                Hypera.Persistence.EraSaveSerializer.Save(new Hypera.Persistence.EraSaveSnapshot
+                {
+                    Header = new Hypera.Persistence.EraSaveHeader(9999L, 900L, "WrongCode", Hypera.Persistence.EraSaveFileType.Normal),
+                }, Hypera.Persistence.EraSaveFormat.Binary));
+            // Slot 3: version too old (500 < AllowVersion 600)
+            File.WriteAllBytes(Path.Combine(savDir, "save03.sav"),
+                Hypera.Persistence.EraSaveSerializer.Save(new Hypera.Persistence.EraSaveSnapshot
+                {
+                    Header = new Hypera.Persistence.EraSaveHeader(7153L, 500L, "TooOld", Hypera.Persistence.EraSaveFileType.Normal),
+                }, Hypera.Persistence.EraSaveFormat.Binary));
+            // Slot 4: corrupted binary file
+            File.WriteAllBytes(Path.Combine(savDir, "save04.sav"),
+                [0x89, 0x45, 0x52, 0x41, 0x0D, 0x0A, 0x1A, 0x0A, 0x10, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99]);
+
+            using HyperaGameHost host = HyperaGameHost.LoadFromVfs(vfs, ownsVfs: false, new HyperaGameLoadOptions
+            {
+                SaveDirectory = tempDir,
+                AutoStartSystemFlow = true,
+            });
+
+            EmueraEngine engine = host.Engine;
+            for (int i = 0; i < 20 && engine.Step(100_000) == EngineStepStatus.Running; i++) { }
+            Assert.Null(engine.FaultException);
+            Assert.Equal(EngineStepStatus.Completed, engine.Status);
+
+            Assert.True(engine.FastVariables!.TryResolveSlot("GLOBAL", out int gSlot));
+            Assert.True(engine.FastVariables.TryResolveSlot("GLOBALS", out int gsSlot));
+            Assert.Equal(0L, engine.FastVariables.GetInt1D(gSlot, 0));
+            Assert.Equal("ValidSlot0", engine.FastVariables.GetStr1D(gsSlot, 0));
+            Assert.Equal(1L, engine.FastVariables.GetInt1D(gSlot, 1));
+            Assert.Equal(2L, engine.FastVariables.GetInt1D(gSlot, 2));
+            Assert.Equal(3L, engine.FastVariables.GetInt1D(gSlot, 3));
+            Assert.Equal(4L, engine.FastVariables.GetInt1D(gSlot, 4));
+
+            Assert.True(engine.FastVariables.TryResolveSlot("B", out int bSlot));
+            Assert.Equal(0L, engine.FastVariables.GetInt1D(bSlot, 0));
+            Assert.Equal(0L, engine.FastVariables.GetInt1D(bSlot, 1));
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
 }

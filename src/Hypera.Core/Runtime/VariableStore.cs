@@ -1720,7 +1720,24 @@ public sealed class VariableStore : IVariableStore
             }
 
             bool include = wantGlobal ? slot.IsGlobal : (!slot.IsGlobal && slot.IsSavedata);
-            if (include && slot.FindLastNonDefaultIndex() >= 0)
+            if (!include)
+            {
+                continue;
+            }
+
+            // Always persist slots that have non-zero data OR non-zero system/initial defaults
+            // (e.g. TARGET=1, ASSI=-1, PBAND, EJAC) so explicitly zeroed values survive save/load.
+            if (slot.FindLastNonDefaultIndex() >= 0 ||
+                slot.InitialIntValues is { Length: > 0 } ||
+                slot.InitialStrValues is { Length: > 0 } ||
+                slot.SlotId == TargetSlotId ||
+                slot.SlotId == AssiSlotId ||
+                slot.SlotId == MasterSlotId ||
+                slot.SlotId == PlayerSlotId ||
+                slot.SlotId == NextComSlotId ||
+                slot.SlotId == PrevComSlotId ||
+                slot.SlotId == PbandSlotId ||
+                slot.SlotId == EjacSlotId)
             {
                 yield return slot;
             }

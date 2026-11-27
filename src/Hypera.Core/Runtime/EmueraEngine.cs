@@ -1761,7 +1761,7 @@ public sealed partial class EmueraEngine : IDisposable
         return false;
     }
 
-    internal bool CheckSaveSlotExists(int slotNo, out string summary)
+    internal long CheckSaveSlot(int slotNo, out string summary)
     {
         VariableStore vars = RequireVariableStore();
         if (_writableStorage is not null)
@@ -1769,20 +1769,30 @@ public sealed partial class EmueraEngine : IDisposable
             string relPath = _writableStorage.GetSaveSlotVirtualPath(slotNo, Options.UseSaveFolder);
             if (_writableStorage.FileExists(relPath))
             {
-                EraSaveHeader header = EraSaveSerializer.PeekHeader(_writableStorage.ReadAllBytes(relPath));
-                summary = header.SaveDataText;
-                return true;
+                return ValidateSaveHeaderBytes(_writableStorage.ReadAllBytes(relPath), vars.GameBase, EraSaveFileType.Normal, out summary);
             }
         }
 
         if (vars.HasMemorySaveSlot(slotNo, out EngineSaveSlotSnapshot? mem) && mem is not null)
         {
             summary = mem.SaveText;
-            return true;
+            return 0L;
         }
 
-        summary = string.Empty;
-        return false;
+        summary = "No save data";
+        return 1L;
+    }
+
+    internal bool CheckSaveSlotExists(int slotNo, out string summary)
+    {
+        long code = CheckSaveSlot(slotNo, out summary);
+        if (code != 0L)
+        {
+            summary = string.Empty;
+            return false;
+        }
+
+        return true;
     }
 
     internal void DeleteSaveSlot(int slotNo)

@@ -994,9 +994,10 @@ internal static partial class VmBuiltinExecutor
             }
 
             case BuiltinMethodKind.CHKDATA:
-                return engine.CheckSaveSlotExists((int)w.GetInt(0), out string summary)
-                    ? SetResults0AndReturn(vars, summary, 0L)
-                    : SetResults0AndReturn(vars, "No save data", 1L);
+            {
+                long status = engine.CheckSaveSlot((int)w.GetInt(0), out string summary);
+                return SetResults0AndReturn(vars, summary, status);
+            }
 
             case BuiltinMethodKind.EXISTFILE:
                 return engine.FileSystem.FileExists(w.GetStr(0)) ? 1L : 0L;

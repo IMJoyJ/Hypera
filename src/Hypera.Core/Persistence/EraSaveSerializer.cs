@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Data;
 using System.Globalization;
 using System.IO.Compression;
 using System.Text;
@@ -134,9 +135,13 @@ public static class EraSaveSerializer
 
     private static void SaveBinary(EraSaveSnapshot snapshot, Stream output, bool compressed)
     {
-        Span<byte> magicBytes = stackalloc byte[8];
-        BinaryPrimitives.WriteUInt64LittleEndian(magicBytes, compressed ? ZipHeaderMagic : BinaryHeaderMagic);
-        output.Write(magicBytes);
+        // Upstream Emuera writes the 16-byte header (magic + version + dataCount) UNCOMPRESSED
+        // before opening the GZip stream for compressed saves.
+        Span<byte> headerBytes = stackalloc byte[16];
+        BinaryPrimitives.WriteUInt64LittleEndian(headerBytes[0..8], compressed ? ZipHeaderMagic : BinaryHeaderMagic);
+        BinaryPrimitives.WriteUInt32LittleEndian(headerBytes[8..12], snapshot.Header.BinaryVersion);
+        BinaryPrimitives.WriteUInt32LittleEndian(headerBytes[12..16], 0u); // DataCount reserved (0 in upstream)
+        output.Write(headerBytes);
 
         if (compressed)
         {
@@ -151,19 +156,17 @@ public static class EraSaveSerializer
 
     private static void WriteBinaryPayload(EraSaveSnapshot snapshot, Stream targetStream)
     {
-        using var w = new BinaryWriter(targetStream, Encoding.UTF8, leaveOpen: true);
+        // Upstream EraBinaryDataWriter uses Encoding.Unicode (UTF-16LE) for all BinaryWriter strings.
+        using var w = new BinaryWriter(targetStream, Encoding.Unicode, leaveOpen: true);
 
-        w.Write(snapshot.Header.BinaryVersion);
-        w.Write(0u); // DataCount reserved (0 in upstream)
         w.Write((byte)snapshot.Header.FileType);
-
-        WriteEbdbInt(w, snapshot.Header.ScriptUniqueCode);
-        WriteEbdbInt(w, snapshot.Header.ScriptVersion);
-        WriteEbdbString(w, snapshot.Header.SaveDataText);
+        w.Write(snapshot.Header.ScriptUniqueCode);
+        w.Write(snapshot.Header.ScriptVersion);
+        w.Write(snapshot.Header.SaveDataText ?? string.Empty);
 
         if (snapshot.Header.FileType is EraSaveFileType.Normal or EraSaveFileType.CharVar)
         {
-            WriteEbdbInt(w, snapshot.Characters.Count);
+            w.Write((long)snapshot.Characters.Count);
             foreach (EraCharacterSaveData chara in snapshot.Characters)
             {
                 WriteCharacterBinary(w, chara);
@@ -179,12 +182,16 @@ public static class EraSaveSerializer
         w.Write((byte)EraSaveDataType.EndOfFile);
 
         // VarExt (EM Data: Map, Xml, DataTable)
-        foreach ((string key, EraSaveValue value) in snapshot.VarExtVariables)
+        if (snapshot.Header.FileType is EraSaveFileType.Normal or EraSaveFileType.Global || snapshot.VarExtVariables.Count > 0)
         {
-            WriteWithKey(w, key, value);
+            foreach ((string key, EraSaveValue value) in snapshot.VarExtVariables)
+            {
+                WriteWithKey(w, key, value);
+            }
+
+            w.Write((byte)EraSaveDataType.EndOfFile);
         }
 
-        w.Write((byte)EraSaveDataType.EndOfFile);
         w.Flush();
     }
 
@@ -233,20 +240,47 @@ public static class EraSaveSerializer
         w.Write((byte)EraSaveDataType.EndOfCharacter);
     }
 
-    private static EraSaveHeader PeekBinaryHeader(Stream input, bool compressed)
+    private static BinaryReader OpenBinaryPayloadReader(Stream input, bool compressed, out uint version)
     {
-        input.Position = 8; // skip 8-byte magic
-        using Stream payloadStream = compressed
+        input.Position = 0;
+        Span<byte> headerBytes = stackalloc byte[16];
+        input.ReadExactly(headerBytes);
+
+        version = BinaryPrimitives.ReadUInt32LittleEndian(headerBytes[8..12]);
+        uint dataCount = BinaryPrimitives.ReadUInt32LittleEndian(headerBytes[12..16]);
+        if (dataCount > 0)
+        {
+            if (dataCount > 1024 * 1024)
+            {
+                throw new InvalidDataException($"Invalid binary save header dataCount: {dataCount}.");
+            }
+
+            byte[] extra = new byte[dataCount * 4];
+            input.ReadExactly(extra);
+        }
+
+        Stream payloadStream = compressed
             ? new GZipStream(input, CompressionMode.Decompress, leaveOpen: true)
             : input;
-        using var r = new BinaryReader(payloadStream, Encoding.UTF8, leaveOpen: true);
 
-        uint version = r.ReadUInt32();
-        _ = r.ReadUInt32(); // dataCount
-        var fileType = (EraSaveFileType)r.ReadByte();
-        long uniqueCode = ReadEbdbInt(r);
-        long scriptVersion = ReadEbdbInt(r);
-        string saveText = ReadEbdbString(r);
+        // Upstream EraBinaryDataReader uses Encoding.Unicode (UTF-16LE) for all BinaryReader strings.
+        return new BinaryReader(payloadStream, Encoding.Unicode, leaveOpen: !compressed);
+    }
+
+    private static EraSaveHeader PeekBinaryHeader(Stream input, bool compressed)
+    {
+        using BinaryReader r = OpenBinaryPayloadReader(input, compressed, out uint version);
+
+        byte fileTypeByte = r.ReadByte();
+        if (fileTypeByte > (byte)EraSaveFileType.CharVar)
+        {
+            throw new InvalidDataException($"Invalid EraSaveFileType: 0x{fileTypeByte:X2}");
+        }
+
+        var fileType = (EraSaveFileType)fileTypeByte;
+        long uniqueCode = r.ReadInt64();
+        long scriptVersion = r.ReadInt64();
+        string saveText = r.ReadString();
 
         return new EraSaveHeader(
             uniqueCode,
@@ -259,18 +293,18 @@ public static class EraSaveSerializer
 
     private static EraSaveSnapshot LoadBinary(Stream input, bool compressed)
     {
-        input.Position = 8; // skip 8-byte magic
-        using Stream payloadStream = compressed
-            ? new GZipStream(input, CompressionMode.Decompress, leaveOpen: true)
-            : input;
-        using var r = new BinaryReader(payloadStream, Encoding.UTF8, leaveOpen: true);
+        using BinaryReader r = OpenBinaryPayloadReader(input, compressed, out uint version);
 
-        uint version = r.ReadUInt32();
-        _ = r.ReadUInt32(); // DataCount
-        var fileType = (EraSaveFileType)r.ReadByte();
-        long uniqueCode = ReadEbdbInt(r);
-        long scriptVersion = ReadEbdbInt(r);
-        string saveText = ReadEbdbString(r);
+        byte fileTypeByte = r.ReadByte();
+        if (fileTypeByte > (byte)EraSaveFileType.CharVar)
+        {
+            throw new InvalidDataException($"Invalid EraSaveFileType: 0x{fileTypeByte:X2}");
+        }
+
+        var fileType = (EraSaveFileType)fileTypeByte;
+        long uniqueCode = r.ReadInt64();
+        long scriptVersion = r.ReadInt64();
+        string saveText = r.ReadString();
 
         var header = new EraSaveHeader(
             uniqueCode,
@@ -283,7 +317,12 @@ public static class EraSaveSerializer
         var characters = new List<EraCharacterSaveData>();
         if (fileType is EraSaveFileType.Normal or EraSaveFileType.CharVar)
         {
-            long charaCount = ReadEbdbInt(r);
+            long charaCount = r.ReadInt64();
+            if (charaCount < 0 || charaCount > 1_000_000)
+            {
+                throw new InvalidDataException($"Invalid character count in save file: {charaCount}.");
+            }
+
             for (long i = 0; i < charaCount; i++)
             {
                 characters.Add(ReadCharacterBinary(r));
@@ -291,32 +330,13 @@ public static class EraSaveSerializer
         }
 
         var variables = new Dictionary<string, EraSaveValue>(StringComparer.OrdinalIgnoreCase);
-        while (TryReadKeyValue(r, out EraSaveDataType tag, out string key, out EraSaveValue? value))
-        {
-            if (tag == EraSaveDataType.EndOfFile)
-            {
-                break;
-            }
-
-            if (value is not null)
-            {
-                variables[key] = value;
-            }
-        }
-
         var varExt = new Dictionary<string, EraSaveValue>(StringComparer.OrdinalIgnoreCase);
-        while (TryReadKeyValue(r, out EraSaveDataType tag, out string key, out EraSaveValue? value))
-        {
-            if (tag == EraSaveDataType.EndOfFile)
-            {
-                break;
-            }
 
-            if (value is not null)
-            {
-                varExt[key] = value;
-            }
-        }
+        // Section 1: Variables (terminated by EndOfFile 0xFF)
+        ReadBinaryKeyValueSection(r, variables, varExt);
+
+        // Section 2: VarExt / EM data (optional in vanilla Emuera; terminated by EndOfFile 0xFF or stream EOF)
+        ReadBinaryKeyValueSection(r, variables, varExt);
 
         return new EraSaveSnapshot
         {
@@ -325,6 +345,34 @@ public static class EraSaveSerializer
             Variables = variables,
             VarExtVariables = varExt,
         };
+    }
+
+    private static void ReadBinaryKeyValueSection(
+        BinaryReader r,
+        Dictionary<string, EraSaveValue> variables,
+        Dictionary<string, EraSaveValue> varExt)
+    {
+        while (TryReadKeyValue(r, out EraSaveDataType tag, out string key, out EraSaveValue? value))
+        {
+            if (tag == EraSaveDataType.EndOfFile)
+            {
+                break;
+            }
+
+            if (value is null)
+            {
+                continue;
+            }
+
+            if (tag is EraSaveDataType.Map or EraSaveDataType.Xml or EraSaveDataType.DataTable)
+            {
+                varExt[key] = value;
+            }
+            else
+            {
+                variables[key] = value;
+            }
+        }
     }
 
     private static EraCharacterSaveData ReadCharacterBinary(BinaryReader r)
@@ -432,7 +480,7 @@ public static class EraSaveSerializer
                 WriteIntArray3D(w, value.AsIntArray3D());
                 break;
             case EraSaveDataType.Str:
-                WriteEbdbString(w, value.AsStr());
+                w.Write(value.AsStr() ?? string.Empty);
                 break;
             case EraSaveDataType.StrArray:
                 WriteStrArray1D(w, value.AsStrArray());
@@ -447,10 +495,10 @@ public static class EraSaveSerializer
                 WriteMap(w, value.AsMap());
                 break;
             case EraSaveDataType.Xml:
-                WriteEbdbString(w, value.AsXml());
+                w.Write(value.AsXml() ?? string.Empty);
                 break;
             case EraSaveDataType.DataTable:
-                WriteDataTable(w, value.AsDataTable());
+                WriteDataTable(w, key, value.AsDataTable());
                 break;
             default:
                 throw new InvalidDataException($"Unsupported EraSaveDataType: {value.DataType}");
@@ -463,12 +511,12 @@ public static class EraSaveSerializer
         EraSaveDataType.IntArray => EraSaveValue.FromIntArray(ReadIntArray1D(r)),
         EraSaveDataType.IntArray2D => EraSaveValue.FromIntArray2D(ReadIntArray2D(r)),
         EraSaveDataType.IntArray3D => EraSaveValue.FromIntArray3D(ReadIntArray3D(r)),
-        EraSaveDataType.Str => EraSaveValue.FromStr(ReadEbdbString(r)),
+        EraSaveDataType.Str => EraSaveValue.FromStr(r.ReadString()),
         EraSaveDataType.StrArray => EraSaveValue.FromStrArray(ReadStrArray1D(r)),
         EraSaveDataType.StrArray2D => EraSaveValue.FromStrArray2D(ReadStrArray2D(r)),
         EraSaveDataType.StrArray3D => EraSaveValue.FromStrArray3D(ReadStrArray3D(r)),
         EraSaveDataType.Map => EraSaveValue.FromMap(ReadMap(r)),
-        EraSaveDataType.Xml => EraSaveValue.FromXml(ReadEbdbString(r)),
+        EraSaveDataType.Xml => EraSaveValue.FromXml(r.ReadString()),
         EraSaveDataType.DataTable => EraSaveValue.FromDataTable(ReadDataTable(r)),
         _ => throw new InvalidDataException($"Unexpected EraSaveDataType tag: 0x{(byte)tag:X2}"),
     };
@@ -519,27 +567,21 @@ public static class EraSaveSerializer
         w.Write(value ?? string.Empty);
     }
 
-    private static string ReadEbdbString(BinaryReader r)
-    {
-        byte token = r.ReadByte();
-        if (token != EbdbString)
-        {
-            throw new InvalidDataException($"Expected Ebdb String token 0xD8, got 0x{token:X2}.");
-        }
-
-        return r.ReadString();
-    }
-
     private static void WriteIntArray1D(BinaryWriter w, long[] arr)
     {
-        WriteEbdbInt(w, arr.Length);
+        w.Write(arr.Length);
         WriteIntSpanRle(w, arr);
         w.Write(EbdbEoD);
     }
 
     private static long[] ReadIntArray1D(BinaryReader r)
     {
-        int len = checked((int)ReadEbdbInt(r));
+        int len = r.ReadInt32();
+        if (len < 0)
+        {
+            throw new InvalidDataException($"Invalid IntArray1D length: {len}.");
+        }
+
         long[] arr = new long[len];
         int idx = 0;
         while (true)
@@ -574,8 +616,8 @@ public static class EraSaveSerializer
     {
         int d0 = arr.GetLength(0);
         int d1 = arr.GetLength(1);
-        WriteEbdbInt(w, d0);
-        WriteEbdbInt(w, d1);
+        w.Write(d0);
+        w.Write(d1);
 
         int zeroRowRun = 0;
         for (int i = 0; i < d0; i++)
@@ -622,8 +664,13 @@ public static class EraSaveSerializer
 
     private static long[,] ReadIntArray2D(BinaryReader r)
     {
-        int d0 = checked((int)ReadEbdbInt(r));
-        int d1 = checked((int)ReadEbdbInt(r));
+        int d0 = r.ReadInt32();
+        int d1 = r.ReadInt32();
+        if (d0 < 0 || d1 < 0)
+        {
+            throw new InvalidDataException($"Invalid IntArray2D dimensions: {d0}x{d1}.");
+        }
+
         long[,] arr = new long[d0, d1];
         int i = 0;
         int j = 0;
@@ -675,9 +722,9 @@ public static class EraSaveSerializer
         int d0 = arr.GetLength(0);
         int d1 = arr.GetLength(1);
         int d2 = arr.GetLength(2);
-        WriteEbdbInt(w, d0);
-        WriteEbdbInt(w, d1);
-        WriteEbdbInt(w, d2);
+        w.Write(d0);
+        w.Write(d1);
+        w.Write(d2);
 
         int zeroSliceRun = 0;
         for (int i = 0; i < d0; i++)
@@ -743,9 +790,14 @@ public static class EraSaveSerializer
 
     private static long[,,] ReadIntArray3D(BinaryReader r)
     {
-        int d0 = checked((int)ReadEbdbInt(r));
-        int d1 = checked((int)ReadEbdbInt(r));
-        int d2 = checked((int)ReadEbdbInt(r));
+        int d0 = r.ReadInt32();
+        int d1 = r.ReadInt32();
+        int d2 = r.ReadInt32();
+        if (d0 < 0 || d1 < 0 || d2 < 0)
+        {
+            throw new InvalidDataException($"Invalid IntArray3D dimensions: {d0}x{d1}x{d2}.");
+        }
+
         long[,,] arr = new long[d0, d1, d2];
         int i = 0, j = 0, k = 0;
 
@@ -807,7 +859,7 @@ public static class EraSaveSerializer
 
     private static void WriteStrArray1D(BinaryWriter w, string[] arr)
     {
-        WriteEbdbInt(w, arr.Length);
+        w.Write(arr.Length);
         int emptyRun = 0;
         for (int i = 0; i < arr.Length; i++)
         {
@@ -834,7 +886,12 @@ public static class EraSaveSerializer
 
     private static string[] ReadStrArray1D(BinaryReader r)
     {
-        int len = checked((int)ReadEbdbInt(r));
+        int len = r.ReadInt32();
+        if (len < 0)
+        {
+            throw new InvalidDataException($"Invalid StrArray1D length: {len}.");
+        }
+
         string[] arr = new string[len];
         Array.Fill(arr, string.Empty);
         int idx = 0;
@@ -874,8 +931,8 @@ public static class EraSaveSerializer
     {
         int d0 = arr.GetLength(0);
         int d1 = arr.GetLength(1);
-        WriteEbdbInt(w, d0);
-        WriteEbdbInt(w, d1);
+        w.Write(d0);
+        w.Write(d1);
 
         int emptyRowRun = 0;
         for (int i = 0; i < d0; i++)
@@ -922,8 +979,13 @@ public static class EraSaveSerializer
 
     private static string[,] ReadStrArray2D(BinaryReader r)
     {
-        int d0 = checked((int)ReadEbdbInt(r));
-        int d1 = checked((int)ReadEbdbInt(r));
+        int d0 = r.ReadInt32();
+        int d1 = r.ReadInt32();
+        if (d0 < 0 || d1 < 0)
+        {
+            throw new InvalidDataException($"Invalid StrArray2D dimensions: {d0}x{d1}.");
+        }
+
         string[,] arr = new string[d0, d1];
         for (int a = 0; a < d0; a++)
         {
@@ -980,9 +1042,9 @@ public static class EraSaveSerializer
         int d0 = arr.GetLength(0);
         int d1 = arr.GetLength(1);
         int d2 = arr.GetLength(2);
-        WriteEbdbInt(w, d0);
-        WriteEbdbInt(w, d1);
-        WriteEbdbInt(w, d2);
+        w.Write(d0);
+        w.Write(d1);
+        w.Write(d2);
 
         int emptySliceRun = 0;
         for (int i = 0; i < d0; i++)
@@ -1048,9 +1110,14 @@ public static class EraSaveSerializer
 
     private static string[,,] ReadStrArray3D(BinaryReader r)
     {
-        int d0 = checked((int)ReadEbdbInt(r));
-        int d1 = checked((int)ReadEbdbInt(r));
-        int d2 = checked((int)ReadEbdbInt(r));
+        int d0 = r.ReadInt32();
+        int d1 = r.ReadInt32();
+        int d2 = r.ReadInt32();
+        if (d0 < 0 || d1 < 0 || d2 < 0)
+        {
+            throw new InvalidDataException($"Invalid StrArray3D dimensions: {d0}x{d1}x{d2}.");
+        }
+
         string[,,] arr = new string[d0, d1, d2];
         for (int a = 0; a < d0; a++)
         {
@@ -1119,98 +1186,153 @@ public static class EraSaveSerializer
 
     private static void WriteMap(BinaryWriter w, Dictionary<string, string> map)
     {
-        WriteEbdbInt(w, map.Count);
+        w.Write(map.Count);
         foreach ((string k, string v) in map)
         {
-            WriteEbdbString(w, k);
-            WriteEbdbString(w, v);
+            w.Write(k ?? string.Empty);
+            w.Write(v ?? string.Empty);
         }
     }
 
     private static Dictionary<string, string> ReadMap(BinaryReader r)
     {
-        int count = checked((int)ReadEbdbInt(r));
+        int count = r.ReadInt32();
+        if (count < 0)
+        {
+            throw new InvalidDataException($"Invalid Map entry count: {count}.");
+        }
+
         var map = new Dictionary<string, string>(count, StringComparer.Ordinal);
         for (int i = 0; i < count; i++)
         {
-            string k = ReadEbdbString(r);
-            string v = ReadEbdbString(r);
+            string k = r.ReadString();
+            string v = r.ReadString();
             map[k] = v;
         }
 
         return map;
     }
 
-    private static void WriteDataTable(BinaryWriter w, EraDataTableSnapshot table)
+    private static void WriteDataTable(BinaryWriter w, string key, EraDataTableSnapshot table)
     {
-        WriteEbdbInt(w, table.Columns.Count);
+        // Upstream Emuera EM/EE writes DataTable as two raw UTF-16LE strings: WriteXmlSchema then WriteXml.
+        using var dt = new DataTable(string.IsNullOrWhiteSpace(key) ? "Table" : key)
+        {
+            Locale = CultureInfo.InvariantCulture,
+        };
+
         foreach (EraDataColumnDefinition col in table.Columns)
         {
-            WriteEbdbString(w, col.Name);
-            WriteEbdbString(w, col.TypeName);
+            Type colType = ResolveDataTableColumnType(col.TypeName);
+            DataColumn dc = dt.Columns.Add(col.Name, colType);
+            dc.AllowDBNull = true;
         }
 
-        WriteEbdbInt(w, table.Rows.Count);
-        foreach (object?[] row in table.Rows)
+        foreach (object?[] rowCells in table.Rows)
         {
+            DataRow dr = dt.NewRow();
             for (int c = 0; c < table.Columns.Count; c++)
             {
-                object? cell = c < row.Length ? row[c] : null;
+                object? cell = c < rowCells.Length ? rowCells[c] : null;
                 if (cell is null)
                 {
-                    w.Write((byte)0);
+                    dr[c] = DBNull.Value;
                 }
-                else if (cell is long l)
+                else if (dt.Columns[c].DataType == typeof(string))
                 {
-                    w.Write((byte)1);
-                    WriteEbdbInt(w, l);
-                }
-                else if (cell is int iv)
-                {
-                    w.Write((byte)1);
-                    WriteEbdbInt(w, iv);
+                    dr[c] = cell.ToString() ?? string.Empty;
                 }
                 else
                 {
-                    w.Write((byte)2);
-                    WriteEbdbString(w, cell.ToString() ?? string.Empty);
+                    dr[c] = Convert.ChangeType(cell, dt.Columns[c].DataType, CultureInfo.InvariantCulture);
                 }
             }
+
+            dt.Rows.Add(dr);
         }
+
+        var sb = new StringBuilder();
+        using var sw = new StringWriter(sb, CultureInfo.InvariantCulture);
+        dt.WriteXmlSchema(sw);
+        w.Write(sb.ToString());
+        sb.Clear();
+        dt.WriteXml(sw);
+        w.Write(sb.ToString());
     }
 
     private static EraDataTableSnapshot ReadDataTable(BinaryReader r)
     {
-        int colCount = checked((int)ReadEbdbInt(r));
-        var columns = new List<EraDataColumnDefinition>(colCount);
-        for (int i = 0; i < colCount; i++)
+        string schemaXml = r.ReadString();
+        string dataXml = r.ReadString();
+
+        using var dt = new DataTable
         {
-            string name = ReadEbdbString(r);
-            string typeName = ReadEbdbString(r);
-            columns.Add(new EraDataColumnDefinition(name, typeName));
+            Locale = CultureInfo.InvariantCulture,
+        };
+
+        if (!string.IsNullOrWhiteSpace(schemaXml))
+        {
+            using var srSchema = new StringReader(schemaXml);
+            dt.ReadXmlSchema(srSchema);
         }
 
-        int rowCount = checked((int)ReadEbdbInt(r));
-        var rows = new List<object?[]>(rowCount);
-        for (int i = 0; i < rowCount; i++)
+        if (!string.IsNullOrWhiteSpace(dataXml))
         {
-            object?[] row = new object?[colCount];
-            for (int c = 0; c < colCount; c++)
+            using var srData = new StringReader(dataXml);
+            dt.ReadXml(srData);
+        }
+
+        var columns = new List<EraDataColumnDefinition>(dt.Columns.Count);
+        for (int c = 0; c < dt.Columns.Count; c++)
+        {
+            DataColumn dc = dt.Columns[c];
+            columns.Add(new EraDataColumnDefinition(dc.ColumnName, FormatDataTableColumnType(dc.DataType)));
+        }
+
+        var rows = new List<object?[]>(dt.Rows.Count);
+        for (int rowIdx = 0; rowIdx < dt.Rows.Count; rowIdx++)
+        {
+            DataRow dr = dt.Rows[rowIdx];
+            object?[] cells = new object?[dt.Columns.Count];
+            for (int c = 0; c < dt.Columns.Count; c++)
             {
-                byte cellKind = r.ReadByte();
-                row[c] = cellKind switch
+                object val = dr[c];
+                if (val == DBNull.Value || val is null)
                 {
-                    0 => null,
-                    1 => ReadEbdbInt(r),
-                    2 => ReadEbdbString(r),
-                    _ => throw new InvalidDataException($"Unknown DataTable cell tag: {cellKind}"),
-                };
+                    cells[c] = null;
+                }
+                else if (val is sbyte or short or int or long or byte or ushort or uint)
+                {
+                    cells[c] = Convert.ToInt64(val, CultureInfo.InvariantCulture);
+                }
+                else
+                {
+                    cells[c] = val.ToString() ?? string.Empty;
+                }
             }
 
-            rows.Add(row);
+            rows.Add(cells);
         }
 
         return new EraDataTableSnapshot { Columns = columns, Rows = rows };
+    }
+
+    private static Type ResolveDataTableColumnType(string? typeName) => (typeName ?? string.Empty).Trim().ToLowerInvariant() switch
+    {
+        "int8" or "sbyte" or "1" => typeof(sbyte),
+        "int16" or "short" or "2" => typeof(short),
+        "int32" or "int" or "3" => typeof(int),
+        "int64" or "long" or "4" => typeof(long),
+        _ => typeof(string),
+    };
+
+    private static string FormatDataTableColumnType(Type type)
+    {
+        if (type == typeof(sbyte)) return "Int8";
+        if (type == typeof(short)) return "Int16";
+        if (type == typeof(int)) return "Int32";
+        if (type == typeof(long)) return "Int64";
+        return "String";
     }
 
     private static void WriteIntSpanRle(BinaryWriter w, ReadOnlySpan<long> values)

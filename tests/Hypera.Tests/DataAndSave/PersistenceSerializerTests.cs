@@ -303,4 +303,89 @@ public sealed class PersistenceSerializerTests
             Assert.Equal("TRUE_END", loaded.Variables["GLOBALS"].AsStrArray()[2]);
         }
     }
+
+    [Fact]
+    public void EraSaveSerializer_ExactUpstreamEmuera1808GlobalBinary_ByteForByteRoundtrip()
+    {
+        // Exact 80-byte global.sav produced by upstream Emuera.NET 1824+EM+EE (version 1808, UTF-16LE, raw Int64/Int32)
+        byte[] upstreamGlobalSav =
+        [
+            0x89, 0x45, 0x52, 0x41, 0x0D, 0x0A, 0x1A, 0x0A, // magic: \x89ERA\r\n\x1A\n
+            0x10, 0x07, 0x00, 0x00,                         // version = 1808
+            0x00, 0x00, 0x00, 0x00,                         // dataCount = 0
+            0x01,                                           // fileType = Global (1)
+            0xF1, 0x1B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uniqueCode = 7153 (raw Int64)
+            0x20, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // scriptVersion = 800 (raw Int64)
+            0x00,                                           // saveDataText = "" (UTF-16LE len 0)
+            0x01, 0x0C,                                     // IntArray, key len 12 bytes ("GLOBAL" UTF-16LE)
+            0x47, 0x00, 0x4C, 0x00, 0x4F, 0x00, 0x42, 0x00, 0x41, 0x00, 0x4C, 0x00,
+            0xD0, 0x07, 0x00, 0x00,                         // length = 2000 (raw Int32)
+            0xF0, 0x02, 0x10, 0x01, 0xFF,                   // Zero(2), 16, 1, EoD
+            0x11, 0x0E,                                     // StrArray, key len 14 bytes ("GLOBALS" UTF-16LE)
+            0x47, 0x00, 0x4C, 0x00, 0x4F, 0x00, 0x42, 0x00, 0x41, 0x00, 0x4C, 0x00, 0x53, 0x00,
+            0x64, 0x00, 0x00, 0x00,                         // length = 100 (raw Int32)
+            0xFF,                                           // EoD
+            0xFF,                                           // EndOfFile (variables)
+            0xFF,                                           // EndOfFile (VarExt)
+        ];
+
+        EraSaveHeader peeked = EraSaveSerializer.PeekHeader(upstreamGlobalSav);
+        Assert.Equal(EraSaveFormat.Binary, peeked.Format);
+        Assert.Equal(1808u, peeked.BinaryVersion);
+        Assert.Equal(EraSaveFileType.Global, peeked.FileType);
+        Assert.Equal(7153L, peeked.ScriptUniqueCode);
+        Assert.Equal(800L, peeked.ScriptVersion);
+        Assert.Equal(string.Empty, peeked.SaveDataText);
+
+        EraSaveSnapshot loaded = EraSaveSerializer.Load(upstreamGlobalSav);
+        long[] global = loaded.Variables["GLOBAL"].AsIntArray();
+        Assert.Equal(2000, global.Length);
+        Assert.Equal(0L, global[0]);
+        Assert.Equal(0L, global[1]);
+        Assert.Equal(16L, global[2]);
+        Assert.Equal(1L, global[3]);
+        Assert.Equal(100, loaded.Variables["GLOBALS"].AsStrArray().Length);
+
+        byte[] reserialized = EraSaveSerializer.Save(loaded, EraSaveFormat.Binary);
+        Assert.Equal(upstreamGlobalSav, reserialized);
+    }
+
+    [Fact]
+    public void EraSaveSerializer_GZipBinary_WritesUncompressedOuterHeaderBeforeGZipAndSkipsExtraDataCount()
+    {
+        var snap = new EraSaveSnapshot
+        {
+            Header = new EraSaveHeader(7153L, 900L, "圧縮テスト", EraSaveFileType.Normal),
+            Variables = new Dictionary<string, EraSaveValue>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["DAY"] = EraSaveValue.FromInt(42),
+                ["SAVESTR"] = EraSaveValue.FromStrArray(["Hello", string.Empty, "世界"]),
+            },
+        };
+
+        byte[] gzipBytes = EraSaveSerializer.Save(snap, EraSaveFormat.GZipBinary);
+
+        // Bytes 0..15 MUST be uncompressed: ZipHeaderMagic + version(1808) + dataCount(0)
+        Assert.Equal(EraSaveSerializer.ZipHeaderMagic, BinaryPrimitives.ReadUInt64LittleEndian(gzipBytes.AsSpan(0, 8)));
+        Assert.Equal(1808u, BinaryPrimitives.ReadUInt32LittleEndian(gzipBytes.AsSpan(8, 4)));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(gzipBytes.AsSpan(12, 4)));
+        // Bytes 16..17 MUST be GZip header (0x1F, 0x8B)
+        Assert.Equal((byte)0x1F, gzipBytes[16]);
+        Assert.Equal((byte)0x8B, gzipBytes[17]);
+
+        // Also verify non-zero dataCount reserved header words are skipped before GZip payload
+        byte[] withExtraHeader = new byte[gzipBytes.Length + 8];
+        gzipBytes.AsSpan(0, 12).CopyTo(withExtraHeader.AsSpan(0, 12));
+        BinaryPrimitives.WriteUInt32LittleEndian(withExtraHeader.AsSpan(12, 4), 2u);
+        BinaryPrimitives.WriteUInt32LittleEndian(withExtraHeader.AsSpan(16, 4), 0x11223344u);
+        BinaryPrimitives.WriteUInt32LittleEndian(withExtraHeader.AsSpan(20, 4), 0x55667788u);
+        gzipBytes.AsSpan(16).CopyTo(withExtraHeader.AsSpan(24));
+
+        EraSaveSnapshot loaded = EraSaveSerializer.Load(withExtraHeader);
+        Assert.Equal(7153L, loaded.Header.ScriptUniqueCode);
+        Assert.Equal(900L, loaded.Header.ScriptVersion);
+        Assert.Equal("圧縮テスト", loaded.Header.SaveDataText);
+        Assert.Equal(42L, loaded.Variables["DAY"].AsInt());
+        Assert.Equal("世界", loaded.Variables["SAVESTR"].AsStrArray()[2]);
+    }
 }
