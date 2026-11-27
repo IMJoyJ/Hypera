@@ -12,12 +12,16 @@ public sealed record RuntimeSessionSummary(
     string LanguageCode,
     EngineStepStatus EngineStatus,
     DateTime CreatedAtUtc,
-    DateTime LastActiveAtUtc);
+    DateTime LastActiveAtUtc,
+    bool CanUndo = false,
+    int UndoCount = 0,
+    int MaxUndoSteps = 1);
 
 public sealed record RuntimeSessionSnapshot(
     RuntimeSessionSummary Summary,
     DisplaySnapshot Display,
-    string? FaultMessage = null);
+    string? FaultMessage = null,
+    bool AutoRolledBackOnFault = false);
 
 public sealed record SessionFontDescriptor(
     string FamilyName,
@@ -41,7 +45,8 @@ public sealed record RuntimeSessionRenderState(
     InputRequest? PendingInput,
     WebAudioStateSnapshot Audio,
     IReadOnlyList<SessionFontDescriptor> CustomFonts,
-    string? FaultMessage = null);
+    string? FaultMessage = null,
+    bool AutoRolledBackOnFault = false);
 
 public sealed record SessionHitTestActionResult(
     ConsoleHitTestResult HitTest,
@@ -105,6 +110,11 @@ public interface IRuntimeSessionManager
         Guid sessionId,
         Guid userId,
         InputResponse input,
+        CancellationToken cancellationToken = default);
+
+    Task<RuntimeSessionSnapshot> UndoSessionAsync(
+        Guid sessionId,
+        Guid userId,
         CancellationToken cancellationToken = default);
 
     Task<byte[]> RenderFramePngAsync(

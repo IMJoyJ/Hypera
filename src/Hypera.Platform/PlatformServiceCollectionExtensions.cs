@@ -37,6 +37,17 @@ public sealed class PlatformHostOptions
     /// </summary>
     public TimeSpan StepWallClockTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// Maximum number of <c>INPUT*</c> undo checkpoints retained per active session (default: 1; 0 disables undo).
+    /// </summary>
+    public int MaxUndoSteps { get; set; } = 1;
+
+    /// <summary>
+    /// When true (default), runtime faults or turn timeouts automatically roll back to the latest <c>INPUT*</c>
+    /// checkpoint while preserving the diagnostic message for user display.
+    /// </summary>
+    public bool AutoRollbackOnError { get; set; } = true;
+
     public string GetResolvedDataRoot() => Path.GetFullPath(DataRootDirectory);
 
     public string GetDatabaseFilePath() => Path.Combine(GetResolvedDataRoot(), "hypera.db");

@@ -49,6 +49,8 @@ builder.Services.AddHyperaPlatformCore((sp, options) =>
 
     options.HostMode = PlatformHostMode.MultiUserServer;
     options.DataRootDirectory = configuredDataRoot;
+    options.MaxUndoSteps = Math.Max(0, config.GetValue("Hypera:MaxUndoSteps", 1));
+    options.AutoRollbackOnError = config.GetValue("Hypera:AutoRollbackOnError", true);
 });
 
 builder.Services.AddSingleton(sp =>

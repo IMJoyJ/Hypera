@@ -4,6 +4,7 @@ using System.Globalization;
 using Hypera.Bytecode;
 using Hypera.Compiler;
 using Hypera.Data;
+using Hypera.Diagnostics;
 using Hypera.Persistence;
 using Hypera.Platform.Data;
 using Hypera.Platform.Domain;
@@ -163,15 +164,44 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
 
             if (session.Host.Engine.Status == EngineStepStatus.WaitingInput && session.Host.Engine.PendingInputRequest is not null)
             {
+                session.ClearFaultNotice();
                 session.Host.Engine.SubmitInput(input);
                 if (session.Host.Engine.Status == EngineStepStatus.Running)
                 {
-                    ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout);
+                    ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, _hostOptions.AutoRollbackOnError);
                 }
             }
             else if (session.Host.Engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded)
             {
-                ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout);
+                session.ClearFaultNotice();
+                ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, _hostOptions.AutoRollbackOnError);
+            }
+
+            return session.BuildSnapshot();
+        }
+        finally
+        {
+            session.Gate.Release();
+        }
+    }
+
+    public async Task<RuntimeSessionSnapshot> UndoSessionAsync(
+        Guid sessionId,
+        Guid userId,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ManagedSession session = RequireActiveSession(sessionId, userId);
+
+        await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(session.IsDisposed, session);
+            session.Touch();
+
+            if (session.Host.Engine.TryUndo())
+            {
+                session.ClearFaultNotice();
             }
 
             return session.BuildSnapshot();
@@ -218,7 +248,8 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 PendingInput: engine.PendingInputRequest,
                 Audio: audio,
                 CustomFonts: session.CustomFonts,
-                FaultMessage: session.EffectiveFaultMessage);
+                FaultMessage: session.EffectiveFaultMessage,
+                AutoRolledBackOnFault: session.LastFaultAutoRolledBack);
         }
         finally
         {
@@ -301,11 +332,12 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 InputResponse? candidateResponse = BuildClickInputResponse(pending, hit, hitSlots);
                 if (candidateResponse is not null)
                 {
+                    session.ClearFaultNotice();
                     engine.SubmitInput(candidateResponse);
                     submitted = engine.Status == EngineStepStatus.Running;
                     if (submitted)
                     {
-                        ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout);
+                        ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, _hostOptions.AutoRollbackOnError);
                     }
                 }
             }
@@ -543,6 +575,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     ownsVfs: true,
                     options: loadOptions,
                     preloadedModule: sharedPackage.Module);
+                host.Engine.MaxUndoSteps = Math.Max(0, _hostOptions.MaxUndoSteps);
 
                 if (allowSharpPlugins)
                 {
@@ -566,7 +599,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     pluginManager: pluginManager,
                     extractedPluginsDir: extractedPluginsTempDir);
 
-                ExecuteTurnWithBudgetLocked(managed, maxInstructions, _hostOptions.StepWallClockTimeout);
+                ExecuteTurnWithBudgetLocked(managed, maxInstructions, _hostOptions.StepWallClockTimeout, _hostOptions.AutoRollbackOnError);
 
                 _sessionsById[newSessionId] = managed;
                 _activeSessionByUserApp[(userId, appId)] = newSessionId;
@@ -662,7 +695,8 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
     private static void ExecuteTurnWithBudgetLocked(
         ManagedSession session,
         int maxInstructions,
-        TimeSpan wallClockTimeout)
+        TimeSpan wallClockTimeout,
+        bool autoRollbackOnError)
     {
         EmueraEngine engine = session.Host.Engine;
         int remaining = Math.Max(1, maxInstructions);
@@ -682,7 +716,8 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
 
             if (status == EngineStepStatus.Faulted)
             {
-                session.MarkFaulted(engine.FaultException?.Message ?? "Runtime execution faulted.");
+                string faultMessage = FormatEngineFaultMessage(engine);
+                HandleFaultOrTimeoutLocked(session, faultMessage, autoRollbackOnError);
                 return;
             }
 
@@ -695,11 +730,39 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             remaining -= slice;
             if (remaining <= 0 || sw.Elapsed >= effectiveTimeout)
             {
-                session.MarkFaulted(
-                    $"Execution aborted: turn exceeded step instruction limit ({maxInstructions}) or timeout ({effectiveTimeout.TotalMilliseconds:F0} ms) — possible infinite loop.");
+                string timeoutMessage = $"Execution aborted: turn exceeded step instruction limit ({maxInstructions}) or timeout ({effectiveTimeout.TotalMilliseconds:F0} ms) — possible infinite loop.";
+                HandleFaultOrTimeoutLocked(session, timeoutMessage, autoRollbackOnError);
                 return;
             }
         }
+    }
+
+    private static void HandleFaultOrTimeoutLocked(ManagedSession session, string faultMessage, bool autoRollbackOnError)
+    {
+        EmueraEngine engine = session.Host.Engine;
+        if (autoRollbackOnError && engine.CanUndo && engine.TryUndo())
+        {
+            session.MarkAutoRolledBackFault(faultMessage);
+            return;
+        }
+
+        session.MarkFaulted(faultMessage);
+    }
+
+    private static string FormatEngineFaultMessage(EmueraEngine engine)
+    {
+        string baseMsg = engine.FaultException?.Message ?? "Runtime execution faulted.";
+        if (engine.CallStack.Count > 0)
+        {
+            CallFrame top = engine.CallStack[^1];
+            int pc = Math.Max(0, top.ProgramCounter - 1);
+            if (engine.Module.SourceMap.TryLookup(pc, out SourceLocation loc))
+            {
+                return $"{baseMsg} (at {loc.DisplayName}:{loc.LineNo})";
+            }
+        }
+
+        return baseMsg;
     }
 
     private static InputResponse? BuildClickInputResponse(
@@ -1161,6 +1224,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         private long _uiFrameSequence;
         private string? _faultOverrideMessage;
         private bool _forceFaulted;
+        private bool _lastFaultAutoRolledBack;
         private bool _disposed;
 
         public ManagedSession(
@@ -1221,12 +1285,29 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         public string? EffectiveFaultMessage =>
             _faultOverrideMessage ?? Host.Engine.FaultException?.Message;
 
+        public bool LastFaultAutoRolledBack => _lastFaultAutoRolledBack;
+
         public void Touch() => Interlocked.Exchange(ref _lastActiveTicks, DateTime.UtcNow.Ticks);
+
+        public void ClearFaultNotice()
+        {
+            _forceFaulted = false;
+            _faultOverrideMessage = null;
+            _lastFaultAutoRolledBack = false;
+        }
+
+        public void MarkAutoRolledBackFault(string message)
+        {
+            _forceFaulted = false;
+            _faultOverrideMessage = message;
+            _lastFaultAutoRolledBack = true;
+        }
 
         public void MarkFaulted(string message)
         {
             _forceFaulted = true;
             _faultOverrideMessage = message;
+            _lastFaultAutoRolledBack = false;
         }
 
         public RuntimeSessionSummary BuildSummary() =>
@@ -1239,13 +1320,17 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 LanguageCode: LanguageCode,
                 EngineStatus: EffectiveStatus,
                 CreatedAtUtc: CreatedAtUtc,
-                LastActiveAtUtc: LastActiveAtUtc);
+                LastActiveAtUtc: LastActiveAtUtc,
+                CanUndo: Host.Engine.CanUndo,
+                UndoCount: Host.Engine.UndoCount,
+                MaxUndoSteps: Host.Engine.MaxUndoSteps);
 
         public RuntimeSessionSnapshot BuildSnapshot() =>
             new(
                 Summary: BuildSummary(),
                 Display: BuildLayoutPositionedSnapshot(Host.Engine, ++_uiFrameSequence),
-                FaultMessage: EffectiveFaultMessage);
+                FaultMessage: EffectiveFaultMessage,
+                AutoRolledBackOnFault: LastFaultAutoRolledBack);
 
         private static DisplaySnapshot BuildLayoutPositionedSnapshot(EmueraEngine engine, long frameSequence)
         {

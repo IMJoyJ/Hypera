@@ -159,6 +159,9 @@
   "player.timeoutRemaining": "残り {0} 秒",
   "player.completed": "終了しました。",
   "player.faulted": "実行エラー",
+  "player.undo": "戻す",
+  "player.undoTooltip": "直前の入力前に戻す ({0}/{1})",
+  "player.autoRolledBack": "直前の入力前の状態に自動ロールバックしました。そのまま続行できます。",
   "player.noActiveSession": "セッションがありません。",
   "player.startSession": "開始",
 

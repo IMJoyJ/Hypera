@@ -159,6 +159,9 @@
   "player.timeoutRemaining": "{0}s left",
   "player.completed": "Session ended.",
   "player.faulted": "Runtime Error",
+  "player.undo": "Undo",
+  "player.undoTooltip": "Undo last input ({0}/{1})",
+  "player.autoRolledBack": "Automatically rolled back to before your last input. You can continue playing.",
   "player.noActiveSession": "No active session.",
   "player.startSession": "Start",
 

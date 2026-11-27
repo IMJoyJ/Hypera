@@ -268,4 +268,178 @@ public sealed class SaveAndRuntimeSessionTests
         Assert.Contains("CHOSEN=77", combinedText, StringComparison.Ordinal);
         Assert.Contains($"BMAP={0x112233}", combinedText, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public async Task RuntimeSessionManager_UndoSession_RestoresAcrossWaitAndClearline_AndAllowsAlternateBranch()
+    {
+        await using PlatformTestWorkspace ws = await PlatformTestWorkspace.CreateAsync(
+            configure: opts =>
+            {
+                opts.MaxUndoSteps = 2;
+                opts.AutoRollbackOnError = true;
+            });
+
+        AppUser admin = (await ws.Auth.RegisterAsync("admin", "AdminPass1!")).User!;
+        GameApp app = await ws.Catalog.CreateAppAsync(admin.Id, "UndoPlatformGame");
+
+        using MemoryStream zip = PlatformTestWorkspace.CreateZipStream(
+            new Dictionary<string, string>
+            {
+                ["ERB/Title.erb"] = """
+                    @SYSTEM_TITLE
+                    FLAG:0 = 10
+                    PRINTL MENU_ROOT
+                    PRINTL [1] PathA
+                    PRINTL [2] PathB
+                    INPUT
+                    IF RESULT == 1
+                        FLAG:0 = 99
+                        CLEARLINE 3
+                        PRINTL PATH_A_BEFORE_WAIT
+                        WAIT
+                        PRINTFORML PATH_A_AFTER_WAIT FLAG={FLAG:0}
+                        INPUT
+                    ELSE
+                        FLAG:0 = 42
+                        PRINTFORML PATH_B_OK FLAG={FLAG:0}
+                        INPUT
+                    ENDIF
+                    QUIT
+                    """,
+            });
+
+        await ws.UploadAndPublishAsync(admin.Id, admin.Id, app.Id, "v1.0", "ja", zip);
+
+        RuntimeSessionSnapshot started = await ws.Sessions.StartSessionAsync(admin.Id, app.Id);
+        Guid sid = started.Summary.SessionId;
+        Assert.Equal(EngineStepStatus.WaitingInput, started.Summary.EngineStatus);
+        Assert.False(started.Summary.CanUndo);
+        Assert.Equal(2, started.Summary.MaxUndoSteps);
+
+        RuntimeSessionRenderState? state0 = await ws.Sessions.GetSessionRenderStateAsync(sid, admin.Id);
+        Assert.NotNull(state0?.PendingInput);
+
+        // Choose PathA (1) -> reaches WAIT (AnyKey)
+        RuntimeSessionSnapshot afterChoice1 = await ws.Sessions.SubmitInputAsync(
+            sid, admin.Id, new InputResponse(state0!.PendingInput!.GenerationId, IntValue: 1));
+        Assert.True(afterChoice1.Summary.CanUndo);
+        Assert.Equal(1, afterChoice1.Summary.UndoCount);
+
+        RuntimeSessionRenderState? waitState = await ws.Sessions.GetSessionRenderStateAsync(sid, admin.Id);
+        Assert.Equal(InputRequestKind.AnyKey, waitState!.PendingInput!.Kind);
+
+        // Advance past WAIT -> WAIT must NOT add a second undo checkpoint
+        RuntimeSessionSnapshot afterWait = await ws.Sessions.SubmitInputAsync(
+            sid, admin.Id, new InputResponse(waitState.PendingInput.GenerationId));
+        Assert.Equal(1, afterWait.Summary.UndoCount);
+        string pathAText = string.Concat(afterWait.Display.Operations.Select(o => o.Text ?? string.Empty));
+        Assert.Contains("PATH_A_AFTER_WAIT FLAG=99", pathAText, StringComparison.Ordinal);
+        Assert.DoesNotContain("MENU_ROOT", pathAText, StringComparison.Ordinal);
+
+        // Undo jumps back across WAIT + CLEARLINE to MENU_ROOT
+        RuntimeSessionSnapshot undone = await ws.Sessions.UndoSessionAsync(sid, admin.Id);
+        Assert.Equal(EngineStepStatus.WaitingInput, undone.Summary.EngineStatus);
+        Assert.False(undone.Summary.CanUndo);
+        Assert.Equal(0, undone.Summary.UndoCount);
+        string restoredText = string.Concat(undone.Display.Operations.Select(o => o.Text ?? string.Empty));
+        Assert.Contains("MENU_ROOT", restoredText, StringComparison.Ordinal);
+        Assert.DoesNotContain("PATH_A_AFTER_WAIT", restoredText, StringComparison.Ordinal);
+
+        // Now choose PathB (2) -> succeeds cleanly with FLAG=42
+        RuntimeSessionRenderState? restoredRender = await ws.Sessions.GetSessionRenderStateAsync(sid, admin.Id);
+        RuntimeSessionSnapshot pathBSnap = await ws.Sessions.SubmitInputAsync(
+            sid, admin.Id, new InputResponse(restoredRender!.PendingInput!.GenerationId, IntValue: 2));
+        string pathBText = string.Concat(pathBSnap.Display.Operations.Select(o => o.Text ?? string.Empty));
+        Assert.Contains("PATH_B_OK FLAG=42", pathBText, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeSessionManager_FaultAutoRollback_AndManualUndoRecovery_WorkEndToEnd()
+    {
+        const string faultErb = """
+            @SYSTEM_TITLE
+            PRINTL CHOOSE_ROUTE
+            INPUT
+            IF RESULT == 1
+                LOCAL:1 = 0
+                LOCAL = 1 / LOCAL:1
+            ELSE
+                PRINTL SAFE_ROUTE_OK
+            ENDIF
+            QUIT
+            """;
+
+        // 1. AutoRollbackOnError = true (default): fault rolls back automatically while reporting diagnostic message
+        await using (PlatformTestWorkspace wsAuto = await PlatformTestWorkspace.CreateAsync(
+            configure: opts =>
+            {
+                opts.MaxUndoSteps = 1;
+                opts.AutoRollbackOnError = true;
+            }))
+        {
+            AppUser admin = (await wsAuto.Auth.RegisterAsync("admin", "AdminPass1!")).User!;
+            GameApp app = await wsAuto.Catalog.CreateAppAsync(admin.Id, "FaultAutoGame");
+            using MemoryStream zip = PlatformTestWorkspace.CreateZipStream(new Dictionary<string, string> { ["ERB/Title.erb"] = faultErb });
+            await wsAuto.UploadAndPublishAsync(admin.Id, admin.Id, app.Id, "v1.0", "ja", zip);
+
+            RuntimeSessionSnapshot started = await wsAuto.Sessions.StartSessionAsync(admin.Id, app.Id);
+            Guid sid = started.Summary.SessionId;
+            RuntimeSessionRenderState? rs0 = await wsAuto.Sessions.GetSessionRenderStateAsync(sid, admin.Id);
+
+            // Submit faulting choice 1 -> auto-rolls back to WaitingInput with FaultMessage populated
+            RuntimeSessionSnapshot faultedSnap = await wsAuto.Sessions.SubmitInputAsync(
+                sid, admin.Id, new InputResponse(rs0!.PendingInput!.GenerationId, IntValue: 1));
+            Assert.Equal(EngineStepStatus.WaitingInput, faultedSnap.Summary.EngineStatus);
+            Assert.True(faultedSnap.AutoRolledBackOnFault);
+            Assert.False(string.IsNullOrWhiteSpace(faultedSnap.FaultMessage));
+
+            RuntimeSessionRenderState? afterAuto = await wsAuto.Sessions.GetSessionRenderStateAsync(sid, admin.Id);
+            Assert.True(afterAuto!.AutoRolledBackOnFault);
+            Assert.NotNull(afterAuto.PendingInput);
+
+            // Submitting safe choice 2 succeeds immediately and clears fault notice
+            RuntimeSessionSnapshot safeSnap = await wsAuto.Sessions.SubmitInputAsync(
+                sid, admin.Id, new InputResponse(afterAuto.PendingInput!.GenerationId, IntValue: 2));
+            Assert.Equal(EngineStepStatus.Completed, safeSnap.Summary.EngineStatus);
+            Assert.False(safeSnap.AutoRolledBackOnFault);
+            Assert.Null(safeSnap.FaultMessage);
+            Assert.Contains("SAFE_ROUTE_OK", string.Concat(safeSnap.Display.Operations.Select(o => o.Text ?? string.Empty)), StringComparison.Ordinal);
+        }
+
+        // 2. AutoRollbackOnError = false: fault pauses session in Faulted state, manual UndoSessionAsync recovers cleanly
+        await using (PlatformTestWorkspace wsManual = await PlatformTestWorkspace.CreateAsync(
+            configure: opts =>
+            {
+                opts.MaxUndoSteps = 1;
+                opts.AutoRollbackOnError = false;
+            }))
+        {
+            AppUser admin = (await wsManual.Auth.RegisterAsync("admin", "AdminPass1!")).User!;
+            GameApp app = await wsManual.Catalog.CreateAppAsync(admin.Id, "FaultManualGame");
+            using MemoryStream zip = PlatformTestWorkspace.CreateZipStream(new Dictionary<string, string> { ["ERB/Title.erb"] = faultErb });
+            await wsManual.UploadAndPublishAsync(admin.Id, admin.Id, app.Id, "v1.0", "ja", zip);
+
+            RuntimeSessionSnapshot started = await wsManual.Sessions.StartSessionAsync(admin.Id, app.Id);
+            Guid sid = started.Summary.SessionId;
+            RuntimeSessionRenderState? rs0 = await wsManual.Sessions.GetSessionRenderStateAsync(sid, admin.Id);
+
+            RuntimeSessionSnapshot faultedSnap = await wsManual.Sessions.SubmitInputAsync(
+                sid, admin.Id, new InputResponse(rs0!.PendingInput!.GenerationId, IntValue: 1));
+            Assert.Equal(EngineStepStatus.Faulted, faultedSnap.Summary.EngineStatus);
+            Assert.False(faultedSnap.AutoRolledBackOnFault);
+            Assert.True(faultedSnap.Summary.CanUndo);
+            Assert.False(string.IsNullOrWhiteSpace(faultedSnap.FaultMessage));
+
+            RuntimeSessionSnapshot recovered = await wsManual.Sessions.UndoSessionAsync(sid, admin.Id);
+            Assert.Equal(EngineStepStatus.WaitingInput, recovered.Summary.EngineStatus);
+            Assert.Null(recovered.FaultMessage);
+            Assert.False(recovered.Summary.CanUndo);
+
+            RuntimeSessionRenderState? rsRec = await wsManual.Sessions.GetSessionRenderStateAsync(sid, admin.Id);
+            RuntimeSessionSnapshot safeSnap = await wsManual.Sessions.SubmitInputAsync(
+                sid, admin.Id, new InputResponse(rsRec!.PendingInput!.GenerationId, IntValue: 2));
+            Assert.Equal(EngineStepStatus.Completed, safeSnap.Summary.EngineStatus);
+            Assert.Contains("SAFE_ROUTE_OK", string.Concat(safeSnap.Display.Operations.Select(o => o.Text ?? string.Empty)), StringComparison.Ordinal);
+        }
+    }
 }

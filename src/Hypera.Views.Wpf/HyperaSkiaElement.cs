@@ -113,6 +113,32 @@ public class HyperaSkiaElement : SKElement, IDisposable
         InvalidateVisual();
     }
 
+    /// <summary>
+    /// Rolls back the attached engine to the previous <c>INPUT*</c> checkpoint, clearing pending
+    /// input/timeout state and immediately repainting the WPF Skia canvas.
+    /// </summary>
+    public bool TryUndoEngine()
+    {
+        if (Engine is not { CanUndo: true } engine)
+        {
+            return false;
+        }
+
+        if (!engine.TryUndo())
+        {
+            return false;
+        }
+
+        _inputBuffer.Clear();
+        _trackedGenerationId = -1;
+        _timeoutDeadlineTimestamp = 0;
+        _scrollbackOffset = 0;
+        engine.ConsoleBuffer.ScrollOffsetLines = 0;
+        _currentSnapshot = engine.CaptureSnapshot();
+        InvalidateVisual();
+        return true;
+    }
+
     public LogicalPoint MapDipToLogical(Point dipPoint, out bool isInsideViewport)
     {
         DpiScale dpi = VisualTreeHelper.GetDpi(this);

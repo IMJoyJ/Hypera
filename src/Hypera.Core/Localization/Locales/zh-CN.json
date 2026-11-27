@@ -159,6 +159,9 @@
   "player.timeoutRemaining": "剩余 {0} 秒",
   "player.completed": "运行结束。",
   "player.faulted": "运行出错",
+  "player.undo": "回退",
+  "player.undoTooltip": "回退到上一次输入前 ({0}/{1})",
+  "player.autoRolledBack": "已自动回退到出错前的输入状态，可直接继续游玩。",
   "player.noActiveSession": "暂无运行会话。",
   "player.startSession": "启动",
 

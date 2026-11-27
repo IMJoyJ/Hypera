@@ -67,6 +67,20 @@
                    Size="Size.Small"
                    Style="width: 84px;" />
 
+        @if (_renderState is { Summary.MaxUndoSteps: > 0 })
+        {
+            <MudButton Variant="Variant.Outlined"
+                       Size="Size.Small"
+                       StartIcon="@Icons.Material.Filled.Undo"
+                       Disabled="@(_busy || !_renderState.Summary.CanUndo)"
+                       title="@Ui.T("player.undoTooltip", _renderState.Summary.UndoCount.ToString(CultureInfo.InvariantCulture), _renderState.Summary.MaxUndoSteps.ToString(CultureInfo.InvariantCulture))"
+                       OnClick="@UndoSessionAsync">
+                @(_renderState.Summary.MaxUndoSteps > 1
+                    ? $"{Ui.T("player.undo")} ({_renderState.Summary.UndoCount}/{_renderState.Summary.MaxUndoSteps})"
+                    : Ui.T("player.undo"))
+            </MudButton>
+        }
+
         <MudButton Variant="Variant.Outlined"
                    Size="Size.Small"
                    StartIcon="@Icons.Material.Filled.Replay"
@@ -89,10 +103,33 @@
     <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
 }
 
-@if (_renderState is not null && !string.IsNullOrWhiteSpace(_renderState.FaultMessage))
+@if (_renderState is not null && !string.IsNullOrWhiteSpace(_renderState.FaultMessage) && !_faultBannerDismissed)
 {
-    <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">
-        <strong>@Ui.T("player.faulted"):</strong> @_renderState.FaultMessage
+    <MudAlert Severity="@(_renderState.AutoRolledBackOnFault ? Severity.Warning : Severity.Error)"
+              Dense="true"
+              ShowCloseIcon="@_renderState.AutoRolledBackOnFault"
+              CloseIconClicked="@(() => _faultBannerDismissed = true)"
+              Class="mb-3">
+        <div class="d-flex flex-wrap align-center justify-space-between gap-2">
+            <div>
+                <strong>@Ui.T("player.faulted"):</strong> @_renderState.FaultMessage
+                @if (_renderState.AutoRolledBackOnFault)
+                {
+                    <div class="mt-1">@Ui.T("player.autoRolledBack")</div>
+                }
+            </div>
+            @if (!_renderState.AutoRolledBackOnFault && _renderState.Summary.CanUndo)
+            {
+                <MudButton Variant="Variant.Outlined"
+                           Color="Color.Warning"
+                           Size="Size.Small"
+                           StartIcon="@Icons.Material.Filled.Undo"
+                           Disabled="@_busy"
+                           OnClick="@UndoSessionAsync">
+                    @Ui.T("player.undo")
+                </MudButton>
+            }
+        </div>
     </MudAlert>
 }
 
@@ -284,6 +321,8 @@
     private string? _hoveredItemKey;
     private bool _loading = true;
     private bool _busy;
+    private bool _faultBannerDismissed;
+    private string? _lastObservedFaultMessage;
     private bool _savesDrawerOpen;
     private bool _muted;
     private int _masterVolume = 100;
@@ -419,6 +458,59 @@
         }
     }
 
+    private async Task UndoSessionAsync()
+    {
+        if (!Ui.IsAuthenticated || _activeSessionId == Guid.Empty || _busy)
+        {
+            return;
+        }
+
+        if (_renderState is not { Summary.CanUndo: true })
+        {
+            return;
+        }
+
+        _busy = true;
+        _error = null;
+        _faultBannerDismissed = false;
+        CancelTimeout();
+        try
+        {
+            Guid userId = Ui.CurrentUser!.Id;
+            await SessionManager.UndoSessionAsync(_activeSessionId, userId);
+            InvalidateDynamicSpriteAndGraphicsCache();
+            await RefreshRenderStateAsync(_activeSessionId);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private void InvalidateDynamicSpriteAndGraphicsCache()
+    {
+        List<string> staleKeys = [];
+        foreach (string key in _assetCache.Keys)
+        {
+            if (key.StartsWith("g:", StringComparison.OrdinalIgnoreCase) ||
+                key.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase) ||
+                key.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase))
+            {
+                staleKeys.Add(key);
+            }
+        }
+
+        for (int i = 0; i < staleKeys.Count; i++)
+        {
+            _assetCache.Remove(staleKeys[i]);
+        }
+    }
+
     private async Task RestartSessionAsync()
     {
         if (!Ui.IsAuthenticated)
@@ -518,6 +610,17 @@
             _renderState = null;
             _renderItems = [];
             return;
+        }
+
+        if (state.AutoRolledBackOnFault)
+        {
+            InvalidateDynamicSpriteAndGraphicsCache();
+        }
+
+        if (!string.Equals(_lastObservedFaultMessage, state.FaultMessage, StringComparison.Ordinal))
+        {
+            _lastObservedFaultMessage = state.FaultMessage;
+            _faultBannerDismissed = false;
         }
 
         _renderState = state;
@@ -1341,6 +1444,15 @@
 
     private async Task OnStageKeyDownAsync(KeyboardEventArgs e)
     {
+        if (!_busy &&
+            _renderState is { Summary.CanUndo: true } &&
+            ((e.CtrlKey && string.Equals(e.Key, "z", StringComparison.OrdinalIgnoreCase)) ||
+             (e.AltKey && string.Equals(e.Key, "ArrowLeft", StringComparison.Ordinal))))
+        {
+            await UndoSessionAsync();
+            return;
+        }
+
         if (_renderState?.PendingInput is not { } pending)
         {
             return;
