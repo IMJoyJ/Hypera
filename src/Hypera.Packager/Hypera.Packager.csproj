@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+    <StartupObject>Hypera.Packager.Program</StartupObject>
+    <AssemblyName>Hypera.Packager</AssemblyName>
+    <RootNamespace>Hypera.Packager</RootNamespace>
+    <Product>Hypera HEP Packager</Product>
+    <Description>Standalone WPF desktop packager that compiles Emuera/ERB game projects into single-file .hep archives powered by Hypera.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Hypera.Packager.Tests" />
+    <ProjectReference Include="..\Hypera.Core\Hypera.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -105,6 +105,7 @@ jobs:
         run: |
           dotnet test tests/Hypera.Tests/Hypera.Tests.csproj -c Release
           dotnet test tests/Hypera.Platform.Tests/Hypera.Platform.Tests.csproj -c Release
+          dotnet test tests/Hypera.Packager.Tests/Hypera.Packager.Tests.csproj -c Release
 
   build-cli:
     name: Build CLI (${{ matrix.rid }})
@@ -262,6 +263,83 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: standalone-win-x64
+          path: dist/*
+          if-no-files-found: error
+
+  build-packager:
+    name: Build Packager (win-x64)
+    needs: [prepare, verify-windows]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Publish Hypera.Packager
+        run: >-
+          dotnet publish src/Hypera.Packager/Hypera.Packager.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=none
+          -p:DebugSymbols=false
+          -p:Version=${{ needs.prepare.outputs.semver }}
+          -o publish/packager
+
+      - name: Headless --cli-pack smoke test
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:RUNNER_TEMP "packager_smoke"
+          $validDir = Join-Path $tmp "ValidGame"
+          $invalidDir = Join-Path $tmp "InvalidGame"
+          New-Item -ItemType Directory -Path "$validDir\ERB" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$invalidDir\ERB" -Force | Out-Null
+          Set-Content -Path "$validDir\ERB\Title.erb" -Value "@SYSTEM_TITLE`nPRINTL Hypera Packager CI Smoke`nWAIT`nQUIT" -Encoding utf8
+          Set-Content -Path "$invalidDir\ERB\Broken.erb" -Value "@SYSTEM_TITLE`nCALL MISSING_SMOKE_TARGET" -Encoding utf8
+
+          $exe = (Resolve-Path "publish\packager\Hypera.Packager.exe").Path
+          $outHep = Join-Path $tmp "ValidGame.hep"
+          $okOut = Join-Path $tmp "ok_stdout.txt"
+          $okErr = Join-Path $tmp "ok_stderr.txt"
+          $pOk = Start-Process -FilePath $exe `
+            -ArgumentList "--cli-pack", $validDir, "-o", $outHep `
+            -Wait -PassThru -RedirectStandardOutput $okOut -RedirectStandardError $okErr
+          Get-Content $okOut
+          if ($pOk.ExitCode -ne 0 -or -not (Test-Path $outHep) -or (Get-Item $outHep).Length -le 0) {
+            Get-Content $okErr
+            throw "Packager valid smoke test failed with exit code $($pOk.ExitCode)"
+          }
+
+          $badHep = Join-Path $tmp "InvalidGame.hep"
+          $badOut = Join-Path $tmp "bad_stdout.txt"
+          $badErr = Join-Path $tmp "bad_stderr.txt"
+          $pBad = Start-Process -FilePath $exe `
+            -ArgumentList "--cli-pack", $invalidDir, "-o", $badHep, "--lang", "en" `
+            -Wait -PassThru -RedirectStandardOutput $badOut -RedirectStandardError $badErr
+          $errText = Get-Content $badErr -Raw
+          Write-Output $errText
+          if ($pBad.ExitCode -eq 0 -or (Test-Path $badHep) -or $errText -notmatch "MISSING_SMOKE_TARGET") {
+            throw "Packager compile-failure smoke test did not fail with expected diagnostics (exit=$($pBad.ExitCode))"
+          }
+
+      - name: Package archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item LICENSE, README.md, README.ja.md -Destination publish/packager/
+          Compress-Archive -Path publish/packager/* -DestinationPath "dist/hypera-packager-${{ needs.prepare.outputs.tag }}-win-x64.zip" -Force
+
+      - name: Upload Packager artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packager-win-x64
           path: dist/*
           if-no-files-found: error
 
@@ -465,6 +543,7 @@ jobs:
       - prepare
       - build-cli
       - build-standalone
+      - build-packager
       - build-server
       - build-maui-windows
       - build-maui-android
@@ -494,6 +573,7 @@ jobs:
 
           ### 发布产物 / 配布バイナリ一覧
           - **Standalone 桌面执行器 (Windows x64)**: `hypera-standalone-${{ needs.prepare.outputs.tag }}-win-x64.zip`（单文件自包含，支持直接加载 `.hep`/`.heb`/`.zip`/目录与 `HYPRBNDL` 封装）
+          - **HEP 打包工具 / パッケージャ (Windows x64)**: `hypera-packager-${{ needs.prepare.outputs.tag }}-win-x64.zip`（单文件自包含 WPF 桌面打包器，支持拖拽目录 / `%1` 自动编译打包与无头 `--cli-pack`）
           - **CLI 编译器与工具链**: `hypera-cli-${{ needs.prepare.outputs.tag }}-{win-x64,win-arm64,linux-x64,linux-arm64,osx-arm64,osx-x64}.{zip,tar.gz}`
           - **多用户 Web 托管服务端**: `hypera-server-${{ needs.prepare.outputs.tag }}-{win-x64,linux-x64,linux-arm64,osx-arm64}.{zip,tar.gz}`
           - **MAUI 跨平台客户端**: `hypera-maui-${{ needs.prepare.outputs.tag }}-win-x64.zip`、`hypera-maui-${{ needs.prepare.outputs.tag }}-android.apk`

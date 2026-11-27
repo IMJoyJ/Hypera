@@ -5,6 +5,7 @@
     <Project Path="src/Hypera.Core/Hypera.Core.csproj" />
     <Project Path="src/Hypera.LegacyPluginShim/Hypera.LegacyPluginShim.csproj" />
     <Project Path="src/Hypera.Maui/Hypera.Maui.csproj" />
+    <Project Path="src/Hypera.Packager/Hypera.Packager.csproj" />
     <Project Path="src/Hypera.Platform/Hypera.Platform.csproj" />
     <Project Path="src/Hypera.Server/Hypera.Server.csproj" />
     <Project Path="src/Hypera.Standalone/Hypera.Standalone.csproj" />
@@ -13,6 +14,7 @@
     <Project Path="src/Hypera.Web.UI/Hypera.Web.UI.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Hypera.Packager.Tests/Hypera.Packager.Tests.csproj" />
     <Project Path="tests/Hypera.Platform.Tests/Hypera.Platform.Tests.csproj" />
     <Project Path="tests/Hypera.Tests/Hypera.Tests.csproj" />
   </Folder>

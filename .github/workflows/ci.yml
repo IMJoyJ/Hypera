@@ -54,12 +54,17 @@ jobs:
           dotnet build src/Hypera.Views.WinForms/Hypera.Views.WinForms.csproj -c Release
           dotnet build src/Hypera.Views.Wpf/Hypera.Views.Wpf.csproj -c Release
           dotnet build src/Hypera.Standalone/Hypera.Standalone.csproj -c Release
+          dotnet build src/Hypera.Packager/Hypera.Packager.csproj -c Release
 
       - name: Test Hypera.Tests
         run: dotnet test tests/Hypera.Tests/Hypera.Tests.csproj -c Release --verbosity normal
 
       - name: Test Hypera.Platform.Tests
         run: dotnet test tests/Hypera.Platform.Tests/Hypera.Platform.Tests.csproj -c Release --verbosity normal
+
+      - name: Test Hypera.Packager.Tests
+        if: runner.os == 'Windows'
+        run: dotnet test tests/Hypera.Packager.Tests/Hypera.Packager.Tests.csproj -c Release --verbosity normal
 
       - name: Smoke check CLI version
         shell: bash
