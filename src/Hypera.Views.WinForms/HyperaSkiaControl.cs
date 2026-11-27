@@ -57,8 +57,12 @@ public class HyperaSkiaControl : SKControl
     private bool _faultRaised;
     private bool _completionRaised;
     private bool _pendingHoverRefresh;
+    private bool _continuationQueued;
+    private long _lastPaintedConsoleVersion = -1;
+    private long _lastPaintedGraphicsVersion = -1;
+    private long _lastPaintedSpriteVersion = -1;
     private int _frameIntervalMs = 16;
-    private int _maxStepSliceMs = 12;
+    private int _maxStepSliceMs = 32;
     private bool _loopRequested;
 
     public HyperaSkiaControl()
@@ -105,6 +109,10 @@ public class HyperaSkiaControl : SKControl
             _faultRaised = false;
             _completionRaised = false;
             _pendingHoverRefresh = false;
+            _continuationQueued = false;
+            _lastPaintedConsoleVersion = -1;
+            _lastPaintedGraphicsVersion = -1;
+            _lastPaintedSpriteVersion = -1;
             _scrollbackOffset = 0;
             _inputBuffer.Clear();
 
@@ -466,6 +474,9 @@ public class HyperaSkiaControl : SKControl
                     hoveredButton: _hoveredButton,
                     elapsedAnimationMs: engine.ElapsedAnimationMs);
                 _lastRenderedScene = scene;
+                _lastPaintedConsoleVersion = engine.ConsoleBuffer.VisualMutationVersion;
+                _lastPaintedGraphicsVersion = engine.Graphics.GlobalMutationVersion;
+                _lastPaintedSpriteVersion = engine.Sprites.GlobalMutationVersion;
 
                 // When freshly entering WaitingInput while the cursor is already resting over a button,
                 // evaluate hover immediately so the button highlights without requiring mouse jitter.
@@ -728,6 +739,16 @@ public class HyperaSkiaControl : SKControl
                                 IsTimeout: pendingReq.Kind == InputRequestKind.TimedWait));
                             stepped = true;
                         }
+                        else if (IsInstantNonInteractiveTimeout(pendingReq))
+                        {
+                            // Ultra-short non-displayed TINPUT (e.g. "TINPUT 1,0,0,\"\"" in @BREAK_BUTTON):
+                            // complete within the current frame slice instead of stalling 15.6ms on WM_TIMER per call.
+                            _timeoutDeadlineTimestamp = 0;
+                            _hasTimeoutDeadline = false;
+                            _trackedGenerationId = -1;
+                            engine.SubmitInput(new InputResponse(pendingReq.GenerationId, IsTimeout: true));
+                            stepped = true;
+                        }
                         else if (_trackedGenerationId == pendingReq.GenerationId &&
                                  _hasTimeoutDeadline &&
                                  Stopwatch.GetTimestamp() >= _timeoutDeadlineTimestamp)
@@ -790,28 +811,41 @@ public class HyperaSkiaControl : SKControl
                 engine.ConsoleBuffer.ScrollOffsetLines = 0;
 
                 bool flushRequested = engine.RedrawFlushSequence != _lastObservedFlushSeq;
-                bool redrawAllowed = engine.CurrentRedrawMode != 0 ||
-                                     flushRequested ||
-                                     engine.Status is EngineStepStatus.WaitingInput or EngineStepStatus.Faulted or EngineStepStatus.Completed;
-                if (redrawAllowed)
+                bool isTerminalOrWait = engine.Status is EngineStepStatus.WaitingInput or EngineStepStatus.Faulted or EngineStepStatus.Completed;
+                bool isTimedAwait = engine.Status == EngineStepStatus.Yielded && _awaitResumeTimestamp > 0;
+                bool visualsChanged =
+                    engine.ConsoleBuffer.VisualMutationVersion != _lastPaintedConsoleVersion ||
+                    engine.Graphics.GlobalMutationVersion != _lastPaintedGraphicsVersion ||
+                    engine.Sprites.GlobalMutationVersion != _lastPaintedSpriteVersion;
+
+                if (isTerminalOrWait || flushRequested || isTimedAwait)
                 {
                     ClearHoverState();
                     _lastObservedFlushSeq = engine.RedrawFlushSequence;
                     _frozenRedrawScene = null;
                     _lastRenderedScene = null;
                     needsRepaint = true;
+                    contentChanged = true;
                     if (engine.Status == EngineStepStatus.WaitingInput)
                     {
                         _pendingHoverRefresh = true;
                     }
                 }
-                else
+                else if (engine.CurrentRedrawMode == 0)
                 {
                     // Honor REDRAW 0: keep the last committed visual frame frozen while offscreen work runs.
                     _frozenRedrawScene ??= _lastRenderedScene;
                 }
-
-                contentChanged = true;
+                else if (visualsChanged && elapsedMs - _lastPaintElapsedMs >= 50)
+                {
+                    // Mid-turn running output: throttle live repaints (~20 fps) and completely skip repaints
+                    // during pure computation slices (e.g. @ACTABLE / @CARD_RESTRICTION_CHECK) where visuals are unchanged.
+                    ClearHoverState();
+                    _frozenRedrawScene = null;
+                    _lastRenderedScene = null;
+                    needsRepaint = true;
+                    contentChanged = true;
+                }
             }
 
             if (SyncWaitingInputDeadline(engine, out bool newlyTracked))
@@ -827,8 +861,15 @@ public class HyperaSkiaControl : SKControl
                 }
                 else if (_hasTimeoutDeadline && elapsedMs - _lastTimeoutCountdownMs >= 100)
                 {
-                    // Refresh status countdown while timed wait / TINPUT is active.
+                    // Refresh status countdown (and live TINPUT DisplayTime console line if enabled).
                     _lastTimeoutCountdownMs = elapsedMs;
+                    if (RemainingTimeoutMs is long remMs && engine.UpdateTimedInputCountdown(remMs))
+                    {
+                        _frozenRedrawScene = null;
+                        _lastRenderedScene = null;
+                        needsRepaint = true;
+                    }
+
                     contentChanged = true;
                 }
             }
@@ -842,10 +883,22 @@ public class HyperaSkiaControl : SKControl
                 needsRepaint = true;
             }
 
+            bool continueRunningImmediately =
+                _loopRequested &&
+                IsHandleCreated &&
+                !IsDisposed &&
+                ((engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded && _awaitResumeTimestamp == 0) ||
+                 ((engine.IsMouseSkip || engine.IsMessageSkip) && engine.Status == EngineStepStatus.WaitingInput && engine.PendingInputRequest is { CanSkipWithMessageSkip: true }));
+
             if (needsRepaint)
             {
                 _lastAnimationRedrawMs = elapsedMs;
                 Invalidate();
+                if (continueRunningImmediately)
+                {
+                    // Flush the throttled progress frame now so BeginInvoke continuation never starves WM_PAINT.
+                    Update();
+                }
             }
 
             if (contentChanged)
@@ -854,12 +907,51 @@ public class HyperaSkiaControl : SKControl
             }
 
             RaiseTerminalEngineEventsIfNeeded(engine);
+
+            if (continueRunningImmediately)
+            {
+                QueueRunningContinuation();
+            }
         }
         finally
         {
             _isTicking = false;
             UpdateFrameTimerState();
         }
+    }
+
+    private void QueueRunningContinuation()
+    {
+        if (_continuationQueued || !IsHandleCreated || IsDisposed)
+        {
+            return;
+        }
+
+        _continuationQueued = true;
+        try
+        {
+            BeginInvoke(RunQueuedContinuation);
+        }
+        catch (ObjectDisposedException)
+        {
+            _continuationQueued = false;
+        }
+        catch (InvalidOperationException)
+        {
+            _continuationQueued = false;
+        }
+    }
+
+    private void RunQueuedContinuation()
+    {
+        _continuationQueued = false;
+        if (IsDisposed || !_loopRequested || _engine is null)
+        {
+            UpdateFrameTimerState();
+            return;
+        }
+
+        PumpEngineSlice(fromUserInput: false);
     }
 
     private void OnEngineFrameReady(DisplayFrameNotification notification)
@@ -1017,6 +1109,12 @@ public class HyperaSkiaControl : SKControl
 
     private int ComputeDesiredTimerIntervalMs(EmueraEngine engine)
     {
+        if (_continuationQueued)
+        {
+            // Active BeginInvoke continuation is driving the VM slice with zero WM_TIMER sleep gap.
+            return 0;
+        }
+
         bool skipNow = engine.IsMouseSkip || engine.IsMessageSkip;
         if (skipNow || (engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded && _awaitResumeTimestamp == 0))
         {
@@ -1053,6 +1151,11 @@ public class HyperaSkiaControl : SKControl
 
         return desired == int.MaxValue ? 0 : Math.Max(1, desired);
     }
+
+    private static bool IsInstantNonInteractiveTimeout(InputRequest req) =>
+        req.TimeoutMilliseconds is <= 1L &&
+        !req.DisplayTime &&
+        req.Kind is InputRequestKind.IntValue or InputRequestKind.StringValue or InputRequestKind.OneInt or InputRequestKind.OneString;
 
     private bool SyncWaitingInputDeadline(EmueraEngine engine, out bool newlyTracked)
     {
@@ -1156,10 +1259,12 @@ public class HyperaSkiaControl : SKControl
         string? nextTooltip = hit.TooltipText;
 
         bool buttonChanged = !ReferenceEquals(_hoveredButton, nextButton) || _hoveredCbgButtonValue != nextCbg;
-        bool tooltipChanged = !string.Equals(engine.ConsoleBuffer.Tooltip.ActiveText, nextTooltip, StringComparison.Ordinal) ||
-                              (!string.IsNullOrEmpty(nextTooltip) &&
-                               (MathF.Abs(engine.ConsoleBuffer.Tooltip.AnchorX - pt.X) >= 1f ||
-                                MathF.Abs(engine.ConsoleBuffer.Tooltip.AnchorY - pt.Y) >= 1f));
+        bool tooltipTextChanged = !string.Equals(engine.ConsoleBuffer.Tooltip.ActiveText, nextTooltip, StringComparison.Ordinal);
+        bool tooltipAnchorMoved = !string.IsNullOrEmpty(nextTooltip) &&
+                                  (_animationStopwatch.ElapsedMilliseconds - _lastPaintElapsedMs >= 16) &&
+                                  (MathF.Abs(engine.ConsoleBuffer.Tooltip.AnchorX - pt.X) >= 4f ||
+                                   MathF.Abs(engine.ConsoleBuffer.Tooltip.AnchorY - pt.Y) >= 4f);
+        bool tooltipChanged = tooltipTextChanged || tooltipAnchorMoved;
 
         _hoveredButton = nextButton;
         _hoveredCbgButtonValue = nextCbg;
@@ -1170,12 +1275,15 @@ public class HyperaSkiaControl : SKControl
                 ? nextCbg.Value.ToString(CultureInfo.InvariantCulture)
                 : string.Empty;
 
-        engine.ConsoleBuffer.Tooltip = engine.ConsoleBuffer.Tooltip with
+        if (tooltipTextChanged || tooltipAnchorMoved)
         {
-            ActiveText = nextTooltip,
-            AnchorX = pt.X,
-            AnchorY = pt.Y,
-        };
+            engine.ConsoleBuffer.Tooltip = engine.ConsoleBuffer.Tooltip with
+            {
+                ActiveText = nextTooltip,
+                AnchorX = pt.X,
+                AnchorY = pt.Y,
+            };
+        }
 
         bool interactive = hit.HasActiveButton || hit.ActiveCbgButton is not null || hit.HasCbgButtonMapHit || hit.HasSrcMapHit;
         Cursor = interactive ? Cursors.Hand : Cursors.Default;

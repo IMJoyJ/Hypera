@@ -152,7 +152,8 @@ public sealed record ConsoleLine(
     float ContentWidth,
     int LineHeight,
     IReadOnlyList<ConsoleRenderPart> Parts,
-    bool ReplacedInPlace = false);
+    bool ReplacedInPlace = false,
+    bool IsTemporary = false);
 
 public sealed record HtmlParseStyle(
     string FontFamily,

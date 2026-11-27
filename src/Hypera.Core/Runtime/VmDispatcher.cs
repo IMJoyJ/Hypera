@@ -41,6 +41,7 @@ internal static class VmDispatcher
         CompilerOptions compilerOpts = module.CompilerOptions;
         List<CallFrame> callStack = engine.InternalCallStack;
         VariableStore? fastVars = engine.FastVariables;
+        VariableSlotStorage?[]? hotSlots = fastVars?.HotSlotsArray;
         CharacterStore? fastChars = engine.FastCharacters;
 
         int executed = 0;
@@ -316,7 +317,16 @@ internal static class VmDispatcher
                     {
                         // Compiler emits Reg1(StrFormAppendInt, valIntReg, aux: depth) -> value is in A (fallback Aux==0xFFFE uses B)
                         ushort srcInt = insn.Aux == 0xFFFE ? insn.B : insn.A;
-                        frame.GetOrCreateStrForm().Append(intRegs[srcInt].ToString(CultureInfo.InvariantCulture));
+                        Span<char> numBuf = stackalloc char[24];
+                        if (intRegs[srcInt].TryFormat(numBuf, out int written, provider: CultureInfo.InvariantCulture))
+                        {
+                            frame.GetOrCreateStrForm().Append(numBuf[..written]);
+                        }
+                        else
+                        {
+                            frame.GetOrCreateStrForm().Append(intRegs[srcInt].ToString(CultureInfo.InvariantCulture));
+                        }
+
                         break;
                     }
 
@@ -369,31 +379,119 @@ internal static class VmDispatcher
                     // 0x0060..0x007A: Static, Local, Character & Ref Load/Store
                     // ---------------------------------------------------------
                     case OpCode.LoadStaticInt:
+                        if (insn.Aux == (ushort)VariableSlotOrigin.FrameLocal)
+                        {
+                            FrameLocalStorage local = frame.LocalSlots[insn.Immediate];
+                            if (local.Scope != VariableScopeKind.Reference)
+                            {
+                                intRegs[insn.A] = local.IntArray![0];
+                                break;
+                            }
+                        }
+
                         frame.ProgramCounter = pc;
                         intRegs[insn.A] = LoadInt0D(engine, fastVars, frame, insn);
                         break;
 
                     case OpCode.StoreStaticInt:
+                        if (insn.Aux == (ushort)VariableSlotOrigin.FrameLocal)
+                        {
+                            FrameLocalStorage local = frame.LocalSlots[insn.Immediate];
+                            if (local.Scope != VariableScopeKind.Reference)
+                            {
+                                local.IntArray![0] = intRegs[insn.A];
+                                break;
+                            }
+                        }
+
                         frame.ProgramCounter = pc;
                         StoreInt0D(engine, fastVars, frame, insn, intRegs[insn.A]);
                         break;
 
                     case OpCode.LoadStaticStr:
+                        if (insn.Aux == (ushort)VariableSlotOrigin.FrameLocal)
+                        {
+                            FrameLocalStorage local = frame.LocalSlots[insn.Immediate];
+                            if (local.Scope != VariableScopeKind.Reference)
+                            {
+                                strRegs[insn.A] = local.StrArray![0];
+                                break;
+                            }
+                        }
+
                         frame.ProgramCounter = pc;
                         strRegs[insn.A] = LoadStr0D(engine, fastVars, frame, insn);
                         break;
 
                     case OpCode.StoreStaticStr:
+                        if (insn.Aux == (ushort)VariableSlotOrigin.FrameLocal)
+                        {
+                            FrameLocalStorage local = frame.LocalSlots[insn.Immediate];
+                            if (local.Scope != VariableScopeKind.Reference)
+                            {
+                                local.StrArray![0] = strRegs[insn.A] ?? string.Empty;
+                                break;
+                            }
+                        }
+
                         frame.ProgramCounter = pc;
                         StoreStr0D(engine, fastVars, frame, insn, strRegs[insn.A]);
                         break;
 
                     case OpCode.LoadStaticInt1D:
+                        if (insn.Aux == (ushort)VariableSlotOrigin.FrameLocal)
+                        {
+                            FrameLocalStorage local = frame.LocalSlots[insn.Immediate];
+                            long i0 = intRegs[insn.B];
+                            if (local.Scope != VariableScopeKind.Reference && local.Rank == 1 && (ulong)i0 < (ulong)local.Dim0)
+                            {
+                                intRegs[insn.A] = local.IntArray![(int)i0];
+                                break;
+                            }
+                        }
+                        else if (hotSlots is not null && (uint)insn.Immediate < (uint)hotSlots.Length)
+                        {
+                            VariableSlotStorage? slot = hotSlots[insn.Immediate];
+                            if (slot is not null && slot.IsSimpleInt1D)
+                            {
+                                long i0 = intRegs[insn.B];
+                                if ((ulong)i0 < (ulong)slot.Dim0)
+                                {
+                                    long[]? dense = slot.FastDenseInt;
+                                    if (dense is not null)
+                                    {
+                                        intRegs[insn.A] = (uint)i0 < (uint)dense.Length ? dense[(int)i0] : 0L;
+                                        break;
+                                    }
+
+                                    long[]?[]? pages = slot.FastIntPages;
+                                    if (pages is not null)
+                                    {
+                                        int flat = (int)i0;
+                                        long[]? page = pages[flat >> 8];
+                                        intRegs[insn.A] = page is not null ? page[flat & 255] : 0L;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         frame.ProgramCounter = pc;
                         intRegs[insn.A] = LoadInt1D(engine, fastVars, frame, insn, intRegs[insn.B]);
                         break;
 
                     case OpCode.StoreStaticInt1D:
+                        if (insn.Aux == (ushort)VariableSlotOrigin.FrameLocal)
+                        {
+                            FrameLocalStorage local = frame.LocalSlots[insn.Immediate];
+                            long i0 = intRegs[insn.B];
+                            if (local.Scope != VariableScopeKind.Reference && local.Rank == 1 && (ulong)i0 < (ulong)local.Dim0)
+                            {
+                                local.IntArray![(int)i0] = intRegs[insn.A];
+                                break;
+                            }
+                        }
+
                         frame.ProgramCounter = pc;
                         StoreInt1D(engine, fastVars, frame, insn, intRegs[insn.B], intRegs[insn.A]);
                         break;
@@ -1179,32 +1277,28 @@ internal static class VmDispatcher
     private static long LoadCharaInt1D(EmueraEngine engine, CharacterStore? fastChars, Instruction insn, long[] intRegs)
     {
         int charaIdx = checked((int)intRegs[insn.B]);
-        bool isScalar0D = fastChars is not null
-            ? (fastChars.TryGetSchema(insn.Immediate, out CharacterSlotSchema? s) && s is { SubRank: 0 })
-            : insn.Aux == 1;
-        long subIdx = isScalar0D ? 0L : intRegs[insn.C];
-        return fastChars is not null
-            ? fastChars.GetInt1D(charaIdx, insn.Immediate, subIdx)
-            : engine.RequireCharactersInterface().GetInt(charaIdx, insn.Immediate, isScalar0D ? default : [subIdx]);
+        if (fastChars is not null)
+        {
+            return fastChars.GetInt1DOrScalar(charaIdx, insn.Immediate, intRegs[insn.C]);
+        }
+
+        bool isScalar0D = insn.Aux == 1;
+        return engine.RequireCharactersInterface().GetInt(charaIdx, insn.Immediate, isScalar0D ? default : [intRegs[insn.C]]);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void StoreCharaInt1D(EmueraEngine engine, CharacterStore? fastChars, Instruction insn, long[] intRegs)
     {
         int charaIdx = checked((int)intRegs[insn.B]);
-        bool isScalar0D = fastChars is not null
-            ? (fastChars.TryGetSchema(insn.Immediate, out CharacterSlotSchema? s) && s is { SubRank: 0 })
-            : insn.Aux == 1;
-        long subIdx = isScalar0D ? 0L : intRegs[insn.C];
         long val = intRegs[insn.A];
         if (fastChars is not null)
         {
-            fastChars.SetInt1D(charaIdx, insn.Immediate, subIdx, val);
+            fastChars.SetInt1DOrScalar(charaIdx, insn.Immediate, intRegs[insn.C], val);
+            return;
         }
-        else
-        {
-            engine.RequireCharactersInterface().SetInt(charaIdx, insn.Immediate, val, isScalar0D ? default : [subIdx]);
-        }
+
+        bool isScalar0D = insn.Aux == 1;
+        engine.RequireCharactersInterface().SetInt(charaIdx, insn.Immediate, val, isScalar0D ? default : [intRegs[insn.C]]);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -1176,13 +1176,19 @@ internal sealed class FunctionBytecodeEmitter
         }
 
         var mark = MarkTempRegs();
+        bool useCharaElem = bm.Method.Kind is BuiltinMethodKind.CMATCH
+            or BuiltinMethodKind.SUMCARRAY
+            or BuiltinMethodKind.MAXCARRAY
+            or BuiltinMethodKind.MINCARRAY
+            or BuiltinMethodKind.INRANGECARRAY;
         PrepareCallArgumentWindow(
             bm.Arguments,
             argIdx => matchedOv is not null && IsRefParamAt(matchedOv, argIdx),
             BytecodeAbi.MaxInlineBuiltinArgs,
             out ushort intBase,
             out ushort strBase,
-            out CallArgTag[] tags);
+            out CallArgTag[] tags,
+            byRefUsesCharaElementSubscript: useCharaElem);
 
         ushort aux = BytecodeAbi.PackBuiltinArgTags(tags);
         OpCode callOp = bm.Method.ReturnKind == VariableValueKind.Str ? OpCode.BuiltinCallStr : OpCode.BuiltinCallInt;
@@ -1205,7 +1211,8 @@ internal sealed class FunctionBytecodeEmitter
             BytecodeAbi.MaxInlineBuiltinArgs,
             out ushort intBase,
             out ushort strBase,
-            out CallArgTag[] tags);
+            out CallArgTag[] tags,
+            byRefUsesCharaElementSubscript: kind == BuiltinInstructionKind.CVARSET);
 
         ushort aux = BytecodeAbi.PackBuiltinArgTags(tags);
         _module.Emit(Instruction.Reg4(OpCode.BuiltinInstruction, 0, intBase, strBase, (ushort)args.Count, (int)kind, aux));
@@ -1275,7 +1282,8 @@ internal sealed class FunctionBytecodeEmitter
         int maxInlineTags,
         out ushort intBase,
         out ushort strBase,
-        out CallArgTag[] tags)
+        out CallArgTag[] tags,
+        bool byRefUsesCharaElementSubscript = false)
     {
         int count = args.Count;
         tags = count == 0 ? [] : new CallArgTag[count];
@@ -1301,8 +1309,7 @@ internal sealed class FunctionBytecodeEmitter
             else if (isByRefAt(i) && arg is VariableAccessExpr refVa)
             {
                 tags[i] = CallArgTag.ByRef;
-                long encodedRef = EncodeByRefVariable(refVa);
-                EmitLoadIntLiteral((ushort)(intBase + i), encodedRef);
+                EmitByRefVariableInto(refVa, (ushort)(intBase + i), byRefUsesCharaElementSubscript);
             }
             else if (arg.ValueKind == VariableValueKind.Str)
             {
@@ -1320,6 +1327,74 @@ internal sealed class FunctionBytecodeEmitter
                 EmitLoadIntLiteral((ushort)(intBase + count + i), (long)tags[i]);
             }
         }
+    }
+
+    private static ExprNode? SelectByRefIndexExpr(VariableAccessExpr va, bool useCharaElementSubscript)
+    {
+        if (va.IsBareArrayReference || va.Subscripts.Length == 0)
+        {
+            return null;
+        }
+
+        if (useCharaElementSubscript && va.Variable.IsCharaData)
+        {
+            return va.Variable.ArrayRank >= 1 && va.Subscripts.Length >= 2
+                ? va.Subscripts[1]
+                : null;
+        }
+
+        return va.Subscripts[0];
+    }
+
+    private void EmitByRefVariableInto(VariableAccessExpr va, ushort dstReg, bool useCharaElementSubscript)
+    {
+        ResolvedVariable v = va.Variable;
+        int slotId;
+        VariableSlotOrigin origin;
+        if (v.IsByRef && _localSlotMap.TryGetValue(v, out int refIdx))
+        {
+            slotId = refIdx;
+            origin = VariableSlotOrigin.RefPassthrough;
+        }
+        else if (_localSlotMap.TryGetValue(v, out int localIdx))
+        {
+            slotId = localIdx;
+            origin = VariableSlotOrigin.FrameLocal;
+        }
+        else
+        {
+            slotId = v.SlotId;
+            origin = VariableSlotOrigin.ModuleStatic;
+        }
+
+        ExprNode? subExpr = SelectByRefIndexExpr(va, useCharaElementSubscript);
+        if (subExpr is null)
+        {
+            EmitLoadIntLiteral(dstReg, BytecodeAbi.PackByRefTarget(slotId, origin, -1));
+            return;
+        }
+
+        if (subExpr is IntLiteralExpr c0)
+        {
+            EmitLoadIntLiteral(dstReg, BytecodeAbi.PackByRefTarget(slotId, origin, (int)c0.Value));
+            return;
+        }
+
+        // Dynamic ByRef subscript (e.g. VARSET TEQUIP:LOCAL:0, 0 / VARSET DOWNBASE:キャラ_ID:0, 0 /
+        // MATCH(CFLAG:LOCAL:0, 1) / CMATCH(CFLAG:IDX, 1)): pack runtime index into bits 40..63.
+        long basePacked = BytecodeAbi.PackByRefTarget(slotId, origin, -1);
+        var mark = MarkTempRegs();
+        EmitIntExprInto(subExpr, dstReg);
+        ushort tmp = AllocateIntReg();
+        EmitLoadIntLiteral(tmp, 1L);
+        _module.Emit(Instruction.Reg3(OpCode.AddInt, dstReg, dstReg, tmp));
+        EmitLoadIntLiteral(tmp, 0xFF_FFFFL);
+        _module.Emit(Instruction.Reg3(OpCode.BitAnd, dstReg, dstReg, tmp));
+        EmitLoadIntLiteral(tmp, 40L);
+        _module.Emit(Instruction.Reg3(OpCode.ShiftLeft, dstReg, dstReg, tmp));
+        EmitLoadIntLiteral(tmp, basePacked);
+        _module.Emit(Instruction.Reg3(OpCode.BitOr, dstReg, dstReg, tmp));
+        ReleaseTempRegs(mark);
     }
 
     public long EncodeByRefVariable(VariableAccessExpr va)

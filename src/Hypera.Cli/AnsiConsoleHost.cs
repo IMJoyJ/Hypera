@@ -241,6 +241,18 @@ public sealed class AnsiConsoleHost : IDisposable
             return BuildResponseFromLine(req, scripted);
         }
 
+        if (req.TimeoutMilliseconds.HasValue)
+        {
+            if (req.TimeoutMilliseconds.Value <= 1L &&
+                !req.DisplayTime &&
+                req.Kind is InputRequestKind.IntValue or InputRequestKind.StringValue or InputRequestKind.OneInt or InputRequestKind.OneString)
+            {
+                return new InputResponse(req.GenerationId, IsTimeout: true);
+            }
+
+            return ReadTimedInput(req);
+        }
+
         switch (req.Kind)
         {
             case InputRequestKind.TimedWait:

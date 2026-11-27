@@ -37,12 +37,36 @@ public sealed class CharacterStore : ICharacterStore
         // Each slot array is null until the first non-default / non-empty write, and grows on demand up to schema.TotalLength.
         public required long[]?[] IntSlots { get; init; }
         public required string?[]?[] StrSlots { get; init; }
+        public required uint[] IntSlotEpochs { get; init; }
+        public required uint[] StrSlotEpochs { get; init; }
         public bool IsSp { get; set; }
         public uint CowEpoch { get; set; }
+
+        public CharacterRecord CloneShallow(uint cowEpoch)
+        {
+            var intCopy = new long[]?[IntSlots.Length];
+            IntSlots.AsSpan().CopyTo(intCopy);
+            var strCopy = new string?[]?[StrSlots.Length];
+            StrSlots.AsSpan().CopyTo(strCopy);
+            var intEpochsCopy = new uint[IntSlotEpochs.Length];
+            IntSlotEpochs.AsSpan().CopyTo(intEpochsCopy);
+            var strEpochsCopy = new uint[StrSlotEpochs.Length];
+            StrSlotEpochs.AsSpan().CopyTo(strEpochsCopy);
+            return new CharacterRecord
+            {
+                IntSlots = intCopy,
+                StrSlots = strCopy,
+                IntSlotEpochs = intEpochsCopy,
+                StrSlotEpochs = strEpochsCopy,
+                IsSp = IsSp,
+                CowEpoch = cowEpoch,
+            };
+        }
 
         public CharacterRecord CloneDeep(uint cowEpoch = 0)
         {
             var rawIntCopy = new long[]?[IntSlots.Length];
+            var intEpochsCopy = new uint[IntSlots.Length];
             for (int i = 0; i < IntSlots.Length; i++)
             {
                 long[]? src = IntSlots[i];
@@ -51,10 +75,12 @@ public sealed class CharacterStore : ICharacterStore
                     var dst = new long[src.Length];
                     src.AsSpan().CopyTo(dst);
                     rawIntCopy[i] = dst;
+                    intEpochsCopy[i] = cowEpoch;
                 }
             }
 
             var strCopy = new string?[]?[StrSlots.Length];
+            var strEpochsCopy = new uint[StrSlots.Length];
             for (int i = 0; i < StrSlots.Length; i++)
             {
                 string?[]? src = StrSlots[i];
@@ -63,6 +89,7 @@ public sealed class CharacterStore : ICharacterStore
                     var dst = new string?[src.Length];
                     src.AsSpan().CopyTo(dst);
                     strCopy[i] = dst;
+                    strEpochsCopy[i] = cowEpoch;
                 }
             }
 
@@ -70,6 +97,8 @@ public sealed class CharacterStore : ICharacterStore
             {
                 IntSlots = rawIntCopy,
                 StrSlots = strCopy,
+                IntSlotEpochs = intEpochsCopy,
+                StrSlotEpochs = strEpochsCopy,
                 IsSp = IsSp,
                 CowEpoch = cowEpoch,
             };
@@ -198,17 +227,35 @@ public sealed class CharacterStore : ICharacterStore
             CharacterRecord rec = _characters[c];
             if (valueKind == VariableValueKind.Int && rec.IntSlots.Length <= denseIdx)
             {
-                long[]?[] old = rec.IntSlots;
                 var expanded = new long[]?[_intSchemas.Count];
-                old.CopyTo(expanded, 0);
-                _characters[c] = new CharacterRecord { IntSlots = expanded, StrSlots = rec.StrSlots, IsSp = rec.IsSp };
+                rec.IntSlots.CopyTo(expanded, 0);
+                var expandedEpochs = new uint[_intSchemas.Count];
+                rec.IntSlotEpochs.CopyTo(expandedEpochs, 0);
+                _characters[c] = new CharacterRecord
+                {
+                    IntSlots = expanded,
+                    StrSlots = rec.StrSlots,
+                    IntSlotEpochs = expandedEpochs,
+                    StrSlotEpochs = rec.StrSlotEpochs,
+                    IsSp = rec.IsSp,
+                    CowEpoch = rec.CowEpoch,
+                };
             }
             else if (valueKind == VariableValueKind.Str && rec.StrSlots.Length <= denseIdx)
             {
-                string?[]?[] old = rec.StrSlots;
                 var expanded = new string?[]?[_strSchemas.Count];
-                old.CopyTo(expanded, 0);
-                _characters[c] = new CharacterRecord { IntSlots = rec.IntSlots, StrSlots = expanded, IsSp = rec.IsSp };
+                rec.StrSlots.CopyTo(expanded, 0);
+                var expandedEpochs = new uint[_strSchemas.Count];
+                rec.StrSlotEpochs.CopyTo(expandedEpochs, 0);
+                _characters[c] = new CharacterRecord
+                {
+                    IntSlots = rec.IntSlots,
+                    StrSlots = expanded,
+                    IntSlotEpochs = rec.IntSlotEpochs,
+                    StrSlotEpochs = expandedEpochs,
+                    IsSp = rec.IsSp,
+                    CowEpoch = rec.CowEpoch,
+                };
             }
         }
 
@@ -235,16 +282,23 @@ public sealed class CharacterStore : ICharacterStore
             _strSchemas[schema.DenseCharaVarIndex] = updated;
         }
 
+        int dense = updated.DenseCharaVarIndex;
         for (int c = 0; c < _characters.Count; c++)
         {
-            CharacterRecord rec = EnsureMutableRecord(c);
+            CharacterRecord cur = _characters[c];
             if (updated.ValueKind == VariableValueKind.Int)
             {
-                rec.IntSlots[updated.DenseCharaVarIndex] = null;
+                if (cur.IntSlots[dense] is null) continue;
+                CharacterRecord rec = EnsureMutableRecordShallow(c);
+                rec.IntSlots[dense] = null;
+                rec.IntSlotEpochs[dense] = _cowEpoch;
             }
             else
             {
-                rec.StrSlots[updated.DenseCharaVarIndex] = null;
+                if (cur.StrSlots[dense] is null) continue;
+                CharacterRecord rec = EnsureMutableRecordShallow(c);
+                rec.StrSlots[dense] = null;
+                rec.StrSlotEpochs[dense] = _cowEpoch;
             }
         }
     }
@@ -819,7 +873,15 @@ public sealed class CharacterStore : ICharacterStore
         }
 
         // Virtual StainDefault handles null arrays with zero allocation
-        EnsureMutableRecord(characterIndex).IntSlots[stainSchema.DenseCharaVarIndex] = null;
+        int stainDense = stainSchema.DenseCharaVarIndex;
+        if (_characters[characterIndex].IntSlots[stainDense] is null)
+        {
+            return;
+        }
+
+        CharacterRecord stainRec = EnsureMutableRecordShallow(characterIndex);
+        stainRec.IntSlots[stainDense] = null;
+        stainRec.IntSlotEpochs[stainDense] = _cowEpoch;
     }
 
     public void ClearCharacterSlot(int characterIndex, int slotId)
@@ -830,7 +892,7 @@ public sealed class CharacterStore : ICharacterStore
             return;
         }
 
-        CharacterRecord rec = EnsureMutableRecord(characterIndex);
+        int dense = schema.DenseCharaVarIndex;
         if (schema.ValueKind == VariableValueKind.Int)
         {
             if (slotId == RelationSlotId && _replaceConfig.RelationDef != 0)
@@ -843,12 +905,26 @@ public sealed class CharacterStore : ICharacterStore
             }
             else
             {
-                rec.IntSlots[schema.DenseCharaVarIndex] = null;
+                if (_characters[characterIndex].IntSlots[dense] is null)
+                {
+                    return;
+                }
+
+                CharacterRecord rec = EnsureMutableRecordShallow(characterIndex);
+                rec.IntSlots[dense] = null;
+                rec.IntSlotEpochs[dense] = _cowEpoch;
             }
         }
         else
         {
-            rec.StrSlots[schema.DenseCharaVarIndex] = null;
+            if (_characters[characterIndex].StrSlots[dense] is null)
+            {
+                return;
+            }
+
+            CharacterRecord rec = EnsureMutableRecordShallow(characterIndex);
+            rec.StrSlots[dense] = null;
+            rec.StrSlotEpochs[dense] = _cowEpoch;
         }
     }
 
@@ -891,7 +967,7 @@ public sealed class CharacterStore : ICharacterStore
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetIntSchemaOrThrow(slotId);
         int flat = ComputeSubFlatIndex(schema, indices);
-        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, flat, value);
+        WriteIntAt(characterIndex, schema, flat, value);
     }
 
     public string GetStr(int characterIndex, int slotId, ReadOnlySpan<long> indices = default)
@@ -907,7 +983,7 @@ public sealed class CharacterStore : ICharacterStore
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetStrSchemaOrThrow(slotId);
         int flat = ComputeSubFlatIndex(schema, indices);
-        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, flat, value);
+        WriteStrAt(characterIndex, schema, flat, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -923,7 +999,7 @@ public sealed class CharacterStore : ICharacterStore
     {
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetIntSchemaOrThrow(slotId);
-        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, 0, value);
+        WriteIntAt(characterIndex, schema, 0, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -961,7 +1037,7 @@ public sealed class CharacterStore : ICharacterStore
                 ThrowSubIndexOutOfRange(schema, idx0);
             }
 
-            WriteRecordInt(EnsureMutableRecord(characterIndex), schema, 0, value);
+            WriteIntAt(characterIndex, schema, 0, value);
             return;
         }
 
@@ -970,7 +1046,44 @@ public sealed class CharacterStore : ICharacterStore
             ThrowSubIndexOutOfRange(schema, idx0);
         }
 
-        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, (int)idx0, value);
+        WriteIntAt(characterIndex, schema, (int)idx0, value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal long GetInt1DOrScalar(int characterIndex, int slotId, long idx0)
+    {
+        ValidateCharacterIndex(characterIndex);
+        CharacterSlotSchema schema = GetIntSchemaOrThrow(slotId);
+        if (schema.SubRank == 0)
+        {
+            return ReadRecordInt(_characters[characterIndex], schema, 0);
+        }
+
+        if ((ulong)idx0 >= (ulong)schema.Dim0)
+        {
+            ThrowSubIndexOutOfRange(schema, idx0);
+        }
+
+        return ReadRecordInt(_characters[characterIndex], schema, (int)idx0);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void SetInt1DOrScalar(int characterIndex, int slotId, long idx0, long value)
+    {
+        ValidateCharacterIndex(characterIndex);
+        CharacterSlotSchema schema = GetIntSchemaOrThrow(slotId);
+        if (schema.SubRank == 0)
+        {
+            WriteIntAt(characterIndex, schema, 0, value);
+            return;
+        }
+
+        if ((ulong)idx0 >= (ulong)schema.Dim0)
+        {
+            ThrowSubIndexOutOfRange(schema, idx0);
+        }
+
+        WriteIntAt(characterIndex, schema, (int)idx0, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -996,7 +1109,7 @@ public sealed class CharacterStore : ICharacterStore
             ThrowSubIndexOutOfRange(schema, idx0);
         }
 
-        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, ((int)idx0 * schema.Dim1) + (int)idx1, value);
+        WriteIntAt(characterIndex, schema, ((int)idx0 * schema.Dim1) + (int)idx1, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1012,7 +1125,7 @@ public sealed class CharacterStore : ICharacterStore
     {
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetStrSchemaOrThrow(slotId);
-        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, 0, value);
+        WriteStrAt(characterIndex, schema, 0, value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1050,7 +1163,7 @@ public sealed class CharacterStore : ICharacterStore
                 ThrowSubIndexOutOfRange(schema, idx0);
             }
 
-            WriteRecordStr(EnsureMutableRecord(characterIndex), schema, 0, value);
+            WriteStrAt(characterIndex, schema, 0, value);
             return;
         }
 
@@ -1059,7 +1172,7 @@ public sealed class CharacterStore : ICharacterStore
             ThrowSubIndexOutOfRange(schema, idx0);
         }
 
-        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, (int)idx0, value);
+        WriteStrAt(characterIndex, schema, (int)idx0, value);
     }
 
     public string GetStr2D(int characterIndex, int slotId, long idx0, long idx1)
@@ -1083,21 +1196,25 @@ public sealed class CharacterStore : ICharacterStore
             ThrowSubIndexOutOfRange(schema, idx0);
         }
 
-        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, ((int)idx0 * schema.Dim1) + (int)idx1, value);
+        WriteStrAt(characterIndex, schema, ((int)idx0 * schema.Dim1) + (int)idx1, value);
     }
 
     public long[] GetRawIntArray(int characterIndex, int slotId)
     {
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetIntSchemaOrThrow(slotId);
-        return EnsureFullIntArray(EnsureMutableRecord(characterIndex), schema);
+        CharacterRecord rec = EnsureMutableRecordShallow(characterIndex);
+        EnsureMutableIntSlot(rec, schema.DenseCharaVarIndex);
+        return EnsureFullIntArray(rec, schema);
     }
 
     public string[] GetRawStrArray(int characterIndex, int slotId)
     {
         ValidateCharacterIndex(characterIndex);
         CharacterSlotSchema schema = GetStrSchemaOrThrow(slotId);
-        return EnsureFullStrArray(EnsureMutableRecord(characterIndex), schema);
+        CharacterRecord rec = EnsureMutableRecordShallow(characterIndex);
+        EnsureMutableStrSlot(rec, schema.DenseCharaVarIndex);
+        return EnsureFullStrArray(rec, schema);
     }
 
     public Span<long> GetIntSpan(int characterIndex, int slotId) => GetRawIntArray(characterIndex, slotId).AsSpan();
@@ -1221,10 +1338,10 @@ public sealed class CharacterStore : ICharacterStore
         ReadRecordStr(_characters[characterIndex], schema, flat);
 
     internal void WriteFlatInt(int characterIndex, CharacterSlotSchema schema, int flat, long value) =>
-        WriteRecordInt(EnsureMutableRecord(characterIndex), schema, flat, value);
+        WriteIntAt(characterIndex, schema, flat, value);
 
     internal void WriteFlatStr(int characterIndex, CharacterSlotSchema schema, int flat, string? value) =>
-        WriteRecordStr(EnsureMutableRecord(characterIndex), schema, flat, value);
+        WriteStrAt(characterIndex, schema, flat, value);
 
     // -------------------------------------------------------------------------
     // CVARSET / CMATCH / SUMCARRAY / MAXCARRAY / MINCARRAY / INRANGECARRAY
@@ -1243,7 +1360,7 @@ public sealed class CharacterStore : ICharacterStore
         int flat = ComputeSubFlatIndex(schema, subIndices);
         for (int c = startChara; c < actualEnd; c++)
         {
-            WriteRecordInt(EnsureMutableRecord(c), schema, flat, value);
+            WriteIntAt(c, schema, flat, value);
         }
     }
 
@@ -1260,7 +1377,7 @@ public sealed class CharacterStore : ICharacterStore
         int flat = ComputeSubFlatIndex(schema, subIndices);
         for (int c = startChara; c < actualEnd; c++)
         {
-            WriteRecordStr(EnsureMutableRecord(c), schema, flat, value);
+            WriteStrAt(c, schema, flat, value);
         }
     }
 
@@ -1383,7 +1500,7 @@ public sealed class CharacterStore : ICharacterStore
         _characters.Clear();
         for (int i = 0; i < snapshot.Count; i++)
         {
-            _characters.Add(snapshot[i].CloneDeep());
+            _characters.Add(snapshot[i].CloneDeep(_cowEpoch));
         }
     }
 
@@ -1524,7 +1641,8 @@ public sealed class CharacterStore : ICharacterStore
             {
                 if (ReferenceEquals(rec.IntSlots[i], arrayRef))
                 {
-                    CharacterRecord mutable = EnsureMutableRecord(c);
+                    CharacterRecord mutable = EnsureMutableRecordShallow(c);
+                    EnsureMutableIntSlot(mutable, i);
                     newLiveArray = mutable.IntSlots[i];
                     return newLiveArray is not null;
                 }
@@ -1534,7 +1652,8 @@ public sealed class CharacterStore : ICharacterStore
             {
                 if (ReferenceEquals(rec.StrSlots[i], arrayRef))
                 {
-                    CharacterRecord mutable = EnsureMutableRecord(c);
+                    CharacterRecord mutable = EnsureMutableRecordShallow(c);
+                    EnsureMutableStrSlot(mutable, i);
                     newLiveArray = mutable.StrSlots[i];
                     return newLiveArray is not null;
                 }
@@ -1551,7 +1670,10 @@ public sealed class CharacterStore : ICharacterStore
         {
             for (int i = 0; i < _characters.Count; i++)
             {
-                _characters[i].CowEpoch = 0;
+                CharacterRecord rec = _characters[i];
+                rec.CowEpoch = 0;
+                Array.Clear(rec.IntSlotEpochs);
+                Array.Clear(rec.StrSlotEpochs);
             }
 
             _cowEpoch = 1;
@@ -1562,16 +1684,72 @@ public sealed class CharacterStore : ICharacterStore
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private CharacterRecord EnsureMutableRecord(int characterIndex)
+    private CharacterRecord EnsureMutableRecordShallow(int characterIndex)
     {
         CharacterRecord rec = _characters[characterIndex];
         if (rec.CowEpoch != _cowEpoch)
         {
-            rec = rec.CloneDeep(_cowEpoch);
+            rec = rec.CloneShallow(_cowEpoch);
             _characters[characterIndex] = rec;
         }
 
         return rec;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureMutableIntSlot(CharacterRecord rec, int denseIndex)
+    {
+        long[]? arr = rec.IntSlots[denseIndex];
+        if (arr is not null && rec.IntSlotEpochs[denseIndex] != _cowEpoch)
+        {
+            var copy = new long[arr.Length];
+            arr.AsSpan().CopyTo(copy);
+            rec.IntSlots[denseIndex] = copy;
+            rec.IntSlotEpochs[denseIndex] = _cowEpoch;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureMutableStrSlot(CharacterRecord rec, int denseIndex)
+    {
+        string?[]? arr = rec.StrSlots[denseIndex];
+        if (arr is not null && rec.StrSlotEpochs[denseIndex] != _cowEpoch)
+        {
+            var copy = new string?[arr.Length];
+            arr.AsSpan().CopyTo(copy);
+            rec.StrSlots[denseIndex] = copy;
+            rec.StrSlotEpochs[denseIndex] = _cowEpoch;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void WriteIntAt(int characterIndex, CharacterSlotSchema schema, int flat, long value)
+    {
+        CharacterRecord rec = _characters[characterIndex];
+        // No-op write guard: skip shallow & per-slot CoW cloning entirely when value is unchanged!
+        if (ReadRecordInt(rec, schema, flat) == value)
+        {
+            return;
+        }
+
+        rec = EnsureMutableRecordShallow(characterIndex);
+        EnsureMutableIntSlot(rec, schema.DenseCharaVarIndex);
+        WriteRecordInt(rec, schema, flat, value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void WriteStrAt(int characterIndex, CharacterSlotSchema schema, int flat, string? value)
+    {
+        string norm = value ?? string.Empty;
+        CharacterRecord rec = _characters[characterIndex];
+        if (string.Equals(ReadRecordStr(rec, schema, flat), norm, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        rec = EnsureMutableRecordShallow(characterIndex);
+        EnsureMutableStrSlot(rec, schema.DenseCharaVarIndex);
+        WriteRecordStr(rec, schema, flat, norm);
     }
 
     private CharacterRecord AllocateBlankRecord() =>
@@ -1579,6 +1757,8 @@ public sealed class CharacterStore : ICharacterStore
         {
             IntSlots = new long[]?[_intSchemas.Count],
             StrSlots = new string?[]?[_strSchemas.Count],
+            IntSlotEpochs = new uint[_intSchemas.Count],
+            StrSlotEpochs = new uint[_strSchemas.Count],
             CowEpoch = _cowEpoch,
         };
 
@@ -1678,6 +1858,7 @@ public sealed class CharacterStore : ICharacterStore
             }
 
             rec.IntSlots[dense] = arr;
+            rec.IntSlotEpochs[dense] = _cowEpoch;
             arr[flat] = value;
             return;
         }
@@ -1697,6 +1878,7 @@ public sealed class CharacterStore : ICharacterStore
         }
 
         rec.IntSlots[dense] = arr;
+        rec.IntSlotEpochs[dense] = _cowEpoch;
         arr[flat] = value;
     }
 
@@ -1708,7 +1890,7 @@ public sealed class CharacterStore : ICharacterStore
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void WriteRecordStr(CharacterRecord rec, CharacterSlotSchema schema, int flat, string? value)
+    private void WriteRecordStr(CharacterRecord rec, CharacterSlotSchema schema, int flat, string? value)
     {
         string norm = value ?? string.Empty;
         int dense = schema.DenseCharaVarIndex;
@@ -1735,6 +1917,7 @@ public sealed class CharacterStore : ICharacterStore
         }
 
         rec.StrSlots[dense] = arr;
+        rec.StrSlotEpochs[dense] = _cowEpoch;
         arr[flat] = norm;
     }
 
@@ -1772,10 +1955,11 @@ public sealed class CharacterStore : ICharacterStore
         }
 
         rec.IntSlots[dense] = full;
+        rec.IntSlotEpochs[dense] = _cowEpoch;
         return full;
     }
 
-    private static string[] EnsureFullStrArray(CharacterRecord rec, CharacterSlotSchema schema)
+    private string[] EnsureFullStrArray(CharacterRecord rec, CharacterSlotSchema schema)
     {
         int dense = schema.DenseCharaVarIndex;
         string?[]? arr = rec.StrSlots[dense];
@@ -1801,6 +1985,7 @@ public sealed class CharacterStore : ICharacterStore
         }
 
         rec.StrSlots[dense] = full;
+        rec.StrSlotEpochs[dense] = _cowEpoch;
         return full;
     }
 

@@ -39,15 +39,56 @@ public sealed class CallFrame
     public int ProgramCounter { get; set; }
     public long[] IntRegisters { get; }
     public string[] StrRegisters { get; }
-    public ushort CallerReturnRegister { get; }
-    public bool ExpectsStringReturn { get; }
+    public ushort CallerReturnRegister { get; internal set; }
+    public bool ExpectsStringReturn { get; internal set; }
     public int? ActiveCatchTargetPc { get; set; }
     public int PassiveDebugGuardEndPc { get; set; } = -1;
 
     public bool IsMethodFunction { get; init; }
-    public bool DiscardCallerRegisterWrite { get; init; }
+    public bool DiscardCallerRegisterWrite { get; internal set; }
     public FrameLocalStorage[] LocalSlots { get; init; } = [];
     public long RepeatEnd { get; set; }
+
+    internal void ResetForReuse(int entryPc, ushort callerReturnReg, bool expectsStrReturn, bool discardReturnReg)
+    {
+        ProgramCounter = entryPc;
+        CallerReturnRegister = callerReturnReg;
+        ExpectsStringReturn = expectsStrReturn;
+        DiscardCallerRegisterWrite = discardReturnReg;
+        ActiveCatchTargetPc = null;
+        PassiveDebugGuardEndPc = -1;
+        RepeatEnd = 0;
+        ResetActiveStrForm();
+
+        if (IntRegisters.Length > 0)
+        {
+            Array.Clear(IntRegisters);
+        }
+
+        if (StrRegisters.Length > 0)
+        {
+            Array.Fill(StrRegisters, string.Empty);
+        }
+
+        FrameLocalStorage[] locals = LocalSlots;
+        for (int i = 0; i < locals.Length; i++)
+        {
+            FrameLocalStorage? loc = locals[i];
+            if (loc is null)
+            {
+                continue;
+            }
+
+            if (loc.Scope == VariableScopeKind.FunctionDynamic)
+            {
+                loc.ResetDynamicValues();
+            }
+            else if (loc.Scope == VariableScopeKind.Reference)
+            {
+                loc.ResetUnboundRef();
+            }
+        }
+    }
 
     public void BeginStrForm()
     {

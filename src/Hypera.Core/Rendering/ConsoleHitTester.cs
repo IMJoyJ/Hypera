@@ -195,47 +195,57 @@ public static class ConsoleHitTester
             }
         }
 
-        // 3. Evaluate visible console lines (including escaped divs/images) if not already claimed by an island
+        // 3. Evaluate visible console lines in exact reverse painter's order:
+        //    (a) explicit foreground parts (Depth < 0), (b) all Depth == 0 flow parts bottom-to-top,
+        //    (c) explicit background parts (Depth > 0).
         if (matchedButton is null && matchedSrcMapColor < 0)
         {
             float[] lineTops = ComputeVisibleLineTops(scene);
 
-            // Check escaped/div parts in front-to-back order (lowest Depth first = painted last)
-            var escaped = new List<(ConsoleRenderPart Part, float LineTopY)>();
-            for (int i = 0; i < scene.VisibleLines.Count; i++)
+            // Collect non-zero depth parts in reverse draw order so ties within the same Depth hit the topmost (latest) part first.
+            List<(ConsoleRenderPart Part, float LineTopY)>? foregroundLayered = null;
+            List<(ConsoleRenderPart Part, float LineTopY)>? backgroundLayered = null;
+            for (int i = scene.VisibleLines.Count - 1; i >= 0; i--)
             {
                 ConsoleLine line = scene.VisibleLines[i];
-                for (int p = 0; p < line.Parts.Count; p++)
+                for (int p = line.Parts.Count - 1; p >= 0; p--)
                 {
                     ConsoleRenderPart part = line.Parts[p];
-                    if (part.IsEscapedFromLine(line.LineHeight))
+                    if (part.Depth < 0)
                     {
-                        escaped.Add((part, lineTops[i]));
+                        (foregroundLayered ??= []).Add((part, lineTops[i]));
+                    }
+                    else if (part.Depth > 0)
+                    {
+                        (backgroundLayered ??= []).Add((part, lineTops[i]));
                     }
                 }
             }
 
-            // Foreground escaped parts (Depth <= 0) first
-            foreach (var entry in escaped.Where(e => e.Part.Depth <= 0).OrderBy(e => e.Part.Depth))
+            // 3a. Explicit foreground parts (Depth < 0), most negative depth first
+            if (foregroundLayered is not null)
             {
-                if (HitTestSinglePart(
-                        entry.Part,
-                        entry.LineTopY,
-                        originOffsetX: 0f,
-                        scene,
-                        logicalX,
-                        logicalY,
-                        graphics,
-                        sprites,
-                        ref matchedButton,
-                        ref matchedSrcMapColor,
-                        ref tooltip))
+                foreach (var entry in foregroundLayered.OrderBy(e => e.Part.Depth))
                 {
-                    break;
+                    if (HitTestSinglePart(
+                            entry.Part,
+                            entry.LineTopY,
+                            originOffsetX: 0f,
+                            scene,
+                            logicalX,
+                            logicalY,
+                            graphics,
+                            sprites,
+                            ref matchedButton,
+                            ref matchedSrcMapColor,
+                            ref tooltip))
+                    {
+                        goto DoneLineScan;
+                    }
                 }
             }
 
-            // Normal flow parts (Depth == 0)
+            // 3b. All Depth == 0 flow parts (text, <img>, <shape>, <div>) in reverse painter's order (bottom-to-top, right-to-left)
             if (matchedButton is null && matchedSrcMapColor < 0)
             {
                 for (int i = scene.VisibleLines.Count - 1; i >= 0; i--)
@@ -245,7 +255,7 @@ public static class ConsoleHitTester
                     for (int p = line.Parts.Count - 1; p >= 0; p--)
                     {
                         ConsoleRenderPart part = line.Parts[p];
-                        if (part.IsEscapedFromLine(line.LineHeight))
+                        if (part.Depth != 0)
                         {
                             continue;
                         }
@@ -269,10 +279,10 @@ public static class ConsoleHitTester
                 }
             }
 
-            // Background escaped parts (Depth > 0)
-            if (matchedButton is null && matchedSrcMapColor < 0)
+            // 3c. Explicit background parts (Depth > 0), smallest positive depth first
+            if (matchedButton is null && matchedSrcMapColor < 0 && backgroundLayered is not null)
             {
-                foreach (var entry in escaped.Where(e => e.Part.Depth > 0).OrderBy(e => e.Part.Depth))
+                foreach (var entry in backgroundLayered.OrderBy(e => e.Part.Depth))
                 {
                     if (HitTestSinglePart(
                             entry.Part,
@@ -341,15 +351,27 @@ public static class ConsoleHitTester
         ref int matchedSrcMapColor,
         ref string? tooltip)
     {
+        if (lines.Count == 0)
+        {
+            return false;
+        }
+
+        float[] tops = new float[lines.Count];
         float y = startTopY;
         for (int i = 0; i < lines.Count; i++)
+        {
+            tops[i] = y;
+            y += Math.Max(1, lines[i].LineHeight);
+        }
+
+        for (int i = lines.Count - 1; i >= 0; i--)
         {
             ConsoleLine line = lines[i];
             for (int p = line.Parts.Count - 1; p >= 0; p--)
             {
                 if (HitTestSinglePart(
                         line.Parts[p],
-                        y,
+                        tops[i],
                         originOffsetX,
                         scene,
                         logicalX,
@@ -363,8 +385,6 @@ public static class ConsoleHitTester
                     return true;
                 }
             }
-
-            y += Math.Max(1, line.LineHeight);
         }
 
         return false;

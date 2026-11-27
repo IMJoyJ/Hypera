@@ -83,6 +83,10 @@ public sealed class VariableSlotStorage
     public bool HasAllocatedStorage =>
         _denseInt is not null || _intPages is not null || _denseStr is not null || _strPages is not null;
 
+    internal bool IsSimpleInt1D => !IsCharaData && CalcKind == BuiltinCalcKind.None && Rank == 1 && ValueKind == VariableValueKind.Int;
+    internal long[]? FastDenseInt => _backingInitialized ? _denseInt : null;
+    internal long[]?[]? FastIntPages => _backingInitialized ? _intPages : null;
+
     /// <summary>
     /// Materializes and returns a contiguous <see cref="long"/> array of length <see cref="TotalLength"/>.
     /// Prefer sparse accessors (<c>ReadIntFlat</c>/<c>WriteIntFlat</c>) on hot paths to preserve lazy memory savings.
@@ -1282,6 +1286,10 @@ public sealed class VariableStore : IVariableStore
     private readonly VariableSlotStorage?[] _hotSlots = new VariableSlotStorage?[HotSlotCapacity];
     private readonly Dictionary<int, VariableSlotStorage> _coldSlots = [];
     private int _maxSlotId = -1;
+    private long _dynamicSlotVersion;
+
+    internal long DynamicSlotVersion => _dynamicSlotVersion;
+    internal VariableSlotStorage?[] HotSlotsArray => _hotSlots;
 
     // Only stores slots NOT present in _module (built-in fallbacks & runtime dynamic LOCAL@FUNC slots).
     private readonly Dictionary<string, int> _localNameToSlot;
@@ -3377,6 +3385,7 @@ public sealed class VariableStore : IVariableStore
         };
 
         StoreSlotAt(slotId, storage, registerLocalName: true);
+        _dynamicSlotVersion++;
         return slotId;
     }
 

@@ -37,6 +37,7 @@ public sealed class SkiaFrameCompositor : IDisposable
 
     public static SKSamplingOptions CrispSampling { get; } = new(SKFilterMode.Nearest, SKMipmapMode.None);
     public static SKSamplingOptions SmoothSampling { get; } = new(SKFilterMode.Linear, SKMipmapMode.Linear);
+    private static readonly SKSamplingOptions SmoothNoMipmapSampling = new(SKFilterMode.Linear, SKMipmapMode.None);
 
     public FontRegistry Fonts => _fontRegistry;
     public GlyphMeasurer Measurer => _glyphMeasurer;
@@ -171,10 +172,9 @@ public sealed class SkiaFrameCompositor : IDisposable
                     {
                         Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)MathF.Round(bg.Opacity * 255f), 0, 255)),
                     };
-                    using SKImage img = SKImage.FromBitmap(frame.Bitmap);
                     var src = new SKRect(frame.SourceRect.Left, frame.SourceRect.Top, frame.SourceRect.Right, frame.SourceRect.Bottom);
                     var dst = new SKRect(0, 0, scene.Viewport.LogicalWidth, scene.Viewport.LogicalHeight);
-                    canvas.DrawImage(img, src, dst, SmoothSampling, paint);
+                    DrawBitmapZeroCopy(canvas, frame.Bitmap, src, dst, SmoothNoMipmapSampling, paint);
                 }
             }
         }
@@ -183,7 +183,7 @@ public sealed class SkiaFrameCompositor : IDisposable
         float[] lineTops = ConsoleHitTester.ComputeVisibleLineTops(scene);
 
         var cbgByDepth = new Dictionary<int, List<CbgLayer>>();
-        var escapedByDepth = new Dictionary<int, List<(ConsoleRenderPart Part, float LineTopY)>>();
+        var layeredPartsByDepth = new Dictionary<int, List<(ConsoleRenderPart Part, float LineTopY)>>();
         var depths = new HashSet<int> { 0 };
 
         foreach (CbgLayer cbg in scene.CbgLayers)
@@ -204,13 +204,13 @@ public sealed class SkiaFrameCompositor : IDisposable
             for (int p = 0; p < line.Parts.Count; p++)
             {
                 ConsoleRenderPart part = line.Parts[p];
-                if (part.IsEscapedFromLine(line.LineHeight))
+                if (part.Depth != 0)
                 {
                     depths.Add(part.Depth);
-                    if (!escapedByDepth.TryGetValue(part.Depth, out List<(ConsoleRenderPart, float)>? list))
+                    if (!layeredPartsByDepth.TryGetValue(part.Depth, out List<(ConsoleRenderPart, float)>? list))
                     {
                         list = [];
-                        escapedByDepth[part.Depth] = list;
+                        layeredPartsByDepth[part.Depth] = list;
                     }
 
                     list.Add((part, lineTops[i]));
@@ -232,27 +232,41 @@ public sealed class SkiaFrameCompositor : IDisposable
                 }
             }
 
-            // 3b. depth == 0 standard visible flow lines
+            // 3b. depth == 0 flow lines in Emuera top-to-bottom painter's order.
+            // Every depth == 0 part (including cross-line <img>/<shape>/<div>) draws with its own line
+            // so earlier lines with positive ypos (e.g. room backgrounds) paint BEHIND later lines' text/bars,
+            // while later lines with negative ypos paint ON TOP OF earlier lines.
             if (depth == 0)
             {
+                float viewportHeight = scene.Viewport.LogicalHeight;
                 for (int i = 0; i < scene.VisibleLines.Count; i++)
                 {
                     ConsoleLine line = scene.VisibleLines[i];
                     float lineY = lineTops[i];
-                    foreach (ConsoleRenderPart part in line.Parts)
+                    bool lineOutsideViewport = lineY + line.LineHeight <= 0f || lineY >= viewportHeight;
+                    for (int p = 0; p < line.Parts.Count; p++)
                     {
-                        if (!part.IsEscapedFromLine(line.LineHeight))
+                        ConsoleRenderPart part = line.Parts[p];
+                        if (part.Depth != 0)
                         {
-                            DrawPart(canvas, part, lineY, originOffsetX: 0f, scene, graphics, sprites);
+                            continue;
                         }
+
+                        if (lineOutsideViewport && !part.IsEscapedFromLine(line.LineHeight))
+                        {
+                            continue;
+                        }
+
+                        DrawPart(canvas, part, lineY, originOffsetX: 0f, scene, graphics, sprites);
                     }
                 }
             }
 
-            // 3c. Escaped cross-line parts (<img> / <shape> / <div>) at this depth
-            if (escapedByDepth.TryGetValue(depth, out List<(ConsoleRenderPart Part, float LineTopY)>? escapedList))
+            // 3c. Explicit non-zero depth parts (depth > 0 behind flow lines, depth < 0 in front of flow lines)
+            if (depth != 0 &&
+                layeredPartsByDepth.TryGetValue(depth, out List<(ConsoleRenderPart Part, float LineTopY)>? layeredList))
             {
-                foreach (var (part, lineY) in escapedList)
+                foreach (var (part, lineY) in layeredList)
                 {
                     DrawPart(canvas, part, lineY, originOffsetX: 0f, scene, graphics, sprites);
                 }
@@ -299,8 +313,9 @@ public sealed class SkiaFrameCompositor : IDisposable
         {
             float drawX = cbg.X;
             float drawY = cbg.Y + scene.Viewport.LogicalHeight - surface.Height;
-            using SKImage img = SKImage.FromBitmap(surface.Bitmap);
-            canvas.DrawImage(img, drawX, drawY, CrispSampling);
+            var srcRect = new SKRect(0, 0, surface.Width, surface.Height);
+            var dstRect = new SKRect(drawX, drawY, drawX + surface.Width, drawY + surface.Height);
+            DrawBitmapZeroCopy(canvas, surface.Bitmap, srcRect, dstRect, CrispSampling);
             return;
         }
 
@@ -325,8 +340,7 @@ public sealed class SkiaFrameCompositor : IDisposable
         float y = cbg.Y + frame.PosY + scene.Viewport.LogicalHeight - frame.LogicalHeight;
         var src = new SKRect(frame.SourceRect.Left, frame.SourceRect.Top, frame.SourceRect.Right, frame.SourceRect.Bottom);
         var dst = new SKRect(x, y, x + frame.LogicalWidth, y + frame.LogicalHeight);
-        using SKImage spriteImg = SKImage.FromBitmap(frame.Bitmap);
-        canvas.DrawImage(spriteImg, src, dst, CrispSampling);
+        DrawBitmapZeroCopy(canvas, frame.Bitmap, src, dst, CrispSampling);
     }
 
     private void DrawPart(
@@ -436,22 +450,45 @@ public sealed class SkiaFrameCompositor : IDisposable
         var dst = new SKRect(x, y, x + part.Width, y + part.Height);
         SKSamplingOptions sampling = part.SamplingMode == PixelSamplingMode.CrispNearestNeighbor
             ? CrispSampling
-            : SmoothSampling;
+            : SmoothNoMipmapSampling;
 
-        using SKImage img = SKImage.FromBitmap(frame.Bitmap);
         if (part.FlipX || part.FlipY)
         {
             canvas.Save();
             canvas.Translate(x + (part.Width * 0.5f), y + (part.Height * 0.5f));
             canvas.Scale(part.FlipX ? -1f : 1f, part.FlipY ? -1f : 1f);
             canvas.Translate(-(x + (part.Width * 0.5f)), -(y + (part.Height * 0.5f)));
-            canvas.DrawImage(img, src, dst, sampling);
+            DrawBitmapZeroCopy(canvas, frame.Bitmap, src, dst, sampling);
             canvas.Restore();
         }
         else
         {
-            canvas.DrawImage(img, src, dst, sampling);
+            DrawBitmapZeroCopy(canvas, frame.Bitmap, src, dst, sampling);
         }
+    }
+
+    private static void DrawBitmapZeroCopy(
+        SKCanvas canvas,
+        SKBitmap bitmap,
+        SKRect src,
+        SKRect dst,
+        SKSamplingOptions sampling,
+        SKPaint? paint = null)
+    {
+        // Wrap the live SKBitmap raster memory directly without copying pixels or rebuilding ephemeral CPU mipmaps.
+        SKPixmap? pixmap = bitmap.PeekPixels();
+        if (pixmap is not null && pixmap.GetPixels() != IntPtr.Zero)
+        {
+            using SKImage wrapped = SKImage.FromPixels(pixmap.Info, pixmap.GetPixels(), pixmap.RowBytes);
+            if (wrapped is not null)
+            {
+                canvas.DrawImage(wrapped, src, dst, sampling, paint);
+                return;
+            }
+        }
+
+        using SKImage fallback = SKImage.FromBitmap(bitmap);
+        canvas.DrawImage(fallback, src, dst, sampling, paint);
     }
 
     private void DrawDivPart(

@@ -214,12 +214,38 @@ public static class EastAsianStringOps
                 }
             }
 
-            // Fallback: full-width CJK / non-ASCII symbols default to 2 in Emuera display width if unmapped in ANSI
-            length += written > 1 ? written : 2;
+            if (char.IsHighSurrogate(c) && i + 1 < str.Length && char.IsLowSurrogate(str[i + 1]))
+            {
+                // Surrogate pair (e.g. CJK Extension B / Emoji): treat as a single width-2 glyph instead of 2+2.
+                length += 2;
+                i++;
+                continue;
+            }
+
+            // Fallback for characters not representable in the active ANSI codepage:
+            // Emuera's Config.Encode.GetByteCount returns 1 for unmapped chars (CP932 '?' fallback),
+            // and MS Gothic / monospace fonts render Latin-Extended ('š', 'À', 'Ø'), narrow symbols ('•', '♫', '♡', '♥', '—'),
+            // etc. at 1 half-width column. Only treat true East-Asian Wide / Fullwidth glyphs as width 2.
+            length += written > 1 ? written : (IsEastAsianWideOrFullwidth(c) ? 2 : 1);
         }
 
         return length;
     }
+
+    private static bool IsEastAsianWideOrFullwidth(char c) =>
+        c is (>= '\u1100' and <= '\u115F')
+            or '\u2329' or '\u232A'
+            or (>= '\u2E80' and <= '\u303E')
+            or (>= '\u3041' and <= '\u33FF')
+            or (>= '\u3400' and <= '\u4DBF')
+            or (>= '\u4E00' and <= '\uA4CF')
+            or (>= '\uA960' and <= '\uA97F')
+            or (>= '\uAC00' and <= '\uD7A3')
+            or (>= '\uF900' and <= '\uFAFF')
+            or (>= '\uFE10' and <= '\uFE19')
+            or (>= '\uFE30' and <= '\uFE6F')
+            or (>= '\uFF01' and <= '\uFF60')
+            or (>= '\uFFE0' and <= '\uFFE6');
 
     public static int GetStrlenSU(string? str) => str?.Length ?? 0;
 

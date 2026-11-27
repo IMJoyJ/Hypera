@@ -22,7 +22,9 @@ internal sealed record PendingScriptInputMeta(
     bool HasDefault,
     long DefaultInt,
     string DefaultStr,
-    int? TargetRegister);
+    int? TargetRegister,
+    string? TimeoutMessage = null,
+    bool DisplayTime = false);
 
 /// <summary>
 /// Fully instance-isolated Hypera execution engine (zero static mutable game state).
@@ -36,6 +38,7 @@ public sealed partial class EmueraEngine : IDisposable
     private readonly List<ButtonDescriptor> _currentCycleButtons = [];
     private readonly IReadOnlyDictionary<string, int> _functionsByName;
     private readonly IReadOnlyDictionary<string, EventFunctionGroup> _eventGroupsByName;
+    private readonly FunctionRuntimePlan?[] _functionPlans;
 
     private long _frameSequence;
     private long _inputGeneration;
@@ -149,6 +152,7 @@ public sealed partial class EmueraEngine : IDisposable
 
         _functionsByName = module.GetEngineFunctionNameMap();
         _eventGroupsByName = module.GetEventGroupMap();
+        _functionPlans = new FunctionRuntimePlan?[module.Functions.Length];
     }
 
     public BytecodeModule Module { get; }
@@ -312,7 +316,8 @@ public sealed partial class EmueraEngine : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(entryFunction);
 
-        _callStack.Add(CreateActivationFrame(entryFunction, callerReturnReg: 0, expectsStrReturn: false, discardReturnReg: true));
+        FunctionRuntimePlan plan = GetOrCreateFunctionPlan(entryFunction);
+        _callStack.Add(AcquireActivationFrame(plan, callerReturnReg: 0, expectsStrReturn: false, discardReturnReg: true));
         Status = EngineStepStatus.Running;
     }
 
@@ -338,6 +343,7 @@ public sealed partial class EmueraEngine : IDisposable
                 Status = nextStatus;
                 if (nextStatus == EngineStepStatus.Completed)
                 {
+                    FlushPendingLine();
                     NotifyRedrawFlush();
                     EmitSnapshotInternal(DisplayFrameReason.Completed);
                 }
@@ -352,6 +358,7 @@ public sealed partial class EmueraEngine : IDisposable
             {
                 FaultException = ex;
                 Status = EngineStepStatus.Faulted;
+                FlushPendingLine();
                 RecordDiagnostic("FAULT", $"{ex.GetType().Name}: {ex.Message}", includeCallerLocation: true);
                 NotifyRedrawFlush();
                 EmitSnapshotInternal(DisplayFrameReason.Faulted);
@@ -408,8 +415,9 @@ public sealed partial class EmueraEngine : IDisposable
             return; // Ignore stale out-of-generation input events safely.
         }
 
-        // Capture undo checkpoint ONLY on numeric/string INPUT* prompts (never WAIT / TWAIT / AWAIT).
-        EngineUndoCheckpoint? uncommittedCheckpoint = ShouldCaptureUndoCheckpoint(PendingInputRequest)
+        // Capture undo checkpoint ONLY on manual (non-timeout) numeric/string INPUT* prompts
+        // (never WAIT / TWAIT / AWAIT, and never timed-out TINPUT auto-advances like BREAK_BUTTON).
+        EngineUndoCheckpoint? uncommittedCheckpoint = !response.IsTimeout && ShouldCaptureUndoCheckpoint(PendingInputRequest)
             ? PushUndoCheckpointBeforeInput()
             : null;
         bool prevTimeout = FastVariables?.LastInputWasTimeout ?? false;
@@ -587,8 +595,9 @@ public sealed partial class EmueraEngine : IDisposable
         }
 
         FunctionDescriptor desc = Module.Functions[fnId];
-        ResetFunctionLocalStatics(desc.Name);
-        _callStack.Add(CreateActivationFrame(desc, 0, expectsStrReturn: false, discardReturnReg: true));
+        FunctionRuntimePlan plan = GetOrCreateFunctionPlan(desc);
+        ResetFunctionArgStatics(plan);
+        _callStack.Add(AcquireActivationFrame(plan, 0, expectsStrReturn: false, discardReturnReg: true));
         return true;
     }
 
@@ -643,55 +652,65 @@ public sealed partial class EmueraEngine : IDisposable
         bool isTry = (insn.Immediate & (1 << 16)) != 0;
         bool isMethodCall = (insn.Aux & BytecodeAbi.CallIsMethodBit) != 0;
 
-        string targetName = (nameStrReg < caller.StrRegisters.Length ? caller.StrRegisters[nameStrReg] : string.Empty).Trim();
-        if (targetName.StartsWith('@'))
+        string rawName = nameStrReg < caller.StrRegisters.Length ? caller.StrRegisters[nameStrReg] : string.Empty;
+        string targetName = rawName.Length > 0 && (char.IsWhiteSpace(rawName[0]) || char.IsWhiteSpace(rawName[^1]))
+            ? rawName.Trim()
+            : rawName;
+        if (targetName.Length > 0 && targetName[0] == '@')
         {
             targetName = targetName[1..];
         }
 
-        if (_eventGroupsByName.ContainsKey(targetName) && !Module.CompilerOptions.CompatiCallEvent)
+        // Fast path: check normal functions FIRST (99.9%+ of CALLFORM/TRYCALLFORM calls),
+        // only touching _eventGroupsByName if not found in _functionsByName.
+        if (_functionsByName.TryGetValue(targetName, out int fnId))
         {
-            if (isTry)
+            FunctionDescriptor target = Module.Functions[fnId];
+            if (target.IsMethodFunction != isMethodCall)
             {
-                HandleMissingCallTarget(caller, targetName, isTry: true);
-                return;
+                if (isTry)
+                {
+                    HandleMissingCallTarget(caller, targetName, isTry: true);
+                    return;
+                }
+
+                throw new InvalidOperationException($"Function kind mismatch calling '@{targetName}'.");
             }
 
-            throw new InvalidOperationException($"Cannot CALL event function '@{targetName}' unless CompatiCallEvent is enabled.");
-        }
-
-        if (_eventGroupsByName.ContainsKey(targetName) && Module.CompilerOptions.CompatiCallEvent && !isMethodCall)
-        {
             caller.ActiveCatchTargetPc = null;
-            if (isJump)
+            InvokeResolvedTarget(caller, insn, target, isJump);
+            return;
+        }
+
+        if (_eventGroupsByName.ContainsKey(targetName))
+        {
+            if (!Module.CompilerOptions.CompatiCallEvent)
             {
-                _callStack.RemoveAt(_callStack.Count - 1);
+                if (isTry)
+                {
+                    HandleMissingCallTarget(caller, targetName, isTry: true);
+                    return;
+                }
+
+                throw new InvalidOperationException($"Cannot CALL event function '@{targetName}' unless CompatiCallEvent is enabled.");
             }
 
-            TryPushEventGroup(targetName);
-            return;
-        }
-
-        if (!_functionsByName.TryGetValue(targetName, out int fnId))
-        {
-            HandleMissingCallTarget(caller, targetName, isTry);
-            return;
-        }
-
-        FunctionDescriptor target = Module.Functions[fnId];
-        if (target.IsMethodFunction != isMethodCall)
-        {
-            if (isTry)
+            if (!isMethodCall)
             {
-                HandleMissingCallTarget(caller, targetName, isTry: true);
+                caller.ActiveCatchTargetPc = null;
+                if (isJump)
+                {
+                    CallFrame popped = _callStack[^1];
+                    _callStack.RemoveAt(_callStack.Count - 1);
+                    ReturnFrameToPool(popped);
+                }
+
+                TryPushEventGroup(targetName);
                 return;
             }
-
-            throw new InvalidOperationException($"Function kind mismatch calling '@{targetName}'.");
         }
 
-        caller.ActiveCatchTargetPc = null;
-        InvokeResolvedTarget(caller, insn, target, isJump);
+        HandleMissingCallTarget(caller, targetName, isTry);
     }
 
     private void HandleMissingCallTarget(CallFrame caller, string targetName, bool isTry)
@@ -715,12 +734,14 @@ public sealed partial class EmueraEngine : IDisposable
         ushort returnReg = isJump ? caller.CallerReturnRegister : insn.A;
         bool discardRegWrite = isJump ? caller.DiscardCallerRegisterWrite : false;
 
-        CallFrame callee = CreateActivationFrame(target, returnReg, expectsStr, discardRegWrite);
-        BindCallArguments(caller, callee, target, insn);
+        FunctionRuntimePlan plan = GetOrCreateFunctionPlan(target);
+        CallFrame callee = AcquireActivationFrame(plan, returnReg, expectsStr, discardRegWrite);
+        BindCallArguments(caller, callee, plan, insn);
 
         if (isJump)
         {
             _callStack[^1] = callee;
+            ReturnFrameToPool(caller);
         }
         else
         {
@@ -728,42 +749,261 @@ public sealed partial class EmueraEngine : IDisposable
         }
     }
 
-    private CallFrame CreateActivationFrame(
-        FunctionDescriptor desc,
-        ushort callerReturnReg,
-        bool expectsStrReturn,
-        bool discardReturnReg)
+    private enum ParamBindKind : byte
     {
-        // Count frame-scoped local descriptors (FunctionDynamic + Reference)
-        int frameLocalCount = 0;
-        for (int i = 0; i < desc.LocalVariables.Length; i++)
+        ByRef = 0,
+        FrameLocalInt = 1,
+        FrameLocalStr = 2,
+        GlobalInt0D = 3,
+        GlobalInt1D = 4,
+        GlobalStr0D = 5,
+        GlobalStr1D = 6,
+    }
+
+    private readonly record struct CompiledParamBinding(
+        ParamBindKind Kind,
+        int TargetIndex,
+        long FixedSubIndex,
+        bool HasDefaultValue,
+        long DefaultIntValue,
+        string DefaultStrValue);
+
+    private sealed class FunctionRuntimePlan
+    {
+        private const int MaxOverflowPool = 3;
+
+        public required FunctionDescriptor Descriptor { get; init; }
+        public required int IntRegCount { get; init; }
+        public required int StrRegCount { get; init; }
+        public required int FrameLocalCount { get; init; }
+        public required VariableSlotDescriptor[] DynamicLocals { get; init; }
+        public required VariableSlotDescriptor[] RefLocals { get; init; }
+        public required CompiledParamBinding[] ParamBindings { get; init; }
+        public int ArgSlotId;
+        public int ArgsSlotId;
+        public long ResolvedDynamicSlotVersion;
+
+        // Fast 1-slot inline pool + small overflow array for recursion (up to 4 pooled frames per function).
+        private CallFrame? _pooled0;
+        private CallFrame?[]? _overflow;
+        private int _overflowCount;
+
+        public CallFrame? TryPopPooled()
         {
-            if (desc.LocalVariables[i].Scope is VariableScopeKind.FunctionDynamic or VariableScopeKind.Reference)
+            CallFrame? f = _pooled0;
+            if (f is not null)
             {
-                frameLocalCount = Math.Max(frameLocalCount, desc.LocalVariables[i].SlotId + 1);
+                _pooled0 = null;
+                return f;
+            }
+
+            if (_overflowCount > 0)
+            {
+                int idx = --_overflowCount;
+                f = _overflow![idx];
+                _overflow[idx] = null;
+                return f;
+            }
+
+            return null;
+        }
+
+        public void ReturnPooled(CallFrame frame)
+        {
+            if (_pooled0 is null)
+            {
+                _pooled0 = frame;
+                return;
+            }
+
+            _overflow ??= new CallFrame?[MaxOverflowPool];
+            if (_overflowCount < MaxOverflowPool)
+            {
+                _overflow[_overflowCount++] = frame;
+            }
+        }
+    }
+
+    private FunctionRuntimePlan GetOrCreateFunctionPlan(FunctionDescriptor desc)
+    {
+        int fnId = desc.FunctionId;
+        if ((uint)fnId < (uint)_functionPlans.Length)
+        {
+            FunctionRuntimePlan? existing = _functionPlans[fnId];
+            if (existing is not null)
+            {
+                if (FastVariables is not null && existing.ResolvedDynamicSlotVersion != FastVariables.DynamicSlotVersion)
+                {
+                    RefreshPlanArgSlots(existing);
+                }
+
+                return existing;
             }
         }
 
-        FrameLocalStorage[] localSlots = frameLocalCount > 0 ? new FrameLocalStorage[frameLocalCount] : [];
+        int frameLocalCount = 0;
+        int dynCount = 0;
+        int refCount = 0;
+        for (int i = 0; i < desc.LocalVariables.Length; i++)
+        {
+            VariableScopeKind scope = desc.LocalVariables[i].Scope;
+            if (scope == VariableScopeKind.FunctionDynamic)
+            {
+                frameLocalCount = Math.Max(frameLocalCount, desc.LocalVariables[i].SlotId + 1);
+                dynCount++;
+            }
+            else if (scope == VariableScopeKind.Reference)
+            {
+                frameLocalCount = Math.Max(frameLocalCount, desc.LocalVariables[i].SlotId + 1);
+                refCount++;
+            }
+        }
+
+        VariableSlotDescriptor[] dynLocals = dynCount > 0 ? new VariableSlotDescriptor[dynCount] : [];
+        VariableSlotDescriptor[] refLocals = refCount > 0 ? new VariableSlotDescriptor[refCount] : [];
+        int dIdx = 0;
+        int rIdx = 0;
         for (int i = 0; i < desc.LocalVariables.Length; i++)
         {
             VariableSlotDescriptor lv = desc.LocalVariables[i];
             if (lv.Scope == VariableScopeKind.FunctionDynamic)
             {
-                localSlots[lv.SlotId] = FrameLocalStorage.CreateDynamic(lv.SlotId, lv);
+                dynLocals[dIdx++] = lv;
             }
             else if (lv.Scope == VariableScopeKind.Reference)
             {
-                localSlots[lv.SlotId] = FrameLocalStorage.CreateUnboundRef(lv.SlotId, lv.Name, lv.ValueKind, Math.Max(1, lv.Dimensions.Length));
+                refLocals[rIdx++] = lv;
             }
+        }
+
+        CompiledParamBinding[] paramBindings = desc.Parameters.Length > 0
+            ? new CompiledParamBinding[desc.Parameters.Length]
+            : [];
+        for (int i = 0; i < desc.Parameters.Length; i++)
+        {
+            FunctionParameterDescriptor p = desc.Parameters[i];
+            if (p.IsByRef)
+            {
+                paramBindings[i] = new CompiledParamBinding(ParamBindKind.ByRef, p.RegisterOrSlotIndex, 0L, false, 0L, string.Empty);
+                continue;
+            }
+
+            int colon = p.Name.IndexOf(':');
+            if (colon > 0)
+            {
+                long sub = long.Parse(p.Name.AsSpan(colon + 1), CultureInfo.InvariantCulture);
+                paramBindings[i] = new CompiledParamBinding(
+                    p.ValueKind == VariableValueKind.Int ? ParamBindKind.GlobalInt1D : ParamBindKind.GlobalStr1D,
+                    p.RegisterOrSlotIndex,
+                    sub,
+                    p.HasDefaultValue,
+                    p.DefaultIntValue,
+                    p.DefaultStrValue ?? string.Empty);
+                continue;
+            }
+
+            bool isFrameLocal = false;
+            for (int k = 0; k < dynLocals.Length; k++)
+            {
+                if (dynLocals[k].SlotId == p.RegisterOrSlotIndex &&
+                    dynLocals[k].ValueKind == p.ValueKind &&
+                    string.Equals(dynLocals[k].Name, p.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    isFrameLocal = true;
+                    break;
+                }
+            }
+
+            ParamBindKind kind = (p.ValueKind == VariableValueKind.Int, isFrameLocal) switch
+            {
+                (true, true) => ParamBindKind.FrameLocalInt,
+                (false, true) => ParamBindKind.FrameLocalStr,
+                (true, false) => ParamBindKind.GlobalInt0D,
+                (false, false) => ParamBindKind.GlobalStr0D,
+            };
+
+            paramBindings[i] = new CompiledParamBinding(
+                kind,
+                p.RegisterOrSlotIndex,
+                0L,
+                p.HasDefaultValue,
+                p.DefaultIntValue,
+                p.DefaultStrValue ?? string.Empty);
+        }
+
+        var plan = new FunctionRuntimePlan
+        {
+            Descriptor = desc,
+            IntRegCount = Math.Max((int)desc.IntRegisterCount, 1),
+            StrRegCount = Math.Max((int)desc.StrRegisterCount, 1),
+            FrameLocalCount = frameLocalCount,
+            DynamicLocals = dynLocals,
+            RefLocals = refLocals,
+            ParamBindings = paramBindings,
+            ArgSlotId = -1,
+            ArgsSlotId = -1,
+            ResolvedDynamicSlotVersion = -1,
+        };
+
+        RefreshPlanArgSlots(plan);
+
+        if ((uint)fnId < (uint)_functionPlans.Length)
+        {
+            _functionPlans[fnId] = plan;
+        }
+
+        return plan;
+    }
+
+    private void RefreshPlanArgSlots(FunctionRuntimePlan plan)
+    {
+        if (FastVariables is null)
+        {
+            plan.ArgSlotId = -1;
+            plan.ArgsSlotId = -1;
+            plan.ResolvedDynamicSlotVersion = 0;
+            return;
+        }
+
+        string name = plan.Descriptor.Name;
+        plan.ArgSlotId = FastVariables.TryResolveExistingSlot($"ARG@{name}", out int argId) ? argId : -1;
+        plan.ArgsSlotId = FastVariables.TryResolveExistingSlot($"ARGS@{name}", out int argsId) ? argsId : -1;
+        plan.ResolvedDynamicSlotVersion = FastVariables.DynamicSlotVersion;
+    }
+
+    private static CallFrame AcquireActivationFrame(
+        FunctionRuntimePlan plan,
+        ushort callerReturnReg,
+        bool expectsStrReturn,
+        bool discardReturnReg)
+    {
+        FunctionDescriptor desc = plan.Descriptor;
+        CallFrame? pooled = plan.TryPopPooled();
+        if (pooled is not null)
+        {
+            pooled.ResetForReuse(desc.EntryPc, callerReturnReg, expectsStrReturn, discardReturnReg);
+            return pooled;
+        }
+
+        FrameLocalStorage[] localSlots = plan.FrameLocalCount > 0 ? new FrameLocalStorage[plan.FrameLocalCount] : [];
+        for (int i = 0; i < plan.DynamicLocals.Length; i++)
+        {
+            VariableSlotDescriptor lv = plan.DynamicLocals[i];
+            localSlots[lv.SlotId] = FrameLocalStorage.CreateDynamic(lv.SlotId, lv);
+        }
+
+        for (int i = 0; i < plan.RefLocals.Length; i++)
+        {
+            VariableSlotDescriptor lv = plan.RefLocals[i];
+            localSlots[lv.SlotId] = FrameLocalStorage.CreateUnboundRef(lv.SlotId, lv.Name, lv.ValueKind, Math.Max(1, lv.Dimensions.Length));
         }
 
         return new CallFrame(
             desc.FunctionId,
             desc.Name,
             desc.EntryPc,
-            Math.Max((int)desc.IntRegisterCount, 1),
-            Math.Max((int)desc.StrRegisterCount, 1),
+            plan.IntRegCount,
+            plan.StrRegCount,
             callerReturnReg,
             expectsStrReturn)
         {
@@ -773,10 +1013,20 @@ public sealed partial class EmueraEngine : IDisposable
         };
     }
 
-    private void BindCallArguments(CallFrame caller, CallFrame callee, FunctionDescriptor target, Instruction insn)
+    private void ReturnFrameToPool(CallFrame frame)
     {
-        // Clear ARG@FUNC / ARGS@FUNC before binding arguments
-        ResetFunctionArgStatics(target.Name);
+        int fnId = frame.FunctionId;
+        if ((uint)fnId < (uint)_functionPlans.Length && _functionPlans[fnId] is { } plan)
+        {
+            plan.ReturnPooled(frame);
+        }
+    }
+
+    private void BindCallArguments(CallFrame caller, CallFrame callee, FunctionRuntimePlan plan, Instruction insn)
+    {
+        FunctionDescriptor target = plan.Descriptor;
+        // Clear ARG@FUNC / ARGS@FUNC before binding arguments (O(1) pre-resolved slot IDs, zero string allocations!)
+        ResetFunctionArgStatics(plan);
 
         int passedCount = insn.D;
         ushort intBase = insn.B;
@@ -799,69 +1049,136 @@ public sealed partial class EmueraEngine : IDisposable
             return tagReg < caller.IntRegisters.Length ? (CallArgTag)caller.IntRegisters[tagReg] : CallArgTag.Omitted;
         }
 
-        // Bind declared formal parameters
-        for (int i = 0; i < target.Parameters.Length; i++)
+        // Bind declared formal parameters via pre-compiled binding descriptors
+        CompiledParamBinding[] bindings = plan.ParamBindings;
+        for (int i = 0; i < bindings.Length; i++)
         {
-            FunctionParameterDescriptor p = target.Parameters[i];
+            CompiledParamBinding b = bindings[i];
             CallArgTag tag = GetArgTag(i);
 
-            if (p.IsByRef)
+            switch (b.Kind)
             {
-                if (tag != CallArgTag.ByRef)
+                case ParamBindKind.ByRef:
                 {
-                    throw new InvalidOperationException($"Missing by-reference argument #{i + 1} for '@{target.Name}'.");
+                    if (tag != CallArgTag.ByRef)
+                    {
+                        throw new InvalidOperationException($"Missing by-reference argument #{i + 1} for '@{target.Name}'.");
+                    }
+
+                    var (slotId, origin, fixedIdx0) = BytecodeAbi.UnpackByRefTarget(caller.IntRegisters[intBase + i]);
+                    FrameLocalStorage dstRef = callee.LocalSlots[b.TargetIndex];
+                    if (origin is VariableSlotOrigin.FrameLocal or VariableSlotOrigin.RefPassthrough)
+                    {
+                        dstRef.CopyBindingFrom(caller.LocalSlots[slotId]);
+                    }
+                    else
+                    {
+                        VmDispatcher.BindRefToGlobalOrCharaSlot(this, dstRef, slotId, fixedIdx0);
+                    }
+
+                    break;
                 }
 
-                var (slotId, origin, fixedIdx0) = BytecodeAbi.UnpackByRefTarget(caller.IntRegisters[intBase + i]);
-                FrameLocalStorage dstRef = callee.LocalSlots[p.RegisterOrSlotIndex];
-                if (origin is VariableSlotOrigin.FrameLocal or VariableSlotOrigin.RefPassthrough)
+                case ParamBindKind.FrameLocalInt:
                 {
-                    dstRef.CopyBindingFrom(caller.LocalSlots[slotId]);
-                }
-                else
-                {
-                    VmDispatcher.BindRefToGlobalOrCharaSlot(this, dstRef, slotId, fixedIdx0);
+                    long val = tag == CallArgTag.Int
+                        ? caller.IntRegisters[intBase + i]
+                        : b.HasDefaultValue ? b.DefaultIntValue : 0L;
+                    callee.LocalSlots[b.TargetIndex].IntArray![0] = val;
+                    break;
                 }
 
-                continue;
-            }
-
-            if (p.ValueKind == VariableValueKind.Int)
-            {
-                long val = tag == CallArgTag.Int
-                    ? caller.IntRegisters[intBase + i]
-                    : p.HasDefaultValue ? p.DefaultIntValue : 0L;
-                WriteBoundParameterInt(callee, p, val);
-            }
-            else
-            {
-                string val = tag switch
+                case ParamBindKind.GlobalInt0D:
                 {
-                    CallArgTag.Str => caller.StrRegisters[strBase + i] ?? string.Empty,
-                    CallArgTag.Int when Module.CompilerOptions.CompatiFuncArgAutoConvert =>
-                        caller.IntRegisters[intBase + i].ToString(CultureInfo.InvariantCulture),
-                    _ => p.HasDefaultValue ? (p.DefaultStrValue ?? string.Empty) : string.Empty,
-                };
-                WriteBoundParameterStr(callee, p, val);
+                    long val = tag == CallArgTag.Int
+                        ? caller.IntRegisters[intBase + i]
+                        : b.HasDefaultValue ? b.DefaultIntValue : 0L;
+                    FastVariables?.SetInt0D(b.TargetIndex, val);
+                    break;
+                }
+
+                case ParamBindKind.GlobalInt1D:
+                {
+                    long val = tag == CallArgTag.Int
+                        ? caller.IntRegisters[intBase + i]
+                        : b.HasDefaultValue ? b.DefaultIntValue : 0L;
+                    FastVariables?.SetInt1D(b.TargetIndex, b.FixedSubIndex, val);
+                    break;
+                }
+
+                case ParamBindKind.FrameLocalStr:
+                {
+                    string val = tag switch
+                    {
+                        CallArgTag.Str => caller.StrRegisters[strBase + i] ?? string.Empty,
+                        CallArgTag.Int when Module.CompilerOptions.CompatiFuncArgAutoConvert =>
+                            caller.IntRegisters[intBase + i].ToString(CultureInfo.InvariantCulture),
+                        _ => b.HasDefaultValue ? b.DefaultStrValue : string.Empty,
+                    };
+                    callee.LocalSlots[b.TargetIndex].StrArray![0] = val;
+                    break;
+                }
+
+                case ParamBindKind.GlobalStr0D:
+                {
+                    string val = tag switch
+                    {
+                        CallArgTag.Str => caller.StrRegisters[strBase + i] ?? string.Empty,
+                        CallArgTag.Int when Module.CompilerOptions.CompatiFuncArgAutoConvert =>
+                            caller.IntRegisters[intBase + i].ToString(CultureInfo.InvariantCulture),
+                        _ => b.HasDefaultValue ? b.DefaultStrValue : string.Empty,
+                    };
+                    FastVariables?.SetStr0D(b.TargetIndex, val);
+                    break;
+                }
+
+                case ParamBindKind.GlobalStr1D:
+                {
+                    string val = tag switch
+                    {
+                        CallArgTag.Str => caller.StrRegisters[strBase + i] ?? string.Empty,
+                        CallArgTag.Int when Module.CompilerOptions.CompatiFuncArgAutoConvert =>
+                            caller.IntRegisters[intBase + i].ToString(CultureInfo.InvariantCulture),
+                        _ => b.HasDefaultValue ? b.DefaultStrValue : string.Empty,
+                    };
+                    FastVariables?.SetStr1D(b.TargetIndex, b.FixedSubIndex, val);
+                    break;
+                }
             }
         }
 
         // Also mirror positional non-declared arguments into ARG@FUNC / ARGS@FUNC without forcing dense allocation
-        if (target.Parameters.IsEmpty && passedCount > 0 && FastVariables is not null)
+        if (bindings.Length == 0 && passedCount > 0 && FastVariables is not null)
         {
             for (int i = 0; i < passedCount; i++)
             {
                 CallArgTag tag = GetArgTag(i);
-                if (tag == CallArgTag.Int && FastVariables.TryResolveSlot($"ARG@{target.Name}", out int argSlot))
+                if (tag == CallArgTag.Int)
                 {
-                    if ((uint)i < (uint)FastVariables.GetSlotDimension0(argSlot))
+                    int argSlot = plan.ArgSlotId;
+                    if (argSlot < 0 && FastVariables.TryResolveSlot($"ARG@{target.Name}", out int resolvedArg))
+                    {
+                        argSlot = resolvedArg;
+                        plan.ArgSlotId = resolvedArg;
+                        plan.ResolvedDynamicSlotVersion = FastVariables.DynamicSlotVersion;
+                    }
+
+                    if (argSlot >= 0 && (uint)i < (uint)FastVariables.GetSlotDimension0(argSlot))
                     {
                         FastVariables.SetInt1D(argSlot, i, caller.IntRegisters[intBase + i]);
                     }
                 }
-                else if (tag == CallArgTag.Str && FastVariables.TryResolveSlot($"ARGS@{target.Name}", out int argsSlot))
+                else if (tag == CallArgTag.Str)
                 {
-                    if ((uint)i < (uint)FastVariables.GetSlotDimension0(argsSlot))
+                    int argsSlot = plan.ArgsSlotId;
+                    if (argsSlot < 0 && FastVariables.TryResolveSlot($"ARGS@{target.Name}", out int resolvedArgs))
+                    {
+                        argsSlot = resolvedArgs;
+                        plan.ArgsSlotId = resolvedArgs;
+                        plan.ResolvedDynamicSlotVersion = FastVariables.DynamicSlotVersion;
+                    }
+
+                    if (argsSlot >= 0 && (uint)i < (uint)FastVariables.GetSlotDimension0(argsSlot))
                     {
                         FastVariables.SetStr1D(argsSlot, i, caller.StrRegisters[strBase + i] ?? string.Empty);
                     }
@@ -870,62 +1187,22 @@ public sealed partial class EmueraEngine : IDisposable
         }
     }
 
-    private void WriteBoundParameterInt(CallFrame callee, FunctionParameterDescriptor p, long val)
-    {
-        int colon = p.Name.IndexOf(':');
-        if (colon > 0 && FastVariables is not null)
-        {
-            long sub = long.Parse(p.Name.AsSpan(colon + 1), CultureInfo.InvariantCulture);
-            FastVariables.SetInt1D(p.RegisterOrSlotIndex, sub, val);
-            return;
-        }
-
-        if ((uint)p.RegisterOrSlotIndex < (uint)callee.LocalSlots.Length &&
-            callee.LocalSlots[p.RegisterOrSlotIndex] is { ValueKind: VariableValueKind.Int } loc &&
-            string.Equals(loc.Name, p.Name, StringComparison.OrdinalIgnoreCase))
-        {
-            loc.IntArray![0] = val;
-            return;
-        }
-
-        FastVariables?.SetInt0D(p.RegisterOrSlotIndex, val);
-    }
-
-    private void WriteBoundParameterStr(CallFrame callee, FunctionParameterDescriptor p, string val)
-    {
-        int colon = p.Name.IndexOf(':');
-        if (colon > 0 && FastVariables is not null)
-        {
-            long sub = long.Parse(p.Name.AsSpan(colon + 1), CultureInfo.InvariantCulture);
-            FastVariables.SetStr1D(p.RegisterOrSlotIndex, sub, val);
-            return;
-        }
-
-        if ((uint)p.RegisterOrSlotIndex < (uint)callee.LocalSlots.Length &&
-            callee.LocalSlots[p.RegisterOrSlotIndex] is { ValueKind: VariableValueKind.Str } loc &&
-            string.Equals(loc.Name, p.Name, StringComparison.OrdinalIgnoreCase))
-        {
-            loc.StrArray![0] = val;
-            return;
-        }
-
-        FastVariables?.SetStr0D(p.RegisterOrSlotIndex, val);
-    }
-
-    private void ResetFunctionArgStatics(string funcName)
+    private void ResetFunctionArgStatics(FunctionRuntimePlan plan)
     {
         if (FastVariables is null)
         {
             return;
         }
 
-        FastVariables.TryClearMaterializedSlotByName($"ARG@{funcName}");
-        FastVariables.TryClearMaterializedSlotByName($"ARGS@{funcName}");
-    }
+        if (plan.ArgSlotId >= 0)
+        {
+            FastVariables.ClearSlot(plan.ArgSlotId);
+        }
 
-    private void ResetFunctionLocalStatics(string funcName)
-    {
-        ResetFunctionArgStatics(funcName);
+        if (plan.ArgsSlotId >= 0)
+        {
+            FastVariables.ClearSlot(plan.ArgsSlotId);
+        }
     }
 
     private bool HasRegisteredName(string varName) =>
@@ -935,7 +1212,10 @@ public sealed partial class EmueraEngine : IDisposable
     {
         CallFrame finished = _callStack[^1];
         _callStack.RemoveAt(_callStack.Count - 1);
-        if (!finished.IsMethodFunction && FastVariables is not null)
+        bool isMethod = finished.IsMethodFunction;
+        ReturnFrameToPool(finished);
+
+        if (!isMethod && FastVariables is not null)
         {
             FastVariables.Result = 0L;
         }
@@ -947,18 +1227,22 @@ public sealed partial class EmueraEngine : IDisposable
     {
         CallFrame finished = _callStack[^1];
         _callStack.RemoveAt(_callStack.Count - 1);
+        bool discardRegWrite = finished.DiscardCallerRegisterWrite;
+        bool expectsStr = finished.ExpectsStringReturn;
+        ushort callerRetReg = finished.CallerReturnRegister;
+        ReturnFrameToPool(finished);
 
         if (syncResultArray && FastVariables is not null)
         {
             FastVariables.Result = returnValue;
         }
 
-        if (_callStack.Count > 0 && !finished.DiscardCallerRegisterWrite && !finished.ExpectsStringReturn)
+        if (_callStack.Count > 0 && !discardRegWrite && !expectsStr)
         {
             CallFrame caller = _callStack[^1];
-            if (finished.CallerReturnRegister < caller.IntRegisters.Length)
+            if (callerRetReg < caller.IntRegisters.Length)
             {
-                caller.IntRegisters[finished.CallerReturnRegister] = returnValue;
+                caller.IntRegisters[callerRetReg] = returnValue;
             }
         }
 
@@ -969,18 +1253,22 @@ public sealed partial class EmueraEngine : IDisposable
     {
         CallFrame finished = _callStack[^1];
         _callStack.RemoveAt(_callStack.Count - 1);
+        bool discardRegWrite = finished.DiscardCallerRegisterWrite;
+        bool expectsStr = finished.ExpectsStringReturn;
+        ushort callerRetReg = finished.CallerReturnRegister;
+        ReturnFrameToPool(finished);
 
         if (syncResultsArray && FastVariables is not null)
         {
             FastVariables.Results = returnValue;
         }
 
-        if (_callStack.Count > 0 && !finished.DiscardCallerRegisterWrite && finished.ExpectsStringReturn)
+        if (_callStack.Count > 0 && !discardRegWrite && expectsStr)
         {
             CallFrame caller = _callStack[^1];
-            if (finished.CallerReturnRegister < caller.StrRegisters.Length)
+            if (callerRetReg < caller.StrRegisters.Length)
             {
-                caller.StrRegisters[finished.CallerReturnRegister] = returnValue;
+                caller.StrRegisters[callerRetReg] = returnValue;
             }
         }
 
@@ -1005,7 +1293,8 @@ public sealed partial class EmueraEngine : IDisposable
     private void PushEventHandlerFrame(EventHandlerEntry entry)
     {
         FunctionDescriptor desc = Module.Functions[entry.FunctionId];
-        _callStack.Add(CreateActivationFrame(desc, 0, expectsStrReturn: false, discardReturnReg: true));
+        FunctionRuntimePlan plan = GetOrCreateFunctionPlan(desc);
+        _callStack.Add(AcquireActivationFrame(plan, 0, expectsStrReturn: false, discardReturnReg: true));
     }
 
     internal bool TryAdvanceEventsOrSystemFlow()
@@ -1083,10 +1372,11 @@ public sealed partial class EmueraEngine : IDisposable
         return IssueScriptInput(kind, flags, hasDef, defInt, defStr, timeoutMs, timeoutMsg, targetReg);
     }
 
-    internal bool IssueAnyKeyWait(bool canSkipWithMessageSkip = true) =>
+    internal bool IssueAnyKeyWait(bool canSkipWithMessageSkip = true, bool flushPendingLine = true) =>
         IssueScriptInput(
             InputRequestKind.AnyKey,
-            canSkipWithMessageSkip ? WaitInputFlags.CanSkipWithMessageSkip : WaitInputFlags.None);
+            canSkipWithMessageSkip ? WaitInputFlags.CanSkipWithMessageSkip : WaitInputFlags.None,
+            flushPendingLine: flushPendingLine);
 
     internal bool IssueTimedWait(long durationMs, bool forceNoSkip)
     {
@@ -1102,6 +1392,8 @@ public sealed partial class EmueraEngine : IDisposable
 
     internal void IssueSystemInputRequest(InputRequestKind kind)
     {
+        // Match EmueraConsole.callEmueraProgram: PrintFlush(false) commits any non-empty pending line before pausing.
+        FlushPendingLine();
         _inputGeneration++;
         _pendingScriptInputMeta = null;
         PendingInputRequest = new InputRequest(
@@ -1122,9 +1414,20 @@ public sealed partial class EmueraEngine : IDisposable
         string defStr = "",
         long? timeoutMs = null,
         string? timeoutMsg = null,
-        int? targetReg = null)
+        int? targetReg = null,
+        bool displayTime = false,
+        bool flushPendingLine = true)
     {
         SystemFlow.NotifyWaitOccurredInScript();
+
+        // Match EmueraConsole.callEmueraProgram: PrintFlush(false) commits any non-empty pending line
+        // whenever execution pauses for WAIT / TWAIT / INPUT* / BINPUT* / ONEINPUT* / TINPUT* / INPUTMOUSEKEY
+        // (except PRINT*N / NoNewLineWait, which explicitly holds the pending line open across the wait).
+        if (flushPendingLine)
+        {
+            FlushPendingLine();
+        }
+
         IReadOnlyList<ButtonDescriptor> activeButtons = SnapshotActiveButtonsForGeneration();
 
         // BINPUT / BINPUTS / ONEBINPUT / ONEBINPUTS active button inventory check!
@@ -1190,8 +1493,14 @@ public sealed partial class EmueraEngine : IDisposable
             return false;
         }
 
+        if (displayTime && timeoutMs is long tMs && !IsSkipDisplay)
+        {
+            long tenths = Math.Max(0L, tMs) / 100L;
+            PrintSingleLine(string.Create(CultureInfo.InvariantCulture, $"残り {tenths / 10.0:0.0}"));
+        }
+
         _inputGeneration++;
-        _pendingScriptInputMeta = new PendingScriptInputMeta(kind, flags, hasDef, defInt, defStr ?? string.Empty, targetReg);
+        _pendingScriptInputMeta = new PendingScriptInputMeta(kind, flags, hasDef, defInt, defStr ?? string.Empty, targetReg, timeoutMsg, displayTime);
         PendingInputRequest = new InputRequest(
             _inputGeneration,
             kind,
@@ -1199,7 +1508,8 @@ public sealed partial class EmueraEngine : IDisposable
             TimeoutMessage: timeoutMsg,
             AllowMouseHitTest: Options.UseMouse && (flags & WaitInputFlags.DisableMouseHitTest) == 0,
             ActiveButtons: activeButtons,
-            CanSkipWithMessageSkip: (flags & WaitInputFlags.CanSkipWithMessageSkip) != 0);
+            CanSkipWithMessageSkip: (flags & WaitInputFlags.CanSkipWithMessageSkip) != 0,
+            DisplayTime: displayTime);
         Status = EngineStepStatus.WaitingInput;
         NotifyRedrawFlush();
         EmitSnapshotInternal(DisplayFrameReason.WaitingInput);
@@ -1304,6 +1614,7 @@ public sealed partial class EmueraEngine : IDisposable
                 _callStack[^1].IntRegisters[dstIntReg] = resolvedInt;
             }
 
+            ApplyTimedInputDisplayUpdate(meta, response.IsTimeout, resolvedInt.ToString(CultureInfo.InvariantCulture));
             return true;
         }
         else
@@ -1354,7 +1665,61 @@ public sealed partial class EmueraEngine : IDisposable
                 _callStack[^1].StrRegisters[dstStrReg] = resolvedStr;
             }
 
+            ApplyTimedInputDisplayUpdate(meta, response.IsTimeout, resolvedStr);
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Updates the live countdown line for <c>TINPUT</c> / <c>TINPUTS</c> when <c>DisplayTime</c> is enabled.
+    /// </summary>
+    public bool UpdateTimedInputCountdown(long remainingMs)
+    {
+        if (Status != EngineStepStatus.WaitingInput || _pendingScriptInputMeta is not { DisplayTime: true } || IsSkipDisplay)
+        {
+            return false;
+        }
+
+        long tenths = Math.Max(0L, remainingMs) / 100L;
+        string text = string.Create(CultureInfo.InvariantCulture, $"残り {tenths / 10.0:0.0}");
+        if (string.Equals(ConsoleBuffer.LastCommittedPlainText, text, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        ConsoleBuffer.ClearLine(1);
+        SyncLineCount();
+        PrintSingleLine(text);
+        return true;
+    }
+
+    private void ApplyTimedInputDisplayUpdate(PendingScriptInputMeta meta, bool isTimeout, string submittedText)
+    {
+        if (IsSkipDisplay)
+        {
+            return;
+        }
+
+        if (isTimeout)
+        {
+            if (meta.DisplayTime)
+            {
+                ConsoleBuffer.ClearLine(1);
+                SyncLineCount();
+                PrintSingleLine(meta.TimeoutMessage ?? string.Empty);
+            }
+            else if (meta.TimeoutMessage is not null)
+            {
+                // Match EmueraConsole.endTimer(): non-null TimeUpMes (including "") prints a single logical line
+                // so idioms like "TINPUT 1,0,0,\"\"" + "CLEARLINE 1" (@BREAK_BUTTON) clear only the timeout line.
+                PrintSingleLine(meta.TimeoutMessage);
+            }
+        }
+        else if (meta.DisplayTime)
+        {
+            ConsoleBuffer.ClearLine(1);
+            SyncLineCount();
+            PrintSingleLine(submittedText);
         }
     }
 
@@ -1510,6 +1875,18 @@ public sealed partial class EmueraEngine : IDisposable
             }
             : text;
 
+        bool isSingleLine = (flags & PrintModifierFlags.SingleLine) != 0;
+        if (isSingleLine)
+        {
+            // Match EmueraConsole.PrintSingleLine: empty string is a no-op; non-empty flushes pending line first.
+            if (string.IsNullOrEmpty(projected))
+            {
+                return;
+            }
+
+            FlushPendingLine();
+        }
+
         bool useDefaultColor = (flags & PrintModifierFlags.DefaultColor) != 0;
         bool isPlainText = (flags & PrintModifierFlags.PlainText) != 0;
 
@@ -1532,7 +1909,11 @@ public sealed partial class EmueraEngine : IDisposable
             ConsoleBuffer.Print(projected, useDefaultColor: useDefaultColor);
         }
 
-        if ((flags & PrintModifierFlags.NewLine) != 0)
+        if (isSingleLine)
+        {
+            PrintNewLine(noWrap: true);
+        }
+        else if ((flags & PrintModifierFlags.NewLine) != 0)
         {
             PrintNewLine();
         }
@@ -1540,7 +1921,10 @@ public sealed partial class EmueraEngine : IDisposable
 
     internal void PrintColumnCell(string text, bool rightAlign, PrintModifierFlags flags)
     {
-        int widthCols = Math.Max(1, Options.PrintCLength);
+        // Match EmueraConsole.CreateTypeCString: PRINTC right-pads to PrintCLength, PRINTLC left-pads to PrintCLength + 1.
+        int widthCols = rightAlign
+            ? Math.Max(1, Options.PrintCLength)
+            : Math.Max(1, Options.PrintCLength) + 1;
         int textBytes = EastAsianStringOps.GetStrlenS(text, Options.LanguageCodePage);
         int pad = Math.Max(0, widthCols - textBytes);
         bool useDefaultColor = (flags & PrintModifierFlags.DefaultColor) != 0;
@@ -1632,11 +2016,44 @@ public sealed partial class EmueraEngine : IDisposable
 
     internal void PrintTextLine(string text) => PrintStyled(text, PrintModifierFlags.NewLine);
 
-    internal void PrintNewLine()
+    internal void PrintSingleLine(string text, bool isTemporary = false)
+    {
+        FlushPendingLine();
+
+        if (!string.IsNullOrEmpty(text))
+        {
+            RecordDisplayOperation(new DisplayOperation(
+                DisplayOperationKind.PrintTextSpan,
+                default,
+                text,
+                Options.ForeColorRgba,
+                CurrentFontName,
+                Options.FontSize));
+            ConsoleBuffer.CurrentFontFamily = CurrentFontName;
+            ConsoleBuffer.FontStyle = (FontStyleFlags)(CurrentFontStyle & 0xF);
+            ConsoleBuffer.PrintPlain(text, useDefaultColor: true);
+        }
+
+        PrintNewLine(noWrap: true, isTemporary: isTemporary);
+    }
+
+    internal void PrintNewLine(bool noWrap = false, bool isTemporary = false)
     {
         RecordDisplayOperation(new DisplayOperation(DisplayOperationKind.NewLine, default));
-        ConsoleBuffer.NewLine();
+        ConsoleBuffer.NewLine(noWrap, isTemporary);
         SyncLineCount();
+    }
+
+    /// <summary>
+    /// Mirrors Emuera's <c>EmueraConsole.PrintFlush(false)</c>: commits the current pending line if non-empty,
+    /// and does nothing when the pending buffer is already empty.
+    /// </summary>
+    internal void FlushPendingLine()
+    {
+        if (ConsoleBuffer.HasPendingLine)
+        {
+            PrintNewLine();
+        }
     }
 
     internal string BuildLineString(string? customPattern = null)
@@ -1651,7 +2068,7 @@ public sealed partial class EmueraEngine : IDisposable
             unit,
             Options.FontSize,
             CurrentFontName,
-            (FontStyleFlags)(CurrentFontStyle & 0xF));
+            FontStyleFlags.Regular);
 
         int repeatCount;
         if (unitPx > 0.5f)
@@ -1676,10 +2093,17 @@ public sealed partial class EmueraEngine : IDisposable
 
     internal void PrintDrawLine(string? customPattern = null)
     {
+        FlushPendingLine();
         string line = BuildLineString(customPattern);
         RecordDisplayOperation(new DisplayOperation(DisplayOperationKind.DrawLineRule, default, line, CurrentForeColorRgba, CurrentFontName, Options.FontSize));
+        FontStyleFlags prevStyle = ConsoleBuffer.FontStyle;
+        string prevFont = ConsoleBuffer.CurrentFontFamily;
+        ConsoleBuffer.CurrentFontFamily = CurrentFontName;
+        ConsoleBuffer.FontStyle = FontStyleFlags.Regular;
         ConsoleBuffer.PrintPlain(line);
-        ConsoleBuffer.NewLine();
+        ConsoleBuffer.NewLine(noWrap: true);
+        ConsoleBuffer.FontStyle = prevStyle;
+        ConsoleBuffer.CurrentFontFamily = prevFont;
         SyncLineCount();
     }
 
@@ -1696,8 +2120,24 @@ public sealed partial class EmueraEngine : IDisposable
 
     internal void ReuseLastLine(string replacement)
     {
-        ConsoleBuffer.ClearLine(1);
-        PrintStyled(replacement, PrintModifierFlags.PlainText);
+        // Match Emuera REUSELASTLINE -> PrintTemporaryLine -> PrintSingleLine(str, temporary: true).
+        if (string.IsNullOrEmpty(replacement))
+        {
+            return;
+        }
+
+        FlushPendingLine();
+        RecordDisplayOperation(new DisplayOperation(
+            DisplayOperationKind.PrintTextSpan,
+            default,
+            replacement,
+            CurrentForeColorRgba,
+            CurrentFontName,
+            Options.FontSize));
+        ConsoleBuffer.CurrentFontFamily = CurrentFontName;
+        ConsoleBuffer.FontStyle = (FontStyleFlags)(CurrentFontStyle & 0xF);
+        ConsoleBuffer.Print(replacement, useDefaultColor: false);
+        PrintNewLine(noWrap: true, isTemporary: true);
     }
 
     internal void PrintHtml(string html, bool isIsland, bool noNewLine)
@@ -1717,6 +2157,7 @@ public sealed partial class EmueraEngine : IDisposable
         }
         else
         {
+            FlushPendingLine();
             ConsoleBuffer.HtmlPrint(html, noWrap: false, noNewLine: false);
             SyncLineCount();
             plainText = ConsoleBuffer.LastCommittedPlainText;

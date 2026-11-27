@@ -478,6 +478,14 @@ public class HyperaSkiaElement : SKElement, IDisposable
                                 IsTimeout: pendingReq.Kind == InputRequestKind.TimedWait));
                             stepped = true;
                         }
+                        else if (IsInstantNonInteractiveTimeout(pendingReq))
+                        {
+                            _timeoutDeadlineTimestamp = 0;
+                            _hasTimeoutDeadline = false;
+                            _trackedGenerationId = -1;
+                            engine.SubmitInput(new InputResponse(pendingReq.GenerationId, IsTimeout: true));
+                            stepped = true;
+                        }
                         else if (_trackedGenerationId == pendingReq.GenerationId &&
                                  _hasTimeoutDeadline &&
                                  Stopwatch.GetTimestamp() >= _timeoutDeadlineTimestamp)
@@ -740,6 +748,11 @@ public class HyperaSkiaElement : SKElement, IDisposable
             ? TimeSpan.Zero
             : TimeSpan.FromMilliseconds(Math.Max(1L, desiredMs));
     }
+
+    private static bool IsInstantNonInteractiveTimeout(InputRequest req) =>
+        req.TimeoutMilliseconds is <= 1L &&
+        !req.DisplayTime &&
+        req.Kind is InputRequestKind.IntValue or InputRequestKind.StringValue or InputRequestKind.OneInt or InputRequestKind.OneString;
 
     private bool SyncWaitingInputDeadline(EmueraEngine engine, out bool newlyTracked)
     {

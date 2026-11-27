@@ -116,6 +116,31 @@ public sealed class FrameLocalStorage
         IsBoundRef = true;
     }
 
+    internal void ResetDynamicValues()
+    {
+        if (IntArray is not null)
+        {
+            Array.Clear(IntArray);
+        }
+
+        if (StrArray is not null)
+        {
+            Array.Fill(StrArray, string.Empty);
+        }
+    }
+
+    internal void ResetUnboundRef()
+    {
+        IntArray = null;
+        StrArray = null;
+        Offset = 0;
+        Dim0 = 0;
+        Dim1 = 1;
+        Dim2 = 1;
+        TotalLength = 0;
+        IsBoundRef = false;
+    }
+
     public void CopyBindingFrom(FrameLocalStorage other)
     {
         if (other.ValueKind != ValueKind)

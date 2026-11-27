@@ -112,6 +112,7 @@ public sealed class SpriteRegistry : IDisposable
 
     public int Count => _sprites.Count;
     public bool HasAnimatedSprites => _animatedSpriteCount > 0;
+    public long GlobalMutationVersion => Volatile.Read(ref _nextDefinitionVersion);
 
     /// <summary>
     /// Maximum decoded native pixel-buffer bytes kept in the lazy file-backed LRU cache.
@@ -254,6 +255,7 @@ public sealed class SpriteRegistry : IDisposable
     {
         if (_sprites.Remove(key, out SpriteDefinition? removed))
         {
+            Interlocked.Increment(ref _nextDefinitionVersion);
             if (removed.IsAnimated)
             {
                 _animatedSpriteCount = Math.Max(0, _animatedSpriteCount - 1);

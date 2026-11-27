@@ -341,4 +341,192 @@ public sealed class HtmlCompositorAndHitTestTests
         int wrappedLines = HtmlPrintEngine.GetStringLines("WWWWWWWWWWWWWWWWWWWW", maxWidthPx: 60, measurer, fontSize: 16, fontFamily: "Arial");
         Assert.True(wrappedLines >= 3);
     }
+
+    [Fact]
+    public void CompositorAndHitTester_DepthZeroPaintersOrder_RoomBackgroundBehindLaterBars_AndNegativeYposOverlayOnTop()
+    {
+        using var fonts = new FontRegistry();
+        using var measurer = new GlyphMeasurer(fonts);
+        using var gm = new GraphicsManager(fonts, measurer);
+        using var sprites = new SpriteRegistry();
+        using var compositor = new SkiaFrameCompositor(fonts, measurer);
+
+        // 200x160 viewport, FontSize=16, LineHeight=16
+        var vp = new LogicalViewport(LogicalWidth: 200, LogicalHeight: 160, FontSize: 16, LineHeight: 16);
+        var console = new VirtualConsoleBuffer(vp, measurer, sprites, defaultFontFamily: "Arial", backColorRgba: 0x000000FFu);
+
+        // Bright red room background sprite (RGB 200, 40, 40)
+        gm.Create(1, 100, 80);
+        gm.Clear(1, 0xFFC82828u);
+        sprites.CreateSprite("ROOM_BG", 1, gm);
+
+        // 50% translucent black dimming sprite (ARGB 0x80000000)
+        gm.Create(2, 100, 80);
+        gm.Clear(2, 0x80000000u);
+        sprites.CreateSprite("DIM_BLACK", 2, gm);
+
+        // Bright cyan overlay sprite (RGB 0, 255, 255) for negative-ypos overlay test
+        gm.Create(3, 30, 32);
+        gm.Clear(3, 0xFF00FFFFu);
+        sprites.CreateSprite("TOP_BADGE", 3, gm);
+
+        // Replicate eraOCG2 MASTER_UI.ERB pattern:
+        // Two HTML_PRINT ..., 1 calls whose combined width wraps the 2nd image onto physical line 1,
+        // aligning ROOM_BG (line 0, ypos=+48px) and DIM_BLACK (line 1, ypos=+32px) over lines 3..7!
+        console.HtmlPrint("<shape type='space' param='20px'><button value='999'><img src='ROOM_BG' width='160px' height='80px' ypos='48px'/></button>", noNewLine: true);
+        console.HtmlPrint("<shape type='space' param='20px'><img src='DIM_BLACK' width='160px' height='80px' ypos='32px'/>", noNewLine: true);
+        console.NewLine(); // commits 2 wrapped physical lines: Line 0 (ROOM_BG) and Line 1 (DIM_BLACK)
+
+        console.PrintLine("Header"); // Line 2
+        // Line 3: Green status bar shape + button value=804 at x=20..100 (overlaps ROOM_BG + DIM_BLACK!)
+        console.HtmlPrint("<shape type='space' param='20px'><button value='804'><shape type='rect' param='0px,0px,80px,16px' color='#00FF00'/></button>");
+        // Line 4: Empty background area showing dimmed room image at x=20..180
+        console.PrintLine("");
+        // Line 5: Earlier button at x=120..150, then Line 6 places a negative-ypos overlay image ON TOP of Line 5!
+        console.HtmlPrint("<shape type='space' param='120px'><button value='100'><shape type='rect' param='0px,0px,30px,16px' color='#FF00FF'/></button>");
+        console.HtmlPrint("<shape type='space' param='120px'><button value='200'><img src='TOP_BADGE' width='30px' height='32px' ypos='-16px'/></button>");
+        console.PrintLine(""); // Line 7
+
+        ConsoleScene scene = console.CaptureScene();
+        float[] tops = ConsoleHitTester.ComputeVisibleLineTops(scene);
+        Assert.Equal(8, scene.VisibleLines.Count);
+
+        using var bmp = new SKBitmap(new SKImageInfo(200, 160, SKColorType.Bgra8888, SKAlphaType.Premul));
+        using (var canvas = new SKCanvas(bmp))
+        {
+            compositor.RenderScene(canvas, 200, 160, scene, gm, sprites);
+        }
+
+        // 1. Line 3 status bar (x=50, y=tops[3]+8) MUST be bright green (drawn ON TOP of ROOM_BG + DIM_BLACK)!
+        int barY = (int)(tops[3] + 8f);
+        Assert.Equal(new SKColor(0x00, 0xFF, 0x00, 0xFF), bmp.GetPixel(50, barY));
+
+        // 2. Line 4 uncovered room area (x=50, y=tops[4]+8) MUST be dimmed red (~100, 20, 20) proving DIM_BLACK painted ON TOP of ROOM_BG!
+        int roomY = (int)(tops[4] + 8f);
+        SKColor dimmedRoom = bmp.GetPixel(50, roomY);
+        Assert.InRange(dimmedRoom.Red, 85, 115);
+        Assert.InRange(dimmedRoom.Green, 12, 28);
+        Assert.InRange(dimmedRoom.Blue, 12, 28);
+
+        // 3. Line 5 covered by Line 6's negative-ypos TOP_BADGE (x=135, y=tops[5]+8) MUST be cyan (later line paints ON TOP)!
+        int negOverlayY = (int)(tops[5] + 8f);
+        Assert.Equal(new SKColor(0x00, 0xFF, 0xFF, 0xFF), bmp.GetPixel(135, negOverlayY));
+
+        // 4. Hit-testing matches visual Z-order:
+        //    - Line 3 button 804 beats Line 0 background button 999
+        ConsoleHitTestResult barHit = ConsoleHitTester.HitTestLogicalPoint(scene, 50f, tops[3] + 8f, gm, sprites);
+        Assert.True(barHit.HasActiveButton);
+        Assert.Equal(804L, barHit.ActiveButton!.IntValue);
+
+        //    - Line 4 empty area falls through to Line 0 background button 999
+        ConsoleHitTestResult bgHit = ConsoleHitTester.HitTestLogicalPoint(scene, 50f, tops[4] + 8f, gm, sprites);
+        Assert.True(bgHit.HasActiveButton);
+        Assert.Equal(999L, bgHit.ActiveButton!.IntValue);
+
+        //    - Line 6 negative-ypos button 200 beats Line 5 button 100
+        ConsoleHitTestResult negHit = ConsoleHitTester.HitTestLogicalPoint(scene, 135f, tops[5] + 8f, gm, sprites);
+        Assert.True(negHit.HasActiveButton);
+        Assert.Equal(200L, negHit.ActiveButton!.IntValue);
+    }
+
+    [Fact]
+    public void CompositorAndHitTester_ExplicitNonZeroDepthDivs_AndSpacesPassThroughToPortraitDiv()
+    {
+        using var fonts = new FontRegistry();
+        using var measurer = new GlyphMeasurer(fonts);
+        using var gm = new GraphicsManager(fonts, measurer);
+        using var sprites = new SpriteRegistry();
+        using var compositor = new SkiaFrameCompositor(fonts, measurer);
+
+        var vp = new LogicalViewport(LogicalWidth: 200, LogicalHeight: 120, FontSize: 16, LineHeight: 16);
+        var console = new VirtualConsoleBuffer(vp, measurer, sprites, defaultFontFamily: "Arial", backColorRgba: 0x000000FFu);
+
+        gm.Create(1, 40, 48);
+        gm.Clear(1, 0xFF3366CCu);
+        sprites.CreateSprite("PORTRAIT", 1, gm);
+
+        // Line 0: TARGET_UI-style depth=0 relative div portrait button on left (x=0..40, height=48px spanning lines 0..2)
+        console.HtmlPrint("<div width='40px' height='48px'><button value='803'><img src='PORTRAIT' width='40px' height='48px'/></button></div>");
+        // Line 1: Plain spaces overlapping left portrait (x=0..35) + depth=0 yellow rect button at exact x=60..100
+        console.HtmlPrint("        <button value='777' pos='60px'><shape type='rect' param='0px,0px,40px,16px' color='#FFFF00'/></button>");
+        // Line 2: Explicit depth=10 background div (MUST draw BEHIND Line 1 yellow rect!)
+        //       + Explicit depth=-5 foreground div (MUST draw IN FRONT OF Line 1 yellow rect!)
+        console.HtmlPrint(
+            "<div xpos='60px' ypos='-16px' width='40px' height='16px' depth='10' color='#FF0000'><button value='10'><shape type='rect' param='0px,0px,40px,16px' color='#FF0000'/></button></div>" +
+            "<div xpos='60px' ypos='-16px' width='20px' height='16px' depth='-5' color='#0000FF'><button value='50'><shape type='rect' param='0px,0px,20px,16px' color='#0000FF'/></button></div>");
+
+        ConsoleScene scene = console.CaptureScene();
+        float[] tops = ConsoleHitTester.ComputeVisibleLineTops(scene);
+
+        using var bmp = new SKBitmap(new SKImageInfo(200, 120, SKColorType.Bgra8888, SKAlphaType.Premul));
+        using (var canvas = new SKCanvas(bmp))
+        {
+            compositor.RenderScene(canvas, 200, 120, scene, gm, sprites);
+        }
+
+        int line1Y = (int)(tops[1] + 8f);
+        // x=20 on Line 1: spaces are transparent, portrait shows cleanly
+        Assert.Equal(new SKColor(0x33, 0x66, 0xCC, 0xFF), bmp.GetPixel(20, line1Y));
+        // x=70 on Line 1: depth=-5 blue div overwrites depth=0 yellow rect
+        Assert.Equal(new SKColor(0x00, 0x00, 0xFF, 0xFF), bmp.GetPixel(70, line1Y));
+        // x=90 on Line 1: depth=0 yellow rect overwrites depth=10 red div even though depth=10 div is on a later line!
+        Assert.Equal(new SKColor(0xFF, 0xFF, 0x00, 0xFF), bmp.GetPixel(90, line1Y));
+
+        // Clicking portrait at Line 1 (x=20) passes through non-button spaces and hits button 803!
+        ConsoleHitTestResult portraitHit = ConsoleHitTester.HitTestLogicalPoint(scene, 20f, tops[1] + 8f, gm, sprites);
+        Assert.True(portraitHit.HasActiveButton);
+        Assert.Equal(803L, portraitHit.ActiveButton!.IntValue);
+
+        // Clicking x=70 hits depth=-5 foreground button 50; clicking x=90 hits depth=0 button 777 (beating depth=10 button 10)!
+        ConsoleHitTestResult fgDivHit = ConsoleHitTester.HitTestLogicalPoint(scene, 70f, tops[1] + 8f, gm, sprites);
+        Assert.True(fgDivHit.HasActiveButton);
+        Assert.Equal(50L, fgDivHit.ActiveButton!.IntValue);
+
+        ConsoleHitTestResult flowOverBgDivHit = ConsoleHitTester.HitTestLogicalPoint(scene, 90f, tops[1] + 8f, gm, sprites);
+        Assert.True(flowOverBgDivHit.HasActiveButton);
+        Assert.Equal(777L, flowOverBgDivHit.ActiveButton!.IntValue);
+    }
+
+    [Fact]
+    public void CaptureScene_TopOverscanPreservesTallImageScrolledAboveViewportWithoutShiftingLines()
+    {
+        using var fonts = new FontRegistry();
+        using var measurer = new GlyphMeasurer(fonts);
+        using var gm = new GraphicsManager(fonts, measurer);
+        using var sprites = new SpriteRegistry();
+        using var compositor = new SkiaFrameCompositor(fonts, measurer);
+
+        // 100x80 viewport -> 5 visible lines (+2 baseline = 7 lines)
+        var vp = new LogicalViewport(LogicalWidth: 100, LogicalHeight: 80, FontSize: 16, LineHeight: 16);
+        var console = new VirtualConsoleBuffer(vp, measurer, sprites, defaultFontFamily: "Arial", backColorRgba: 0x000000FFu);
+
+        gm.Create(1, 60, 120);
+        gm.Clear(1, 0xFF22AA44u);
+        sprites.CreateSprite("TALL_BG", 1, gm);
+
+        // Line 0: tall image with ypos=+48px, height=120px -> reaches +168px (10.5 lines) below Line 0!
+        console.HtmlPrint("<img src='TALL_BG' width='60px' height='120px' ypos='48px'/>");
+        // Print 9 more lines (total 10 lines -> Line 0 is 5 lines above the 5-line viewport top, beyond baseline +2!)
+        for (int i = 1; i <= 9; i++)
+        {
+            console.PrintLine($"L{i}");
+        }
+
+        ConsoleScene scene = console.CaptureScene();
+        float[] tops = ConsoleHitTester.ComputeVisibleLineTops(scene);
+
+        // Bottom line (L9) MUST still be anchored cleanly at LogicalHeight - 16 = 64px!
+        Assert.Equal(64f, tops[^1], precision: 2);
+        // Line 0 MUST be included via top overscan because its bottom (tops[0] + 168 = -80 + 168 = +88px) reaches into viewport!
+        Assert.Equal(10, scene.VisibleLines.Count);
+
+        using var bmp = new SKBitmap(new SKImageInfo(100, 80, SKColorType.Bgra8888, SKAlphaType.Premul));
+        using (var canvas = new SKCanvas(bmp))
+        {
+            compositor.RenderScene(canvas, 100, 80, scene, gm, sprites);
+        }
+
+        // At (40, 20) — right of short text "L5", inside viewport — TALL_BG green pixel MUST still be rendered!
+        Assert.Equal(new SKColor(0x22, 0xAA, 0x44, 0xFF), bmp.GetPixel(40, 20));
+    }
 }

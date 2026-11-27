@@ -15,8 +15,8 @@
 
     <ApplicationTitle>Hypera</ApplicationTitle>
     <ApplicationId>io.hypera.app</ApplicationId>
-    <ApplicationDisplayVersion Condition="'$(ApplicationDisplayVersion)' == ''">1.4.0</ApplicationDisplayVersion>
-    <ApplicationVersion Condition="'$(ApplicationVersion)' == ''">5</ApplicationVersion>
+    <ApplicationDisplayVersion Condition="'$(ApplicationDisplayVersion)' == ''">1.4.1</ApplicationDisplayVersion>
+    <ApplicationVersion Condition="'$(ApplicationVersion)' == ''">6</ApplicationVersion>
 
     <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
     <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">15.0</SupportedOSPlatformVersion>

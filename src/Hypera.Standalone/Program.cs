@@ -98,9 +98,16 @@ public static class Program
 
                 if (status == EngineStepStatus.WaitingInput && engine.PendingInputRequest is { } req)
                 {
-                    if (req.Kind == InputRequestKind.TimedWait && options.AutoAdvanceTimedWaits && timedWaitsAdvanced < 64)
+                    bool isInstantTimedInput = req.TimeoutMilliseconds is <= 1L &&
+                        !req.DisplayTime &&
+                        req.Kind is InputRequestKind.IntValue or InputRequestKind.StringValue or InputRequestKind.OneInt or InputRequestKind.OneString;
+                    if (isInstantTimedInput || (req.Kind == InputRequestKind.TimedWait && options.AutoAdvanceTimedWaits && timedWaitsAdvanced < 64))
                     {
-                        timedWaitsAdvanced++;
+                        if (!isInstantTimedInput)
+                        {
+                            timedWaitsAdvanced++;
+                        }
+
                         engine.SubmitInput(new InputResponse(req.GenerationId, IsTimeout: true));
                         continue;
                     }

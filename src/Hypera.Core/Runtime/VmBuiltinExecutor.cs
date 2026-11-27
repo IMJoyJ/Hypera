@@ -196,7 +196,9 @@ internal static partial class VmBuiltinExecutor
             {
                 string text = insn.A < strRegs.Length ? (strRegs[insn.A] ?? string.Empty) : string.Empty;
                 engine.PrintStyled(text, flags);
-                return (flags & (PrintModifierFlags.WaitInput | PrintModifierFlags.NoNewLineWait)) != 0 && engine.IssueAnyKeyWait();
+                bool noNewLineWait = (flags & PrintModifierFlags.NoNewLineWait) != 0;
+                return (flags & (PrintModifierFlags.WaitInput | PrintModifierFlags.NoNewLineWait)) != 0
+                    && engine.IssueAnyKeyWait(canSkipWithMessageSkip: true, flushPendingLine: !noNewLineWait);
             }
 
             case OpCode.PrintLine:
@@ -209,11 +211,12 @@ internal static partial class VmBuiltinExecutor
             case OpCode.PrintWait:
             {
                 string text = insn.A < strRegs.Length ? (strRegs[insn.A] ?? string.Empty) : string.Empty;
-                PrintModifierFlags eff = (flags & PrintModifierFlags.NoNewLineWait) != 0
+                bool noNewLineWait = (flags & PrintModifierFlags.NoNewLineWait) != 0;
+                PrintModifierFlags eff = noNewLineWait
                     ? (flags | PrintModifierFlags.WaitInput)
                     : (flags | PrintModifierFlags.NewLine | PrintModifierFlags.WaitInput);
                 engine.PrintStyled(text, eff);
-                return engine.IssueAnyKeyWait();
+                return engine.IssueAnyKeyWait(canSkipWithMessageSkip: true, flushPendingLine: !noNewLineWait);
             }
 
             case OpCode.PrintSingle:
@@ -2195,8 +2198,9 @@ internal static partial class VmBuiltinExecutor
                     WaitInputFlags.HasDefault | WaitInputFlags.HasTimeout,
                     hasDef: true,
                     defInt: w.GetInt(1),
-                    timeoutMs: w.GetInt(0),
-                    timeoutMsg: w.HasArg(3) ? w.GetStr(3) : vars.ReplaceConfig.TimeupLabel)
+                    timeoutMs: Math.Max(0L, w.GetInt(0)),
+                    timeoutMsg: w.HasArg(3) ? w.GetStr(3) : vars.ReplaceConfig.TimeupLabel,
+                    displayTime: !w.HasArg(2) || w.GetInt(2) != 0)
                     ? EngineStepStatus.WaitingInput
                     : null;
 
@@ -2206,8 +2210,9 @@ internal static partial class VmBuiltinExecutor
                     WaitInputFlags.HasDefault | WaitInputFlags.HasTimeout,
                     hasDef: true,
                     defStr: w.GetStr(1),
-                    timeoutMs: w.GetInt(0),
-                    timeoutMsg: w.HasArg(3) ? w.GetStr(3) : vars.ReplaceConfig.TimeupLabel)
+                    timeoutMs: Math.Max(0L, w.GetInt(0)),
+                    timeoutMsg: w.HasArg(3) ? w.GetStr(3) : vars.ReplaceConfig.TimeupLabel,
+                    displayTime: !w.HasArg(2) || w.GetInt(2) != 0)
                     ? EngineStepStatus.WaitingInput
                     : null;
 
@@ -2217,8 +2222,9 @@ internal static partial class VmBuiltinExecutor
                     WaitInputFlags.HasDefault | WaitInputFlags.HasTimeout,
                     hasDef: true,
                     defInt: w.GetInt(1),
-                    timeoutMs: w.GetInt(0),
-                    timeoutMsg: w.HasArg(3) ? w.GetStr(3) : vars.ReplaceConfig.TimeupLabel)
+                    timeoutMs: Math.Max(0L, w.GetInt(0)),
+                    timeoutMsg: w.HasArg(3) ? w.GetStr(3) : vars.ReplaceConfig.TimeupLabel,
+                    displayTime: !w.HasArg(2) || w.GetInt(2) != 0)
                     ? EngineStepStatus.WaitingInput
                     : null;
 
@@ -2228,8 +2234,9 @@ internal static partial class VmBuiltinExecutor
                     WaitInputFlags.HasDefault | WaitInputFlags.HasTimeout,
                     hasDef: true,
                     defStr: w.GetStr(1),
-                    timeoutMs: w.GetInt(0),
-                    timeoutMsg: w.HasArg(3) ? w.GetStr(3) : vars.ReplaceConfig.TimeupLabel)
+                    timeoutMs: Math.Max(0L, w.GetInt(0)),
+                    timeoutMsg: w.HasArg(3) ? w.GetStr(3) : vars.ReplaceConfig.TimeupLabel,
+                    displayTime: !w.HasArg(2) || w.GetInt(2) != 0)
                     ? EngineStepStatus.WaitingInput
                     : null;
 

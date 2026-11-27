@@ -40,6 +40,7 @@ public sealed class GraphicsManager : IDisposable
     private readonly string? _saveDirectory;
     private IWritableUserStorage? _writableStorage;
     private long _nextSurfaceToken;
+    private long _globalMutationVersion = 1;
     private bool _disposed;
 
     public GraphicsManager(
@@ -65,6 +66,9 @@ public sealed class GraphicsManager : IDisposable
     public string DefaultFontName { get; }
     public int DefaultFontSize { get; }
     public int Count => _surfaces.Count;
+    public long GlobalMutationVersion => Volatile.Read(ref _globalMutationVersion);
+
+    private void BumpGlobalMutationVersion() => Interlocked.Increment(ref _globalMutationVersion);
 
     public void AttachWritableStorage(IWritableUserStorage? writableStorage)
     {
@@ -185,6 +189,7 @@ public sealed class GraphicsManager : IDisposable
                 surface.Dispose();
             }
 
+            BumpGlobalMutationVersion();
             return true;
         }
 
@@ -221,6 +226,7 @@ public sealed class GraphicsManager : IDisposable
 
         // Ownership of restored surfaces has returned to _surfaces.
         delta.OriginalSurfaces.Clear();
+        BumpGlobalMutationVersion();
     }
 
     private void ReplaceSurfaceInternal(int id, GraphicsSurface replacement)
@@ -243,6 +249,7 @@ public sealed class GraphicsManager : IDisposable
         }
 
         _surfaces[id] = replacement;
+        BumpGlobalMutationVersion();
     }
 
     private void RecordBeforeInPlaceMutation(int id, GraphicsSurface surface)
@@ -251,6 +258,8 @@ public sealed class GraphicsManager : IDisposable
         {
             _activeUndoDelta.OriginalSurfaces[id] = surface.Clone();
         }
+
+        BumpGlobalMutationVersion();
     }
 
     public int GetWidth(int id) => TryGetSurface(id, out GraphicsSurface s) ? s.Width : 0;

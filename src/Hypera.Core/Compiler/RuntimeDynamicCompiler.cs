@@ -1191,6 +1191,11 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         ushort intBase = 1;
         ushort strBase = 1;
 
+        bool useCharaElem = bm.Method.Kind is BuiltinMethodKind.CMATCH
+            or BuiltinMethodKind.SUMCARRAY
+            or BuiltinMethodKind.MAXCARRAY
+            or BuiltinMethodKind.MINCARRAY
+            or BuiltinMethodKind.INRANGECARRAY;
         for (int i = 0; i < count; i++)
         {
             ExprNode? arg = bm.Arguments[i];
@@ -1201,7 +1206,7 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
             else if (matchedOv is not null && IsRefParamAt(matchedOv, i) && arg is VariableAccessExpr refVa)
             {
                 tags[i] = CallArgTag.ByRef;
-                scratchFrame.IntRegisters[intBase + i] = EncodeRuntimeByRef(refVa, activeFrame);
+                scratchFrame.IntRegisters[intBase + i] = EncodeRuntimeByRef(refVa, engine, activeFrame, useCharaElem);
             }
             else if (arg.ValueKind == VariableValueKind.Str)
             {
@@ -1322,7 +1327,7 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
             else if (i < targetDesc.Parameters.Length && targetDesc.Parameters[i].IsByRef && arg is VariableAccessExpr refVa)
             {
                 tags[i] = CallArgTag.ByRef;
-                caller.IntRegisters[intBase + i] = EncodeRuntimeByRef(refVa, activeFrame);
+                caller.IntRegisters[intBase + i] = EncodeRuntimeByRef(refVa, engine, activeFrame, useCharaElementSubscript: false);
             }
             else if (arg.ValueKind == VariableValueKind.Str)
             {
@@ -1346,9 +1351,28 @@ public sealed class RuntimeDynamicCompiler : IDynamicEvaluator
         return caller;
     }
 
-    private long EncodeRuntimeByRef(VariableAccessExpr va, CallFrame? activeFrame)
+    private long EncodeRuntimeByRef(VariableAccessExpr va, EmueraEngine engine, CallFrame? activeFrame, bool useCharaElementSubscript)
     {
-        int fixedIdx0 = (!va.IsBareArrayReference && va.Subscripts is [IntLiteralExpr c0, ..]) ? (int)c0.Value : -1;
+        ExprNode? subExpr = null;
+        if (!va.IsBareArrayReference && va.Subscripts.Length > 0)
+        {
+            if (useCharaElementSubscript && va.Variable.IsCharaData)
+            {
+                subExpr = va.Variable.ArrayRank >= 1 && va.Subscripts.Length >= 2 ? va.Subscripts[1] : null;
+            }
+            else
+            {
+                subExpr = va.Subscripts[0];
+            }
+        }
+
+        int fixedIdx0 = subExpr switch
+        {
+            null => -1,
+            IntLiteralExpr c0 => (int)c0.Value,
+            _ => checked((int)EvalIntNode(subExpr, engine, activeFrame)),
+        };
+
         if (activeFrame is not null && activeFrame.TryGetLocal(va.Variable.Name, _options.IgnoreCase, out FrameLocalStorage? loc) && loc is not null)
         {
             VariableSlotOrigin origin = loc.Scope == VariableScopeKind.Reference ? VariableSlotOrigin.RefPassthrough : VariableSlotOrigin.FrameLocal;

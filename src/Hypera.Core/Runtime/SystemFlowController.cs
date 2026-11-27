@@ -885,10 +885,7 @@ public sealed class SystemFlowController
             }
         }
 
-        if (_printedComColumns > 0)
-        {
-            _engine.PrintNewLine();
-        }
+        _engine.FlushPendingLine();
 
         State = SystemFlowState.TrainAfterShowUserCom;
         _engine.TryPushNamedFunction("SHOW_USERCOM");

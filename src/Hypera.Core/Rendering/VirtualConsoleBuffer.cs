@@ -124,6 +124,8 @@ public sealed class VirtualConsoleBuffer
     private ConsoleLine? _cachedPendingLine;
     private long _cachedPendingVersion = -1;
     private long _pendingVersion;
+    private long _visualMutationVersion = 1;
+    private uint _currentBackColorRgba;
     private long _cachedPendingGeneration = -1;
     private LogicalViewport _cachedPendingViewport;
     private HtmlParseStyle? _cachedPendingStyle;
@@ -161,7 +163,19 @@ public sealed class VirtualConsoleBuffer
     public uint DefaultForeColorRgba { get; }
     public uint CurrentForeColorRgba { get; set; }
     public uint DefaultBackColorRgba { get; }
-    public uint CurrentBackColorRgba { get; set; }
+    public uint CurrentBackColorRgba
+    {
+        get => _currentBackColorRgba;
+        set
+        {
+            if (_currentBackColorRgba != value)
+            {
+                _currentBackColorRgba = value;
+                _visualMutationVersion++;
+            }
+        }
+    }
+
     public uint FocusColorRgba { get; set; }
     public TextAlignment Alignment { get; set; } = TextAlignment.Left;
     public FontStyleFlags FontStyle { get; set; } = FontStyleFlags.Regular;
@@ -170,17 +184,27 @@ public sealed class VirtualConsoleBuffer
     public bool ButtonWrap { get; set; }
     public bool ExpandTabs { get; set; }
 
+    public long VisualMutationVersion => _visualMutationVersion;
     public long ButtonGeneration => _buttonGeneration;
     public IReadOnlyList<ConsoleLine> PhysicalLines => _physicalLines;
     public int PhysicalLineCount => _physicalLines.Count;
     public bool HasPendingLine => _pendingHtmlBuffer.Length > 0 || _pendingStyledRuns.Count > 0;
+    public bool LastLineIsTemporary => _physicalLines.Count > 0 && _physicalLines[^1].IsTemporary;
     public bool LastOutputWasInPlaceReplacement { get; private set; }
     public Action<string, long>? AutoButtonDetected { get; set; }
     internal string LastCommittedPlainText => _physicalLines.Count > 0 ? _physicalLines[^1].PlainText : string.Empty;
     public int ScrollOffsetLines
     {
         get => _scrollOffsetLines;
-        set => _scrollOffsetLines = Math.Clamp(value, 0, MaxScrollOffsetLines);
+        set
+        {
+            int clamped = Math.Clamp(value, 0, MaxScrollOffsetLines);
+            if (_scrollOffsetLines != clamped)
+            {
+                _scrollOffsetLines = clamped;
+                _visualMutationVersion++;
+            }
+        }
     }
 
     public int MaxScrollOffsetLines
@@ -201,7 +225,15 @@ public sealed class VirtualConsoleBuffer
     public TooltipState Tooltip
     {
         get => _tooltip;
-        set => _tooltip = value ?? new TooltipState(FontFamily: DefaultFontFamily);
+        set
+        {
+            TooltipState next = value ?? new TooltipState(FontFamily: DefaultFontFamily);
+            if (!Equals(_tooltip, next))
+            {
+                _tooltip = next;
+                _visualMutationVersion++;
+            }
+        }
     }
 
     /// <summary>
@@ -306,13 +338,13 @@ public sealed class VirtualConsoleBuffer
         }
     }
 
-    public void NewLine()
+    public void NewLine(bool noWrap = false, bool isTemporary = false)
     {
         FlushPendingRunsToHtml();
         string html = _pendingHtmlBuffer.ToString();
         _pendingHtmlBuffer.Clear();
         InvalidatePendingCache();
-        CommitHtmlLine(html, noWrapOverride: false);
+        CommitHtmlLine(html, noWrapOverride: noWrap, isTemporary: isTemporary);
     }
 
     /// <summary>
@@ -429,7 +461,8 @@ public sealed class VirtualConsoleBuffer
     }
 
     /// <summary>
-    /// Implements CLEARLINE N: deletes all physical lines belonging to the last <paramref name="logicalLineCount"/> logical lines.
+    /// Implements CLEARLINE N: deletes all physical lines belonging to the last <paramref name="logicalLineCount"/> committed logical lines.
+    /// Matches Emuera <c>EmueraConsole.deleteLine</c>: does not discard unflushed text in the pending buffer.
     /// When <paramref name="logicalLineCount"/> == 1, marks the next output as an in-place replacement merge.
     /// </summary>
     public int ClearLine(int logicalLineCount)
@@ -439,11 +472,11 @@ public sealed class VirtualConsoleBuffer
             return 0;
         }
 
-        // Discard unflushed pending buffer if clearing.
-        _pendingHtmlBuffer.Clear();
-        _pendingStyledRuns.Clear();
-        InvalidatePendingCache();
+        return DeleteCommittedLogicalLinesCore(logicalLineCount, markInPlaceReplacement: logicalLineCount == 1);
+    }
 
+    private int DeleteCommittedLogicalLinesCore(int logicalLineCount, bool markInPlaceReplacement)
+    {
         int remainingLogicalToDelete = logicalLineCount;
         int removedPhysical = 0;
 
@@ -489,7 +522,12 @@ public sealed class VirtualConsoleBuffer
             _logicalLineCount = Math.Max(0, _logicalLineCount - remainingLogicalToDelete);
         }
 
-        _pendingInPlaceReplacement = logicalLineCount == 1 && removedPhysical > 0;
+        _pendingInPlaceReplacement = markInPlaceReplacement && removedPhysical > 0;
+        if (removedPhysical > 0)
+        {
+            _visualMutationVersion++;
+        }
+
         return removedPhysical;
     }
 
@@ -503,6 +541,7 @@ public sealed class VirtualConsoleBuffer
         _totalPhysicalLineNo = 0;
         _pendingInPlaceReplacement = false;
         _scrollOffsetLines = 0;
+        _visualMutationVersion++;
     }
 
     // --- SETBGIMAGE / REMOVEBGIMAGE / CLEARBGIMAGE ---
@@ -515,6 +554,7 @@ public sealed class VirtualConsoleBuffer
         }
 
         _backgroundImages.Add(new BackgroundImageLayer(spriteName.Trim(), depth, Math.Clamp(opacity, 0f, 1f)));
+        _visualMutationVersion++;
     }
 
     public void RemoveBackgroundImage(string spriteName)
@@ -524,18 +564,34 @@ public sealed class VirtualConsoleBuffer
             return;
         }
 
-        _backgroundImages.RemoveAll(bg => bg.SpriteName.Equals(spriteName.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (_backgroundImages.RemoveAll(bg => bg.SpriteName.Equals(spriteName.Trim(), StringComparison.OrdinalIgnoreCase)) > 0)
+        {
+            _visualMutationVersion++;
+        }
     }
 
-    public void ClearBackgroundImages() => _backgroundImages.Clear();
+    public void ClearBackgroundImages()
+    {
+        if (_backgroundImages.Count > 0)
+        {
+            _backgroundImages.Clear();
+            _visualMutationVersion++;
+        }
+    }
 
     // --- CBG Layers & Button Map ---
 
-    public void CbgSetGraphics(int graphicsId, int x, int y, int zDepth) =>
+    public void CbgSetGraphics(int graphicsId, int x, int y, int zDepth)
+    {
         _cbgLayers.Add(new CbgLayer(zDepth, x, y, GraphicsId: graphicsId));
+        _visualMutationVersion++;
+    }
 
-    public void CbgSetSprite(string spriteName, int x, int y, int zDepth) =>
+    public void CbgSetSprite(string spriteName, int x, int y, int zDepth)
+    {
         _cbgLayers.Add(new CbgLayer(zDepth, x, y, SpriteName: spriteName));
+        _visualMutationVersion++;
+    }
 
     public void CbgSetButtonSprite(
         int buttonValue,
@@ -544,7 +600,8 @@ public sealed class VirtualConsoleBuffer
         int x,
         int y,
         int zDepth,
-        string? tooltip = null) =>
+        string? tooltip = null)
+    {
         _cbgLayers.Add(new CbgLayer(
             Depth: zDepth,
             X: x,
@@ -554,27 +611,43 @@ public sealed class VirtualConsoleBuffer
             IsButton: true,
             ButtonValue: buttonValue,
             Tooltip: tooltip));
+        _visualMutationVersion++;
+    }
 
-    public void CbgSetButtonMap(int graphicsId) => _cbgButtonMapGraphicsId = graphicsId;
-    public void CbgRemoveButtonMap() => _cbgButtonMapGraphicsId = null;
+    public void CbgSetButtonMap(int graphicsId)
+    {
+        _cbgButtonMapGraphicsId = graphicsId;
+        _visualMutationVersion++;
+    }
+
+    public void CbgRemoveButtonMap()
+    {
+        _cbgButtonMapGraphicsId = null;
+        _visualMutationVersion++;
+    }
 
     public void CbgRemoveRange(int zMin, int zMax)
     {
         int lo = Math.Min(zMin, zMax);
         int hi = Math.Max(zMin, zMax);
-        _cbgLayers.RemoveAll(c => c.Depth >= lo && c.Depth <= hi);
+        if (_cbgLayers.RemoveAll(c => c.Depth >= lo && c.Depth <= hi) > 0)
+        {
+            _visualMutationVersion++;
+        }
     }
 
     public void CbgClearButtons()
     {
         _cbgLayers.RemoveAll(c => c.IsButton);
         _cbgButtonMapGraphicsId = null;
+        _visualMutationVersion++;
     }
 
     public void CbgClear()
     {
         _cbgLayers.Clear();
         _cbgButtonMapGraphicsId = null;
+        _visualMutationVersion++;
     }
 
     // --- HTML_PRINT_ISLAND / HTML_PRINT_ISLAND_CLEAR ---
@@ -592,9 +665,17 @@ public sealed class VirtualConsoleBuffer
             _sprites,
             noWrapOverride: false);
         _islandLayers.Add(new HtmlIslandLayer(depth, lines));
+        _visualMutationVersion++;
     }
 
-    public void HtmlPrintIslandClear() => _islandLayers.Clear();
+    public void HtmlPrintIslandClear()
+    {
+        if (_islandLayers.Count > 0)
+        {
+            _islandLayers.Clear();
+            _visualMutationVersion++;
+        }
+    }
 
     /// <summary>
     /// Captures the current visible console scene for rendering and pixel hit-testing.
@@ -618,6 +699,61 @@ public sealed class VirtualConsoleBuffer
         int totalCount = allLines.Count + (pendingLine is not null ? 1 : 0);
         int endExclusive = Math.Clamp(totalCount - _scrollOffsetLines, 0, totalCount);
         int start = Math.Max(0, endExclusive - maxVisible);
+
+        // Include scrolled-off lines above the viewport ONLY when they contain tall/positive-ypos
+        // images, shapes, or relative divs whose rendered pixels still extend downward into [0, LogicalHeight).
+        if (start > 0 && endExclusive > start)
+        {
+            float baseVisibleHeight = 0f;
+            for (int i = start; i < endExclusive; i++)
+            {
+                ConsoleLine ln = i < allLines.Count ? allLines[i] : pendingLine!;
+                baseVisibleHeight += Math.Max(1, ln.LineHeight);
+            }
+
+            const int MaxTopOverscanLines = 64;
+            int minProbe = Math.Max(0, start - MaxTopOverscanLines);
+            float probeTopY = Viewport.LogicalHeight - baseVisibleHeight;
+            int extendedStart = start;
+
+            for (int probe = start - 1; probe >= minProbe; probe--)
+            {
+                ConsoleLine ln = allLines[probe];
+                probeTopY -= Math.Max(1, ln.LineHeight);
+
+                bool reachesIntoViewport = false;
+                for (int p = 0; p < ln.Parts.Count; p++)
+                {
+                    ConsoleRenderPart part = ln.Parts[p];
+                    if (!part.IsEscapedFromLine(ln.LineHeight))
+                    {
+                        continue;
+                    }
+
+                    if (part.Kind == ConsolePartKind.Div && part.Div is not null)
+                    {
+                        if (part.Div.DisplayMode == DivDisplayMode.Relative &&
+                            probeTopY + part.Div.YPos + part.Div.Height > 0f)
+                        {
+                            reachesIntoViewport = true;
+                            break;
+                        }
+                    }
+                    else if (probeTopY + part.YOffset + part.Height > 0f)
+                    {
+                        reachesIntoViewport = true;
+                        break;
+                    }
+                }
+
+                if (reachesIntoViewport)
+                {
+                    extendedStart = probe;
+                }
+            }
+
+            start = extendedStart;
+        }
 
         var visible = new List<ConsoleLine>(endExclusive - start);
         for (int i = start; i < endExclusive; i++)
@@ -659,8 +795,14 @@ public sealed class VirtualConsoleBuffer
             DynamicAssetVersions: dynamicAssetVersions);
     }
 
-    private void CommitHtmlLine(string html, bool noWrapOverride)
+    private void CommitHtmlLine(string html, bool noWrapOverride, bool isTemporary = false)
     {
+        // Match EmueraConsole.addDisplayLine: a preceding REUSELASTLINE temporary line is replaced automatically.
+        if (LastLineIsTemporary)
+        {
+            DeleteCommittedLogicalLinesCore(1, markInPlaceReplacement: true);
+        }
+
         long logicalId = _nextLogicalLineId++;
         bool inPlace = _pendingInPlaceReplacement;
         _pendingInPlaceReplacement = false;
@@ -679,14 +821,22 @@ public sealed class VirtualConsoleBuffer
 
         for (int i = 0; i < parsed.Count; i++)
         {
-            ConsoleLine line = inPlace && i == 0
-                ? parsed[i] with { ReplacedInPlace = true }
-                : parsed[i];
+            ConsoleLine line = parsed[i];
+            if ((inPlace && i == 0) || isTemporary)
+            {
+                line = line with
+                {
+                    ReplacedInPlace = inPlace && i == 0,
+                    IsTemporary = isTemporary,
+                };
+            }
+
             _physicalLines.Add(line);
         }
 
         _logicalLineCount++;
         _totalPhysicalLineNo += parsed.Count;
+        _visualMutationVersion++;
         TrimLogIfNeeded();
     }
 
@@ -941,6 +1091,7 @@ public sealed class VirtualConsoleBuffer
     private void InvalidatePendingCache()
     {
         _pendingVersion++;
+        _visualMutationVersion++;
         _cachedPendingLine = null;
     }
 
