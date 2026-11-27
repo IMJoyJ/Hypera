@@ -10,133 +10,153 @@
 
 <MudThemeProvider Theme="@HyperaTheme.Theme" IsDarkMode="@Ui.IsDarkMode" />
 <MudPopoverProvider />
-<MudDialogProvider MaxWidth="MaxWidth.Small" FullWidth="true" CloseOnEscapeKey="true" />
+<MudDialogProvider MaxWidth="MaxWidth.Medium" FullWidth="true" CloseOnEscapeKey="true" />
 <MudSnackbarProvider />
 
-<MudLayout>
-    <MudAppBar Elevation="1" Dense="true">
-        <MudIconButton Icon="@Icons.Material.Filled.Menu"
-                       Color="Color.Inherit"
-                       Edge="Edge.Start"
-                       OnClick="@(() => _drawerOpen = !_drawerOpen)" />
+<MudLayout Class="@(Ui.IsPlayStageActive ? "hypera-layout-play" : "")">
+    @if (!Ui.IsFullscreen)
+    {
+        <MudAppBar Elevation="1" Dense="true">
+            <MudIconButton Icon="@Icons.Material.Filled.Menu"
+                           Color="Color.Inherit"
+                           Edge="Edge.Start"
+                           OnClick="@ToggleDrawer" />
 
-        <MudLink Href="/" Underline="Underline.None" Color="Color.Inherit" Class="d-flex align-center gap-2 ml-1">
-            <MudIcon Icon="@Icons.Material.Filled.Terminal" Size="Size.Small" />
-            <MudText Typo="Typo.h6" Style="font-weight: 600; letter-spacing: 0.02em;">Hypera</MudText>
-        </MudLink>
+            <MudLink Href="/" Underline="Underline.None" Color="Color.Inherit" Class="d-flex align-center gap-2 ml-1">
+                <MudIcon Icon="@Icons.Material.Filled.Terminal" Size="Size.Small" />
+                <MudText Typo="Typo.h6" Style="font-weight: 600; letter-spacing: 0.02em;">Hypera</MudText>
+            </MudLink>
 
-        <MudSpacer />
+            <MudSpacer />
 
-        <MudMenu Icon="@Icons.Material.Filled.Translate"
-                 Color="Color.Inherit"
-                 Dense="true"
-                 AnchorOrigin="Origin.BottomRight"
-                 TransformOrigin="Origin.TopRight"
-                 AriaLabel="@Ui.T("nav.language")">
-            @foreach (LocaleInfo locale in Ui.AvailableLocales)
+            <MudMenu Icon="@Icons.Material.Filled.Translate"
+                     Color="Color.Inherit"
+                     Dense="true"
+                     AnchorOrigin="Origin.BottomRight"
+                     TransformOrigin="Origin.TopRight"
+                     AriaLabel="@Ui.T("nav.language")">
+                @foreach (LocaleInfo locale in Ui.AvailableLocales)
+                {
+                    bool active = string.Equals(locale.Code, Ui.UiLanguage, StringComparison.OrdinalIgnoreCase);
+                    <MudMenuItem OnClick="@(() => OnSelectLanguageAsync(locale.Code))">
+                        <div class="d-flex align-center justify-space-between gap-4" style="min-width: 140px;">
+                            <MudText Typo="Typo.body2" Style="@(active ? "font-weight: 600;" : "")">
+                                @locale.NativeName
+                            </MudText>
+                            @if (active)
+                            {
+                                <MudIcon Icon="@Icons.Material.Filled.Check" Size="Size.Small" Color="Color.Primary" />
+                            }
+                        </div>
+                    </MudMenuItem>
+                }
+            </MudMenu>
+
+            <MudIconButton Icon="@(Ui.IsDarkMode ? Icons.Material.Filled.LightMode : Icons.Material.Filled.DarkMode)"
+                           Color="Color.Inherit"
+                           OnClick="@OnToggleThemeAsync"
+                           title="@(Ui.IsDarkMode ? Ui.T("nav.themeLight") : Ui.T("nav.themeDark"))" />
+
+            @if (Ui.IsMultiUserServer)
             {
-                bool active = string.Equals(locale.Code, Ui.UiLanguage, StringComparison.OrdinalIgnoreCase);
-                <MudMenuItem OnClick="@(() => OnSelectLanguageAsync(locale.Code))">
-                    <div class="d-flex align-center justify-space-between gap-4" style="min-width: 140px;">
-                        <MudText Typo="Typo.body2" Style="@(active ? "font-weight: 600;" : "")">
-                            @locale.NativeName
-                        </MudText>
-                        @if (active)
-                        {
-                            <MudIcon Icon="@Icons.Material.Filled.Check" Size="Size.Small" Color="Color.Primary" />
-                        }
-                    </div>
-                </MudMenuItem>
-            }
-        </MudMenu>
-
-        <MudIconButton Icon="@(Ui.IsDarkMode ? Icons.Material.Filled.LightMode : Icons.Material.Filled.DarkMode)"
-                       Color="Color.Inherit"
-                       OnClick="@OnToggleThemeAsync"
-                       title="@(Ui.IsDarkMode ? Ui.T("nav.themeLight") : Ui.T("nav.themeDark"))" />
-
-        @if (Ui.IsMultiUserServer)
-        {
-            @if (Ui.IsAuthenticated)
-            {
-                <MudMenu Dense="true"
-                         AnchorOrigin="Origin.BottomRight"
-                         TransformOrigin="Origin.TopRight">
-                    <ActivatorContent>
-                        <MudButton Color="Color.Inherit"
-                                   Variant="Variant.Text"
-                                   Size="Size.Small"
-                                   StartIcon="@Icons.Material.Filled.Person"
-                                   Class="text-none ml-1">
-                            @Ui.CurrentUser!.Username
-                        </MudButton>
-                    </ActivatorContent>
-                    <ChildContent>
-                        <MudMenuItem Icon="@Icons.Material.Filled.Settings" Href="/settings">
-                            @Ui.T("nav.settings")
-                        </MudMenuItem>
-                        @if (Ui.ShowAdminNav)
-                        {
-                            <MudMenuItem Icon="@Icons.Material.Filled.AdminPanelSettings" Href="/admin">
-                                @Ui.T("nav.admin")
+                @if (Ui.IsAuthenticated)
+                {
+                    <MudMenu Dense="true"
+                             AnchorOrigin="Origin.BottomRight"
+                             TransformOrigin="Origin.TopRight">
+                        <ActivatorContent>
+                            <MudButton Color="Color.Inherit"
+                                       Variant="Variant.Text"
+                                       Size="Size.Small"
+                                       StartIcon="@Icons.Material.Filled.Person"
+                                       Class="text-none ml-1">
+                                @Ui.CurrentUser!.Username
+                            </MudButton>
+                        </ActivatorContent>
+                        <ChildContent>
+                            <MudMenuItem Icon="@Icons.Material.Filled.Settings" Href="/settings">
+                                @Ui.T("nav.settings")
                             </MudMenuItem>
-                        }
-                        <MudDivider />
-                        <MudMenuItem Icon="@Icons.Material.Filled.Logout" OnClick="@OnLogout">
-                            @Ui.T("auth.logout")
-                        </MudMenuItem>
-                    </ChildContent>
-                </MudMenu>
+                            @if (Ui.ShowAdminNav)
+                            {
+                                <MudMenuItem Icon="@Icons.Material.Filled.AdminPanelSettings" Href="/admin">
+                                    @Ui.T("nav.admin")
+                                </MudMenuItem>
+                            }
+                            <MudDivider />
+                            <MudMenuItem Icon="@Icons.Material.Filled.Logout" OnClick="@OnLogout">
+                                @Ui.T("auth.logout")
+                            </MudMenuItem>
+                        </ChildContent>
+                    </MudMenu>
+                }
+                else
+                {
+                    <MudButton Color="Color.Inherit"
+                               Variant="Variant.Text"
+                               Size="Size.Small"
+                               Href="/login"
+                               Class="text-none ml-1">
+                        @Ui.T("auth.login")
+                    </MudButton>
+                    <MudButton Color="Color.Primary"
+                               Variant="Variant.Filled"
+                               Size="Size.Small"
+                               Href="/register"
+                               Class="text-none ml-1">
+                        @Ui.T("auth.register")
+                    </MudButton>
+                }
             }
-            else
-            {
-                <MudButton Color="Color.Inherit"
-                           Variant="Variant.Text"
-                           Size="Size.Small"
-                           Href="/login"
-                           Class="text-none ml-1">
-                    @Ui.T("auth.login")
-                </MudButton>
-                <MudButton Color="Color.Primary"
-                           Variant="Variant.Filled"
-                           Size="Size.Small"
-                           Href="/register"
-                           Class="text-none ml-1">
-                    @Ui.T("auth.register")
-                </MudButton>
-            }
-        }
-    </MudAppBar>
+        </MudAppBar>
 
-    <MudDrawer @bind-Open="_drawerOpen"
-               Elevation="1"
-               Variant="DrawerVariant.Responsive"
-               ClipMode="DrawerClipMode.Always">
-        <MudNavMenu Class="pt-2">
-            <MudNavLink Href="/" Match="NavLinkMatch.All" Icon="@Icons.Material.Filled.Apps">
-                @Ui.T("nav.catalog")
-            </MudNavLink>
-            <MudNavLink Href="/settings" Icon="@Icons.Material.Filled.Settings">
-                @Ui.T("nav.settings")
-            </MudNavLink>
-            @if (Ui.ShowAdminNav)
-            {
-                <MudNavLink Href="/admin" Icon="@Icons.Material.Filled.AdminPanelSettings">
-                    @Ui.T("nav.admin")
+        <MudDrawer @bind-Open="_drawerOpen"
+                   Elevation="1"
+                   Variant="@(Ui.IsPlayStageActive ? DrawerVariant.Temporary : DrawerVariant.Responsive)"
+                   ClipMode="DrawerClipMode.Always">
+            <MudNavMenu Class="pt-2">
+                <MudNavLink Href="/" Match="NavLinkMatch.All" Icon="@Icons.Material.Filled.Apps">
+                    @(Ui.IsLocalSingleUser ? Ui.T("nav.library") : Ui.T("nav.catalog"))
                 </MudNavLink>
-            }
-        </MudNavMenu>
-    </MudDrawer>
+                <MudNavLink Href="/settings" Icon="@Icons.Material.Filled.Settings">
+                    @Ui.T("nav.settings")
+                </MudNavLink>
+                @if (Ui.ShowAdminNav)
+                {
+                    <MudNavLink Href="/admin" Icon="@Icons.Material.Filled.AdminPanelSettings">
+                        @Ui.T("nav.admin")
+                    </MudNavLink>
+                }
+            </MudNavMenu>
+        </MudDrawer>
+    }
 
-    <MudMainContent>
-        <MudContainer MaxWidth="MaxWidth.ExtraLarge" Class="py-4">
+    <MudMainContent Class="@MainContentClass">
+        @if (Ui.IsPlayStageActive)
+        {
             @Body
-        </MudContainer>
+        }
+        else
+        {
+            <MudContainer MaxWidth="MaxWidth.ExtraLarge" Class="py-5 px-4">
+                <div class="hypera-page-shell">
+                    @Body
+                </div>
+            </MudContainer>
+        }
     </MudMainContent>
 </MudLayout>
 
 @code {
     private bool _drawerOpen = true;
+    private bool _wasPlayStageActive;
+
+    private string MainContentClass =>
+        Ui.IsFullscreen
+            ? "hypera-main-fullscreen"
+            : Ui.IsPlayStageActive
+                ? "hypera-main-play"
+                : string.Empty;
 
     protected override async Task OnInitializedAsync()
     {
@@ -169,6 +189,8 @@
         }
     }
 
+    private void ToggleDrawer() => _drawerOpen = !_drawerOpen;
+
     private async Task OnSelectLanguageAsync(string localeCode)
     {
         await Ui.SetUiLanguageAsync(localeCode);
@@ -194,6 +216,12 @@
 
     private void OnUiChanged()
     {
+        if (Ui.IsPlayStageActive != _wasPlayStageActive)
+        {
+            _wasPlayStageActive = Ui.IsPlayStageActive;
+            _drawerOpen = !Ui.IsPlayStageActive;
+        }
+
         _ = InvokeAsync(StateHasChanged);
     }
 

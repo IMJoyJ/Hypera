@@ -89,4 +89,20 @@ public interface IAppCatalogService
         Guid appId,
         IReadOnlyList<Guid> versionIdsOldestToNewest,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Permanently deletes an app and its version/submission metadata along with unreferenced package files.
+    /// </summary>
+    Task DeleteAppAsync(
+        Guid actorUserId,
+        Guid appId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Permanently deletes a single version within an app and compacts remaining <see cref="GameVersion.OrderIndex"/> values.
+    /// </summary>
+    Task DeleteVersionAsync(
+        Guid actorUserId,
+        Guid versionId,
+        CancellationToken cancellationToken = default);
 }

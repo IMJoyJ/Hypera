@@ -42,6 +42,7 @@ public sealed class GraphicsSurface : IDisposable
 {
     private SKBitmap _bitmap;
     private SKCanvas _canvas;
+    private long _mutationVersion = 1;
     private bool _disposed;
 
     public GraphicsSurface(
@@ -109,6 +110,16 @@ public sealed class GraphicsSurface : IDisposable
     public int Width => _disposed ? 0 : _bitmap.Width;
     public int Height => _disposed ? 0 : _bitmap.Height;
     public bool IsDisposed => _disposed;
+
+    /// <summary>
+    /// Instance-scoped monotonic counter incremented whenever pixel content on this surface changes.
+    /// Used by remote/hybrid UI hosts to invalidate cached surface and dynamic sprite textures accurately.
+    /// </summary>
+    public long MutationVersion => Volatile.Read(ref _mutationVersion);
+
+    internal long InstanceToken { get; set; }
+
+    private void MarkMutated() => Interlocked.Increment(ref _mutationVersion);
 
     public SKBitmap Bitmap
     {
@@ -184,6 +195,7 @@ public sealed class GraphicsSurface : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _canvas.Clear(color);
+        MarkMutated();
     }
 
     public void ClearRect(int x, int y, int width, int height, uint argb) =>
@@ -205,6 +217,7 @@ public sealed class GraphicsSurface : IDisposable
             IsAntialias = false,
         };
         _canvas.DrawRect(x, y, width, height, paint);
+        MarkMutated();
     }
 
     public bool SetPixelColor(int x, int y, uint argb)
@@ -216,6 +229,7 @@ public sealed class GraphicsSurface : IDisposable
         }
 
         _bitmap.SetPixel(x, y, RenderingColor.FromArgb(argb));
+        MarkMutated();
         return true;
     }
 
@@ -256,6 +270,7 @@ public sealed class GraphicsSurface : IDisposable
             IsAntialias = false,
         };
         _canvas.DrawRect(x, y, width, height, paint);
+        MarkMutated();
     }
 
     public void DrawLine(int x1, int y1, int x2, int y2)
@@ -263,6 +278,7 @@ public sealed class GraphicsSurface : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         using var paint = CreatePenPaint();
         _canvas.DrawLine(x1, y1, x2, y2, paint);
+        MarkMutated();
     }
 
     /// <summary>
@@ -425,6 +441,7 @@ public sealed class GraphicsSurface : IDisposable
         }
 
         _bitmap.NotifyPixelsChanged();
+        MarkMutated();
     }
 
     /// <summary>
@@ -450,6 +467,7 @@ public sealed class GraphicsSurface : IDisposable
         SKSamplingOptions sampling = ResolveSampling(samplingMode, isScaled: true);
         _canvas.DrawImage(img, 0f, 0f, sampling);
         _canvas.Restore();
+        MarkMutated();
     }
 
     /// <summary>
@@ -474,6 +492,7 @@ public sealed class GraphicsSurface : IDisposable
         SKSamplingOptions sampling = ResolveSampling(samplingMode, isScaled: true);
         _canvas.DrawImage(img, 0f, 0f, sampling);
         _canvas.Restore();
+        MarkMutated();
     }
 
     /// <summary>
@@ -505,6 +524,7 @@ public sealed class GraphicsSurface : IDisposable
             {
                 using var fallbackPaint = new SKPaint { Color = BrushColor, Style = SKPaintStyle.Fill, IsAntialias = !isCrisp };
                 _canvas.DrawText(text, drawX, baselineY, SKTextAlign.Left, skFont, fallbackPaint);
+                MarkMutated();
             }
 
             return;
@@ -519,12 +539,14 @@ public sealed class GraphicsSurface : IDisposable
                 IsAntialias = !isCrisp,
             };
             _canvas.DrawPath(path, fillPaint);
+            MarkMutated();
         }
 
         if (PenWidth > 0f && PenColor.Alpha > 0)
         {
             using var strokePaint = CreatePenPaint(antialiased: !isCrisp);
             _canvas.DrawPath(path, strokePaint);
+            MarkMutated();
         }
     }
 
@@ -567,6 +589,7 @@ public sealed class GraphicsSurface : IDisposable
         }
 
         _bitmap.NotifyPixelsChanged();
+        MarkMutated();
     }
 
     public byte[] EncodeToPng()
@@ -600,6 +623,7 @@ public sealed class GraphicsSurface : IDisposable
         using SKImage img = SKImage.FromBitmap(source);
         SKSamplingOptions sampling = ResolveSampling(samplingMode, isScaled);
         _canvas.DrawImage(img, srcRect, destRect, sampling, paint);
+        MarkMutated();
     }
 
     private SKPaint CreatePenPaint(bool antialiased = true)

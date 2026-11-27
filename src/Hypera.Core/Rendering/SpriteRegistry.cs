@@ -44,6 +44,7 @@ public sealed class SpriteDefinition
     public int PosY { get; set; }
     public bool IsAnimated { get; }
     public bool IsDynamic { get; }
+    public long Version { get; internal set; }
     public IReadOnlyList<SpriteFrameSpec> Frames => _frames;
 
     internal void AddFrame(SpriteFrameSpec frame)
@@ -106,6 +107,7 @@ public sealed class SpriteRegistry : IDisposable
     private long _maxDecodedCacheBytes = DefaultMaxDecodedCacheBytes;
     private long _currentDecodedBytes;
     private int _animatedSpriteCount;
+    private long _nextDefinitionVersion;
     private bool _disposed;
 
     public int Count => _sprites.Count;
@@ -229,6 +231,7 @@ public sealed class SpriteRegistry : IDisposable
             _animatedSpriteCount = Math.Max(0, _animatedSpriteCount - 1);
         }
 
+        def.Version = ++_nextDefinitionVersion;
         _sprites[key] = def;
         if (def.IsAnimated)
         {
@@ -478,6 +481,7 @@ public sealed class SpriteRegistry : IDisposable
 
         RecordSpriteBeforeMutation(key);
         def.AddFrame(new SpriteFrameSpec(null, graphicsId, SKRectI.Create(x, y, width, height), posX, posY, Math.Max(1, delayMs)));
+        def.Version = ++_nextDefinitionVersion;
         return true;
     }
 
@@ -590,6 +594,7 @@ public sealed class SpriteRegistry : IDisposable
         RecordSpriteBeforeMutation(name.Trim());
         d.PosX = posX;
         d.PosY = posY;
+        d.Version = ++_nextDefinitionVersion;
         return true;
     }
 
@@ -603,6 +608,48 @@ public sealed class SpriteRegistry : IDisposable
         RecordSpriteBeforeMutation(name.Trim());
         d.PosX += deltaX;
         d.PosY += deltaY;
+        d.Version = ++_nextDefinitionVersion;
+        return true;
+    }
+
+    /// <summary>
+    /// Computes an instance-unique content version for sprite <paramref name="name"/>, folding in both
+    /// sprite definition rebindings and pixel mutations of any referenced <see cref="GraphicsSurface"/>.
+    /// </summary>
+    public bool TryGetAssetVersion(
+        string? name,
+        GraphicsManager? graphics,
+        out long version,
+        out bool isDynamic)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!TryGetDefinition(name, out SpriteDefinition def))
+        {
+            version = 0;
+            isDynamic = false;
+            return false;
+        }
+
+        bool hasGraphicsBacking = false;
+        ulong hash = 14695981039346656037UL;
+        hash = (hash ^ (ulong)def.Version) * 1099511628211UL;
+
+        for (int i = 0; i < def.Frames.Count; i++)
+        {
+            SpriteFrameSpec frame = def.Frames[i];
+            if (frame.GraphicsId.HasValue)
+            {
+                hasGraphicsBacking = true;
+                hash = (hash ^ (ulong)(uint)frame.GraphicsId.Value) * 1099511628211UL;
+                if (graphics is not null && graphics.TryGetSurfaceVersion(frame.GraphicsId.Value, out long surfVer))
+                {
+                    hash = (hash ^ (ulong)surfVer) * 1099511628211UL;
+                }
+            }
+        }
+
+        isDynamic = def.IsDynamic || hasGraphicsBacking;
+        version = unchecked((long)hash);
         return true;
     }
 

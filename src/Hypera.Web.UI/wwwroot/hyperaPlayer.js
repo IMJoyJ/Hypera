@@ -8,6 +8,7 @@
     const assetUrls = new Map();
     const registeredFonts = new Set();
     const scalers = new WeakMap();
+    let fullscreenCleanup = null;
 
     // 10 SE channels + 1 BGM channel
     const seChannels = new Array(10).fill(null).map(() => ({
@@ -96,15 +97,16 @@
         return new Blob([buffer], { type: mimeType || "application/octet-stream" });
     }
 
-    function computeScale(wrapperEl, stageEl, logicalWidth, logicalHeight) {
+    function computeScale(wrapperEl, stageEl, logicalWidth, logicalHeight, paddingPx) {
         if (!wrapperEl || !stageEl || logicalWidth <= 0 || logicalHeight <= 0) {
             return 1;
         }
+        const pad = typeof paddingPx === "number" && paddingPx >= 0 ? paddingPx : 4;
         const rect = wrapperEl.getBoundingClientRect();
-        const availW = Math.max(1, rect.width - 8);
-        const availH = Math.max(1, rect.height - 8);
+        const availW = Math.max(1, rect.width - pad * 2);
+        const availH = Math.max(1, rect.height - pad * 2);
         const scale = Math.min(availW / logicalWidth, availH / logicalHeight);
-        const clamped = Math.max(0.1, scale);
+        const clamped = Math.max(0.05, scale);
 
         stageEl.style.width = `${logicalWidth}px`;
         stageEl.style.height = `${logicalHeight}px`;
@@ -114,8 +116,8 @@
 
         const container = stageEl.parentElement;
         if (container && container.classList.contains("hypera-stage-box")) {
-            container.style.width = `${Math.round(logicalWidth * clamped)}px`;
-            container.style.height = `${Math.round(logicalHeight * clamped)}px`;
+            container.style.width = `${Math.floor(logicalWidth * clamped)}px`;
+            container.style.height = `${Math.floor(logicalHeight * clamped)}px`;
         }
         return clamped;
     }
@@ -155,22 +157,39 @@
             };
         },
 
-        attachStageScaler(wrapperEl, stageEl, logicalWidth, logicalHeight) {
+        attachStageScaler(wrapperEl, stageEl, logicalWidth, logicalHeight, paddingPx) {
             if (!wrapperEl || !stageEl) {
                 return;
             }
             this.detachStageScaler(wrapperEl);
-            const update = () => computeScale(wrapperEl, stageEl, logicalWidth, logicalHeight);
-            update();
+            let rafId = 0;
+            const runNow = () => {
+                rafId = 0;
+                computeScale(wrapperEl, stageEl, logicalWidth, logicalHeight, paddingPx);
+            };
+            const schedule = () => {
+                if (!rafId) {
+                    rafId = requestAnimationFrame(runNow);
+                }
+            };
 
+            runNow();
+
+            let ro = null;
             if (typeof ResizeObserver !== "undefined") {
-                const ro = new ResizeObserver(update);
+                ro = new ResizeObserver(schedule);
                 ro.observe(wrapperEl);
-                scalers.set(wrapperEl, { ro, update });
-            } else {
-                window.addEventListener("resize", update);
-                scalers.set(wrapperEl, { ro: null, update });
             }
+            window.addEventListener("resize", schedule);
+            if (window.visualViewport) {
+                window.visualViewport.addEventListener("resize", schedule);
+            }
+
+            scalers.set(wrapperEl, {
+                ro,
+                schedule,
+                cancelRaf: () => { if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } }
+            });
         },
 
         detachStageScaler(wrapperEl) {
@@ -181,12 +200,84 @@
             if (!entry) {
                 return;
             }
+            entry.cancelRaf();
             if (entry.ro) {
                 entry.ro.disconnect();
-            } else {
-                window.removeEventListener("resize", entry.update);
+            }
+            window.removeEventListener("resize", entry.schedule);
+            if (window.visualViewport) {
+                window.visualViewport.removeEventListener("resize", entry.schedule);
             }
             scalers.delete(wrapperEl);
+        },
+
+        isDocumentFullscreen() {
+            return !!(document.fullscreenElement || document.webkitFullscreenElement);
+        },
+
+        async setDocumentFullscreen(enter) {
+            try {
+                if (enter) {
+                    if (!this.isDocumentFullscreen()) {
+                        const root = document.documentElement;
+                        if (root.requestFullscreen) {
+                            await root.requestFullscreen();
+                        } else if (root.webkitRequestFullscreen) {
+                            await root.webkitRequestFullscreen();
+                        }
+                    }
+                    return true;
+                } else {
+                    if (this.isDocumentFullscreen()) {
+                        if (document.exitFullscreen) {
+                            await document.exitFullscreen();
+                        } else if (document.webkitExitFullscreen) {
+                            await document.webkitExitFullscreen();
+                        }
+                    }
+                    return false;
+                }
+            } catch (_) {
+                return !!enter;
+            }
+        },
+
+        registerPlayKeyAndFullscreenHooks(dotNetRef) {
+            this.unregisterPlayKeyAndFullscreenHooks();
+            if (!dotNetRef) {
+                return;
+            }
+
+            const onFullscreenChange = () => {
+                const active = this.isDocumentFullscreen();
+                dotNetRef.invokeMethodAsync("OnDocumentFullscreenChanged", active).catch(() => {});
+            };
+
+            const onKeyDown = (ev) => {
+                if (ev.key === "F11") {
+                    ev.preventDefault();
+                    dotNetRef.invokeMethodAsync("OnFullscreenShortcutAsync").catch(() => {});
+                } else if (ev.key === "Escape") {
+                    dotNetRef.invokeMethodAsync("OnEscapeShortcutAsync").catch(() => {});
+                }
+            };
+
+            document.addEventListener("fullscreenchange", onFullscreenChange);
+            document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+            window.addEventListener("keydown", onKeyDown, true);
+
+            fullscreenCleanup = () => {
+                document.removeEventListener("fullscreenchange", onFullscreenChange);
+                document.removeEventListener("webkitfullscreenchange", onFullscreenChange);
+                window.removeEventListener("keydown", onKeyDown, true);
+            };
+        },
+
+        unregisterPlayKeyAndFullscreenHooks() {
+            if (fullscreenCleanup) {
+                fullscreenCleanup();
+                fullscreenCleanup = null;
+            }
         },
 
         getLogicalCoords(stageEl, clientX, clientY, logicalWidth, logicalHeight) {
@@ -253,12 +344,13 @@
                 return null;
             }
             const existing = assetUrls.get(assetKey);
-            if (existing) {
-                URL.revokeObjectURL(existing);
-            }
             const blob = await streamRefToBlob(streamRef, mimeType || "image/png");
             const url = URL.createObjectURL(blob);
             assetUrls.set(assetKey, url);
+            // Delay revoking previous blob URL so in-flight <img> elements transition seamlessly without flicker.
+            if (existing) {
+                setTimeout(() => URL.revokeObjectURL(existing), 600);
+            }
             return url;
         },
 
@@ -362,7 +454,11 @@
 
         focusElement(el) {
             if (el && typeof el.focus === "function") {
-                el.focus();
+                try {
+                    el.focus({ preventScroll: true });
+                } catch (_) {
+                    el.focus();
+                }
             }
         },
 

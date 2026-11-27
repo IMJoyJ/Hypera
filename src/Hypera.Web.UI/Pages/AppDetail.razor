@@ -14,7 +14,7 @@
                Size="Size.Small"
                StartIcon="@Icons.Material.Filled.ArrowBack"
                Href="/">
-        @Ui.T("appDetail.backToCatalog")
+        @(Ui.IsLocalSingleUser ? Ui.T("appDetail.backToLibrary") : Ui.T("appDetail.backToCatalog"))
     </MudButton>
 </div>
 
@@ -28,79 +28,105 @@ else if (_app is null)
 }
 else
 {
-    <div class="d-flex flex-wrap align-start justify-space-between gap-3 mb-4">
-        <div>
-            <div class="d-flex flex-wrap align-center gap-2">
-                <MudText Typo="Typo.h4" Style="font-weight: 600;">@_app.Title</MudText>
-                @if (!_app.IsPublicPool)
+    bool canManageApp = Ui.IsAuthenticated
+        && (Ui.IsLocalSingleUser || Ui.IsAdmin || _app.CreatedByUserId == Ui.CurrentUser?.Id);
+
+    int attentionBuilds = _allSubmissions.Count(static s =>
+        s.Status is SubmissionStatus.Compiling or SubmissionStatus.CompileFailed);
+
+    @* Hero Card: Metadata + Primary Actions + Smart Launch Bar *@
+    <MudPaper Outlined="true" Class="hypera-section-card mb-4">
+        <div class="d-flex flex-wrap align-start justify-space-between gap-3">
+            <div style="min-width: 0; flex: 1 1 280px;">
+                <div class="d-flex flex-wrap align-center gap-2">
+                    <MudText Typo="Typo.h5" Style="font-weight: 600;">@_app.Title</MudText>
+                    @if (!Ui.IsLocalSingleUser && !_app.IsPublicPool)
+                    {
+                        <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Filled">
+                            @Ui.T("catalog.privatePending")
+                        </MudChip>
+                    }
+                    @if (_app.IsUnlistedOrDeleted)
+                    {
+                        <MudChip T="string" Size="Size.Small" Color="Color.Error" Variant="Variant.Outlined">
+                            @Ui.T("catalog.unlisted")
+                        </MudChip>
+                    }
+                </div>
+
+                @if (!Ui.IsLocalSingleUser && _app.ForkedFromAppId.HasValue)
                 {
-                    <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Filled">
-                        @Ui.T("catalog.privatePending")
-                    </MudChip>
+                    <div class="d-flex align-center gap-1 mt-1">
+                        <MudIcon Icon="@Icons.Material.Filled.AccountTree" Size="Size.Small" Color="Color.Secondary" />
+                        <MudText Typo="Typo.caption" Color="Color.Secondary">@Ui.T("catalog.forkedFrom"):</MudText>
+                        <MudLink Href="@($"/apps/{_app.ForkedFromAppId}")" Typo="Typo.caption">
+                            @(_app.ForkedFromApp?.Title ?? _app.ForkedFromAppId.ToString())
+                        </MudLink>
+                    </div>
                 }
-                @if (_app.IsUnlistedOrDeleted)
+
+                @if (!string.IsNullOrWhiteSpace(_app.Summary))
                 {
-                    <MudChip T="string" Size="Size.Small" Color="Color.Error" Variant="Variant.Outlined">
-                        @Ui.T("catalog.unlisted")
-                    </MudChip>
+                    <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mt-2">@_app.Summary</MudText>
                 }
             </div>
 
-            @if (_app.ForkedFromAppId.HasValue)
-            {
-                <div class="d-flex align-center gap-1 mt-1">
-                    <MudIcon Icon="@Icons.Material.Filled.AccountTree" Size="Size.Small" Color="Color.Secondary" />
-                    <MudText Typo="Typo.caption" Color="Color.Secondary">@Ui.T("catalog.forkedFrom"):</MudText>
-                    <MudLink Href="@($"/apps/{_app.ForkedFromAppId}")" Typo="Typo.caption">
-                        @(_app.ForkedFromApp?.Title ?? _app.ForkedFromAppId.ToString())
-                    </MudLink>
-                </div>
-            }
-
-            @if (!string.IsNullOrWhiteSpace(_app.Summary))
-            {
-                <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mt-2">@_app.Summary</MudText>
-            }
-        </div>
-
-        <div class="d-flex flex-wrap gap-2">
             @if (Ui.IsAuthenticated)
             {
-                <MudButton Variant="Variant.Outlined"
-                           Size="Size.Small"
-                           StartIcon="@Icons.Material.Filled.Save"
-                           Href="@($"/apps/{AppId}/saves")">
-                    @Ui.T("saves.title")
-                </MudButton>
-                <MudButton Variant="Variant.Outlined"
-                           Size="Size.Small"
-                           StartIcon="@Icons.Material.Filled.NewReleases"
-                           OnClick="@OpenSubmitVersionDialogAsync">
-                    @Ui.T("appDetail.newVersion")
-                </MudButton>
-                @if (_orderedVersions.Count > 0)
-                {
+                <div class="d-flex flex-wrap align-center gap-1">
                     <MudButton Variant="Variant.Outlined"
                                Size="Size.Small"
-                               StartIcon="@Icons.Material.Filled.Translate"
-                               OnClick="@(() => OpenAddVariantDialogAsync(null, null))">
-                        @Ui.T("appDetail.addVariant")
+                               StartIcon="@Icons.Material.Filled.Add"
+                               OnClick="@OpenSubmitVersionDialogAsync">
+                        @(Ui.IsLocalSingleUser ? Ui.T("appDetail.importNewVersion") : Ui.T("appDetail.newVersion"))
                     </MudButton>
-                    <MudButton Variant="Variant.Outlined"
-                               Size="Size.Small"
-                               StartIcon="@Icons.Material.Filled.CallSplit"
-                               OnClick="@OpenForkDialogAsync">
-                        @Ui.T("appDetail.fork")
-                    </MudButton>
-                }
+                    @if (_orderedVersions.Count > 0)
+                    {
+                        <MudButton Variant="Variant.Outlined"
+                                   Size="Size.Small"
+                                   StartIcon="@Icons.Material.Filled.Translate"
+                                   OnClick="@(() => OpenAddVariantDialogAsync(null, null))">
+                            @(Ui.IsLocalSingleUser ? Ui.T("appDetail.importVariant") : Ui.T("appDetail.addVariant"))
+                        </MudButton>
+                    }
+                    @if (!Ui.IsLocalSingleUser && _orderedVersions.Count > 0)
+                    {
+                        <MudButton Variant="Variant.Outlined"
+                                   Size="Size.Small"
+                                   StartIcon="@Icons.Material.Filled.CallSplit"
+                                   OnClick="@OpenForkDialogAsync">
+                            @Ui.T("appDetail.fork")
+                        </MudButton>
+                    }
+                    @if (canManageApp && _orderedVersions.Count >= 2)
+                    {
+                        <MudTooltip Text="@Ui.T("admin.reorderVersions")">
+                            <MudIconButton Icon="@Icons.Material.Filled.SwapVert"
+                                           Size="Size.Small"
+                                           OnClick="@OpenReorderVersionsDialogAsync" />
+                        </MudTooltip>
+                    }
+                    @if (canManageApp)
+                    {
+                        <MudTooltip Text="@Ui.T("appDetail.editApp")">
+                            <MudIconButton Icon="@Icons.Material.Filled.Edit"
+                                           Size="Size.Small"
+                                           OnClick="@OpenEditAppDialogAsync" />
+                        </MudTooltip>
+                        <MudTooltip Text="@Ui.T("appDetail.deleteApp")">
+                            <MudIconButton Icon="@Icons.Material.Filled.DeleteOutline"
+                                           Size="Size.Small"
+                                           Color="Color.Error"
+                                           OnClick="@DeleteAppAsync" />
+                        </MudTooltip>
+                    }
+                </div>
             }
         </div>
-    </div>
 
-    @* Smart Launch Bar *@
-    @if (_playableVersions.Count > 0)
-    {
-        <MudPaper Outlined="true" Class="pa-4 mb-5">
+        @if (_playableVersions.Count > 0)
+        {
+            <MudDivider Class="my-4" />
             <div class="d-flex flex-wrap align-center gap-3">
                 <MudSelect T="Guid"
                            Value="_selectedVersionId"
@@ -108,7 +134,7 @@ else
                            Label="@Ui.T("appDetail.launchVersion")"
                            Variant="Variant.Outlined"
                            Margin="Margin.Dense"
-                           Style="min-width: 180px;">
+                           Style="min-width: 170px; max-width: 240px;">
                     @foreach (GameVersion ver in _playableVersions)
                     {
                         <MudSelectItem Value="@ver.Id">@ver.VersionLabel</MudSelectItem>
@@ -120,7 +146,7 @@ else
                            Label="@Ui.T("appDetail.launchLanguage")"
                            Variant="Variant.Outlined"
                            Margin="Margin.Dense"
-                           Style="min-width: 170px;">
+                           Style="min-width: 170px; max-width: 240px;">
                     @foreach (string lang in PlayableLanguagesForSelectedVersion)
                     {
                         <MudSelectItem Value="@lang">@FormatHelpers.GetLanguageLabel(lang, Ui.Localizer)</MudSelectItem>
@@ -143,110 +169,143 @@ else
 
                 <MudButton Variant="Variant.Filled"
                            Color="Color.Primary"
+                           Size="Size.Medium"
                            StartIcon="@Icons.Material.Filled.PlayArrow"
                            Disabled="@(!Ui.IsAuthenticated || _selectedVersionId == Guid.Empty || string.IsNullOrWhiteSpace(_selectedLanguageCode))"
                            OnClick="@LaunchSelected">
                     @Ui.T("appDetail.launch")
                 </MudButton>
             </div>
-        </MudPaper>
-    }
+        }
+    </MudPaper>
 
-    @* Version Chain (OrderIndex newest-to-oldest) *@
-    <MudText Typo="Typo.h6" Class="mb-3" Style="font-weight: 600;">@Ui.T("version.title")</MudText>
-
-    @if (_orderedVersions.Count == 0)
-    {
-        <MudPaper Outlined="true" Class="pa-4 mb-5">
-            <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("appDetail.noVersions")</MudText>
-        </MudPaper>
-    }
-    else
-    {
-        <MudStack Spacing="2" Class="mb-6">
-            @foreach (GameVersion ver in _orderedVersions)
+    @* Clean Tabbed Body: Versions | Builds & Diagnostics | Saves *@
+    <MudTabs @bind-ActivePanelIndex="_activeTab"
+             Elevation="0"
+             Outlined="true"
+             Rounded="true"
+             ApplyEffectsToContainer="true"
+             PanelClass="pa-4">
+        <MudTabPanel Text="@Ui.T("appDetail.tabVersions")"
+                     BadgeData="@(_orderedVersions.Count > 0 ? _orderedVersions.Count : null)"
+                     BadgeColor="Color.Default">
+            @if (_orderedVersions.Count == 0)
             {
-                <MudPaper Outlined="true" Class="pa-4">
-                    <div class="d-flex flex-wrap align-center justify-space-between gap-2 mb-2">
-                        <div class="d-flex align-center gap-2">
-                            <MudText Typo="Typo.subtitle1" Style="font-weight: 600;">@ver.VersionLabel</MudText>
-                            <MudText Typo="Typo.caption" Color="Color.Secondary">
-                                @FormatHelpers.FormatUtc(ver.CreatedAtUtc)
-                            </MudText>
-                        </div>
-
-                        @if (Ui.IsAuthenticated)
-                        {
-                            <MudButton Variant="Variant.Text"
-                                       Size="Size.Small"
-                                       StartIcon="@Icons.Material.Filled.Upload"
-                                       OnClick="@(() => OpenAddVariantDialogAsync(ver.Id, null))">
-                                @Ui.T("appDetail.addVariant")
-                            </MudButton>
-                        }
-                    </div>
-
-                    @if (!string.IsNullOrWhiteSpace(ver.Changelog))
-                    {
-                        <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mb-3" Style="white-space: pre-wrap;">@ver.Changelog</MudText>
-                    }
-
-                    <div class="d-flex flex-wrap align-center gap-2">
-                        @foreach (GameLanguageVariant variant in ver.Variants.OrderBy(static x => x.LanguageCode, StringComparer.OrdinalIgnoreCase))
-                        {
-                            GameLanguageSubmission? activeSub = variant.ActiveSubmission
-                                ?? ver.Submissions.FirstOrDefault(s => s.Id == variant.ActiveSubmissionId);
-                            bool isPublished = activeSub is not null && activeSub.Status == SubmissionStatus.Published;
-                            bool canDownload = activeSub is not null
-                                && Ui.IsAuthenticated
-                                && (activeSub.AllowSourceDownload
-                                    || activeSub.UploadedByUserId == Ui.CurrentUser!.Id
-                                    || Ui.IsAdmin);
-
-                            <MudPaper Outlined="true" Class="px-2 py-1 d-flex align-center gap-2">
-                                <MudChip T="string"
-                                         Size="Size.Small"
-                                         Variant="@(isPublished ? Variant.Filled : Variant.Outlined)"
-                                         Color="@(isPublished ? Color.Primary : Color.Default)">
-                                    @variant.LanguageCode
-                                </MudChip>
-
-                                @if (isPublished && Ui.IsAuthenticated)
-                                {
-                                    <MudIconButton Icon="@Icons.Material.Filled.PlayArrow"
-                                                   Size="Size.Small"
-                                                   Color="Color.Primary"
-                                                   title="@Ui.T("app.play")"
-                                                   OnClick="@(() => LaunchExplicit(ver.Id, variant.LanguageCode))" />
-                                }
-
-                                @if (canDownload && activeSub is not null)
-                                {
-                                    <MudTooltip Text="@Ui.T("appDetail.sourceDownloadTooltip")">
-                                        <MudIconButton Icon="@Icons.Material.Filled.Download"
-                                                       Size="Size.Small"
-                                                       Color="Color.Secondary"
-                                                       OnClick="@(() => DownloadSourceAsync(activeSub, ver.VersionLabel))" />
-                                    </MudTooltip>
-                                }
-                            </MudPaper>
-                        }
-                    </div>
+                <MudPaper Outlined="true" Class="pa-6 text-center">
+                    <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("appDetail.noVersions")</MudText>
                 </MudPaper>
             }
-        </MudStack>
-    }
+            else
+            {
+                <MudStack Spacing="2">
+                    @foreach (GameVersion ver in _orderedVersions)
+                    {
+                        <MudPaper Outlined="true" Class="pa-3">
+                            <div class="d-flex flex-wrap align-center justify-space-between gap-2 mb-2">
+                                <div class="d-flex align-center gap-2">
+                                    <MudText Typo="Typo.subtitle1" Style="font-weight: 600;">@ver.VersionLabel</MudText>
+                                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                        @FormatHelpers.FormatUtc(ver.CreatedAtUtc)
+                                    </MudText>
+                                </div>
 
-    @* Live Submissions & Localized Build Diagnostics *@
-    <div class="d-flex align-center justify-space-between mb-3">
-        <MudText Typo="Typo.h6" Style="font-weight: 600;">@Ui.T("appDetail.submissions")</MudText>
-        <MudIconButton Icon="@Icons.Material.Filled.Refresh"
-                       Size="Size.Small"
-                       OnClick="@LoadDetailAsync"
-                       title="@Ui.T("app.refresh")" />
-    </div>
+                                @if (Ui.IsAuthenticated)
+                                {
+                                    <div class="d-flex align-center gap-1">
+                                        <MudButton Variant="Variant.Text"
+                                                   Size="Size.Small"
+                                                   StartIcon="@Icons.Material.Filled.Upload"
+                                                   OnClick="@(() => OpenAddVariantDialogAsync(ver.Id, null))">
+                                            @(Ui.IsLocalSingleUser ? Ui.T("appDetail.importVariant") : Ui.T("appDetail.addVariant"))
+                                        </MudButton>
+                                        @if (canManageApp)
+                                        {
+                                            <MudTooltip Text="@Ui.T("appDetail.deleteVersion")">
+                                                <MudIconButton Icon="@Icons.Material.Filled.DeleteOutline"
+                                                               Size="Size.Small"
+                                                               Color="Color.Error"
+                                                               OnClick="@(() => DeleteVersionAsync(ver))" />
+                                            </MudTooltip>
+                                        }
+                                    </div>
+                                }
+                            </div>
 
-    <SubmissionDiagnosticsPanel Submissions="@_allSubmissions" />
+                            @if (!string.IsNullOrWhiteSpace(ver.Changelog))
+                            {
+                                <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mb-3" Style="white-space: pre-wrap;">@ver.Changelog</MudText>
+                            }
+
+                            <div class="d-flex flex-wrap align-center gap-2">
+                                @foreach (GameLanguageVariant variant in ver.Variants.OrderBy(static x => x.LanguageCode, StringComparer.OrdinalIgnoreCase))
+                                {
+                                    GameLanguageSubmission? activeSub = variant.ActiveSubmission
+                                        ?? ver.Submissions.FirstOrDefault(s => s.Id == variant.ActiveSubmissionId);
+                                    bool isPublished = activeSub is not null && activeSub.Status == SubmissionStatus.Published;
+                                    bool canDownload = activeSub is not null
+                                        && !string.IsNullOrWhiteSpace(activeSub.SourceZipStoragePath)
+                                        && Ui.IsAuthenticated
+                                        && (activeSub.AllowSourceDownload
+                                            || activeSub.UploadedByUserId == Ui.CurrentUser!.Id
+                                            || Ui.IsAdmin);
+
+                                    <MudPaper Outlined="true" Class="px-2 py-1 d-flex align-center gap-1">
+                                        <MudChip T="string"
+                                                 Size="Size.Small"
+                                                 Variant="@(isPublished ? Variant.Filled : Variant.Outlined)"
+                                                 Color="@(isPublished ? Color.Primary : Color.Default)">
+                                            @variant.LanguageCode
+                                        </MudChip>
+
+                                        @if (isPublished && Ui.IsAuthenticated)
+                                        {
+                                            <MudTooltip Text="@Ui.T("app.play")">
+                                                <MudIconButton Icon="@Icons.Material.Filled.PlayArrow"
+                                                               Size="Size.Small"
+                                                               Color="Color.Primary"
+                                                               OnClick="@(() => LaunchExplicit(ver.Id, variant.LanguageCode))" />
+                                            </MudTooltip>
+                                        }
+
+                                        @if (!Ui.IsLocalSingleUser && canDownload && activeSub is not null)
+                                        {
+                                            <MudTooltip Text="@Ui.T("appDetail.sourceDownloadTooltip")">
+                                                <MudIconButton Icon="@Icons.Material.Filled.Download"
+                                                               Size="Size.Small"
+                                                               Color="Color.Secondary"
+                                                               OnClick="@(() => DownloadSourceAsync(activeSub, ver.VersionLabel))" />
+                                            </MudTooltip>
+                                        }
+                                    </MudPaper>
+                                }
+                            </div>
+                        </MudPaper>
+                    }
+                </MudStack>
+            }
+        </MudTabPanel>
+
+        <MudTabPanel Text="@Ui.T("appDetail.tabBuilds")"
+                     BadgeData="@(attentionBuilds > 0 ? attentionBuilds : null)"
+                     BadgeColor="@(_allSubmissions.Any(static s => s.Status == SubmissionStatus.CompileFailed) ? Color.Error : Color.Info)">
+            <div class="d-flex justify-end mb-2">
+                <MudButton Variant="Variant.Text"
+                           Size="Size.Small"
+                           StartIcon="@Icons.Material.Filled.Refresh"
+                           OnClick="@LoadDetailAsync">
+                    @Ui.T("app.refresh")
+                </MudButton>
+            </div>
+            <SubmissionDiagnosticsPanel Submissions="@_allSubmissions" OnRecompiled="@LoadDetailAsync" />
+        </MudTabPanel>
+
+        @if (Ui.IsAuthenticated)
+        {
+            <MudTabPanel Text="@Ui.T("appDetail.tabSaves")">
+                <SaveManagerPanel AppId="@AppId" UserId="@Ui.CurrentUser!.Id" />
+            </MudTabPanel>
+        }
+    </MudTabs>
 }
 
 @code {
@@ -260,6 +319,7 @@ else
     private ResolvedLaunchTarget? _resolvedTarget;
     private Guid _selectedVersionId;
     private string _selectedLanguageCode = string.Empty;
+    private int _activeTab;
     private bool _loading = true;
     private CancellationTokenSource? _pollCts;
 
@@ -293,7 +353,12 @@ else
 
     private async Task LoadDetailAsync()
     {
-        _loading = true;
+        bool initialLoad = _app is null;
+        if (initialLoad)
+        {
+            _loading = true;
+        }
+
         try
         {
             _app = await CatalogService.GetAppDetailAsync(AppId, Ui.CurrentUser?.Id);
@@ -333,6 +398,14 @@ else
             {
                 _selectedVersionId = _playableVersions[0].Id;
                 _selectedLanguageCode = PlayableLanguagesForSelectedVersion.FirstOrDefault() ?? string.Empty;
+            }
+
+            // If there are no playable builds yet and a build is compiling or failed, focus Builds tab on initial open.
+            if (initialLoad
+                && _playableVersions.Count == 0
+                && _allSubmissions.Any(static s => s.Status is SubmissionStatus.Compiling or SubmissionStatus.CompileFailed))
+            {
+                _activeTab = 1;
             }
 
             if (_allSubmissions.Any(static s => s.Status == SubmissionStatus.Compiling))
@@ -397,6 +470,109 @@ else
         }
     }
 
+    private async Task OpenEditAppDialogAsync()
+    {
+        if (!Ui.IsAuthenticated || _app is null)
+        {
+            return;
+        }
+
+        var parameters = new DialogParameters<EditAppDialog>
+        {
+            { x => x.App, _app },
+            { x => x.UserId, Ui.CurrentUser!.Id },
+        };
+
+        IDialogReference dialog = await DialogService.ShowAsync<EditAppDialog>(Ui.T("appDetail.editApp"), parameters);
+        DialogResult? result = await dialog.Result;
+        if (result is { Canceled: false })
+        {
+            await LoadDetailAsync();
+        }
+    }
+
+    private async Task DeleteAppAsync()
+    {
+        if (!Ui.IsAuthenticated || _app is null)
+        {
+            return;
+        }
+
+        bool? confirmed = await DialogService.ShowMessageBox(
+            Ui.T("appDetail.deleteApp"),
+            Ui.T("appDetail.deleteAppConfirm", _app.Title),
+            yesText: Ui.T("app.delete"),
+            cancelText: Ui.T("app.cancel"));
+
+        if (confirmed != true)
+        {
+            return;
+        }
+
+        try
+        {
+            await CatalogService.DeleteAppAsync(Ui.CurrentUser!.Id, _app.Id);
+            Snackbar.Add(Ui.T("appDetail.appDeleted"), Severity.Success);
+            Navigation.NavigateTo("/");
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+    }
+
+    private async Task DeleteVersionAsync(GameVersion ver)
+    {
+        if (!Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        bool? confirmed = await DialogService.ShowMessageBox(
+            Ui.T("appDetail.deleteVersion"),
+            Ui.T("appDetail.deleteVersionConfirm", ver.VersionLabel),
+            yesText: Ui.T("app.delete"),
+            cancelText: Ui.T("app.cancel"));
+
+        if (confirmed != true)
+        {
+            return;
+        }
+
+        try
+        {
+            await CatalogService.DeleteVersionAsync(Ui.CurrentUser!.Id, ver.Id);
+            Snackbar.Add(Ui.T("appDetail.versionDeleted"), Severity.Success);
+            await LoadDetailAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+    }
+
+    private async Task OpenReorderVersionsDialogAsync()
+    {
+        if (!Ui.IsAuthenticated || _app is null)
+        {
+            return;
+        }
+
+        var parameters = new DialogParameters<ReorderVersionsDialog>
+        {
+            { x => x.AppId, _app.Id },
+            { x => x.AdminUserId, Ui.CurrentUser!.Id },
+            { x => x.Versions, _orderedVersions },
+        };
+
+        IDialogReference dialog = await DialogService.ShowAsync<ReorderVersionsDialog>(Ui.T("admin.reorderVersions"), parameters);
+        DialogResult? result = await dialog.Result;
+        if (result is { Canceled: false })
+        {
+            await LoadDetailAsync();
+        }
+    }
+
     private async Task OpenSubmitVersionDialogAsync()
     {
         if (!Ui.IsAuthenticated)
@@ -411,7 +587,15 @@ else
             { x => x.ExistingVersions, _orderedVersions },
         };
 
-        IDialogReference dialog = await DialogService.ShowAsync<SubmitVersionDialog>(Ui.T("appDetail.newVersion"), parameters);
+        var options = new DialogOptions
+        {
+            MaxWidth = MaxWidth.Medium,
+            FullWidth = true,
+            CloseOnEscapeKey = true,
+        };
+
+        string title = Ui.IsLocalSingleUser ? Ui.T("appDetail.importNewVersion") : Ui.T("appDetail.newVersion");
+        IDialogReference dialog = await DialogService.ShowAsync<SubmitVersionDialog>(title, parameters, options);
         DialogResult? result = await dialog.Result;
         if (result is { Canceled: false })
         {
@@ -434,7 +618,15 @@ else
             { x => x.DefaultLanguageCode, lang },
         };
 
-        IDialogReference dialog = await DialogService.ShowAsync<AddVariantDialog>(Ui.T("appDetail.addVariant"), parameters);
+        var options = new DialogOptions
+        {
+            MaxWidth = MaxWidth.Medium,
+            FullWidth = true,
+            CloseOnEscapeKey = true,
+        };
+
+        string title = Ui.IsLocalSingleUser ? Ui.T("appDetail.importVariant") : Ui.T("appDetail.addVariant");
+        IDialogReference dialog = await DialogService.ShowAsync<AddVariantDialog>(title, parameters, options);
         DialogResult? result = await dialog.Result;
         if (result is { Canceled: false })
         {
@@ -480,7 +672,11 @@ else
                 using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
                 while (await timer.WaitForNextTickAsync(token))
                 {
-                    await InvokeAsync(LoadDetailAsync);
+                    await InvokeAsync(async () =>
+                    {
+                        await LoadDetailAsync();
+                        StateHasChanged();
+                    });
                 }
             }
             catch (OperationCanceledException)

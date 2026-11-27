@@ -90,5 +90,23 @@ public sealed class PlatformSettings
 
     public long MaxSaveQuotaBytesPerApp { get; set; } = DefaultMaxSaveQuotaBytesPerApp;
 
+    /// <summary>
+    /// Optional JSON-serialized <see cref="Hypera.Configuration.CompilerOptionsOverride"/> used as default
+    /// compilation overrides when uploading or importing packages.
+    /// </summary>
+    public string? DefaultCompilerOptionsJson { get; set; }
+
+    /// <summary>
+    /// Optional user-configured maximum undo checkpoints per session; <see langword="null"/> inherits
+    /// <see cref="PlatformHostOptions.MaxUndoSteps"/>.
+    /// </summary>
+    public int? MaxUndoSteps { get; set; }
+
+    /// <summary>
+    /// Optional user-configured automatic rollback on runtime fault/timeout; <see langword="null"/> inherits
+    /// <see cref="PlatformHostOptions.AutoRollbackOnError"/>.
+    /// </summary>
+    public bool? AutoRollbackOnError { get; set; }
+
     public DateTime UpdatedAtUtc { get; set; } = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 }

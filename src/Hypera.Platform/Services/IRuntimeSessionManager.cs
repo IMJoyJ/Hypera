@@ -36,7 +36,9 @@ public sealed record SessionAssetPayload(
     string FileName,
     int Width = 0,
     int Height = 0,
-    bool IsAnimated = false);
+    bool IsAnimated = false,
+    bool IsDynamic = false,
+    long ContentVersion = 0);
 
 public sealed record RuntimeSessionRenderState(
     RuntimeSessionSummary Summary,
@@ -46,7 +48,10 @@ public sealed record RuntimeSessionRenderState(
     WebAudioStateSnapshot Audio,
     IReadOnlyList<SessionFontDescriptor> CustomFonts,
     string? FaultMessage = null,
-    bool AutoRolledBackOnFault = false);
+    bool AutoRolledBackOnFault = false,
+    IReadOnlyDictionary<string, long>? DynamicAssetVersions = null,
+    int ScrollOffsetLines = 0,
+    int MaxScrollOffsetLines = 0);
 
 public sealed record SessionHitTestActionResult(
     ConsoleHitTestResult HitTest,
@@ -117,6 +122,18 @@ public interface IRuntimeSessionManager
         Guid userId,
         CancellationToken cancellationToken = default);
 
+    Task<RuntimeSessionSnapshot> StepYieldedSessionAsync(
+        Guid sessionId,
+        Guid userId,
+        CancellationToken cancellationToken = default);
+
+    Task<RuntimeSessionSnapshot> ScrollSessionAsync(
+        Guid sessionId,
+        Guid userId,
+        int deltaLines,
+        bool scrollToBottom = false,
+        CancellationToken cancellationToken = default);
+
     Task<byte[]> RenderFramePngAsync(
         Guid sessionId,
         Guid userId,
@@ -127,6 +144,10 @@ public interface IRuntimeSessionManager
     Task<bool> StopSessionAsync(
         Guid sessionId,
         Guid userId,
+        CancellationToken cancellationToken = default);
+
+    Task<int> StopSessionsForAppAsync(
+        Guid appId,
         CancellationToken cancellationToken = default);
 
     Task<int> EvictIdleSessionsAsync(

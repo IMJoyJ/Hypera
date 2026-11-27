@@ -168,13 +168,13 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 session.Host.Engine.SubmitInput(input);
                 if (session.Host.Engine.Status == EngineStepStatus.Running)
                 {
-                    ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, _hostOptions.AutoRollbackOnError);
+                    ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, session.AutoRollbackOnError);
                 }
             }
             else if (session.Host.Engine.Status is EngineStepStatus.Running or EngineStepStatus.Yielded)
             {
                 session.ClearFaultNotice();
-                ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, _hostOptions.AutoRollbackOnError);
+                ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, session.AutoRollbackOnError);
             }
 
             return session.BuildSnapshot();
@@ -212,6 +212,62 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         }
     }
 
+    public async Task<RuntimeSessionSnapshot> StepYieldedSessionAsync(
+        Guid sessionId,
+        Guid userId,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ManagedSession session = RequireActiveSession(sessionId, userId);
+        int maxInstructions = await GetMaxStepInstructionsAsync(cancellationToken).ConfigureAwait(false);
+
+        await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(session.IsDisposed, session);
+            session.Touch();
+
+            if (session.EffectiveStatus != EngineStepStatus.Faulted &&
+                session.Host.Engine.Status is EngineStepStatus.Yielded or EngineStepStatus.Running)
+            {
+                session.ClearFaultNotice();
+                ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, session.AutoRollbackOnError);
+            }
+
+            return session.BuildSnapshot();
+        }
+        finally
+        {
+            session.Gate.Release();
+        }
+    }
+
+    public async Task<RuntimeSessionSnapshot> ScrollSessionAsync(
+        Guid sessionId,
+        Guid userId,
+        int deltaLines,
+        bool scrollToBottom = false,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ManagedSession session = RequireActiveSession(sessionId, userId);
+
+        await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(session.IsDisposed, session);
+            session.Touch();
+
+            VirtualConsoleBuffer buffer = session.Host.Engine.ConsoleBuffer;
+            buffer.ScrollOffsetLines = scrollToBottom ? 0 : buffer.ScrollOffsetLines + deltaLines;
+            return session.BuildSnapshot();
+        }
+        finally
+        {
+            session.Gate.Release();
+        }
+    }
+
     public async Task<RuntimeSessionRenderState?> GetSessionRenderStateAsync(
         Guid sessionId,
         Guid userId,
@@ -240,6 +296,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             ConsoleScene scene = engine.ConsoleBuffer.CaptureScene(elapsedAnimationMs: elapsedAnimationMs);
             float[] lineTops = ConsoleHitTester.ComputeVisibleLineTops(scene);
             WebAudioStateSnapshot audio = session.AudioTracker.CaptureState(afterAudioEventSequence);
+            Dictionary<string, long> dynamicVersions = CollectDynamicAssetVersions(scene, engine.Graphics, engine.Sprites);
 
             return new RuntimeSessionRenderState(
                 Summary: session.BuildSummary(),
@@ -249,7 +306,10 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 Audio: audio,
                 CustomFonts: session.CustomFonts,
                 FaultMessage: session.EffectiveFaultMessage,
-                AutoRolledBackOnFault: session.LastFaultAutoRolledBack);
+                AutoRolledBackOnFault: session.LastFaultAutoRolledBack,
+                DynamicAssetVersions: dynamicVersions,
+                ScrollOffsetLines: engine.ConsoleBuffer.ScrollOffsetLines,
+                MaxScrollOffsetLines: engine.ConsoleBuffer.MaxScrollOffsetLines);
         }
         finally
         {
@@ -337,7 +397,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     submitted = engine.Status == EngineStepStatus.Running;
                     if (submitted)
                     {
-                        ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, _hostOptions.AutoRollbackOnError);
+                        ExecuteTurnWithBudgetLocked(session, maxInstructions, _hostOptions.StepWallClockTimeout, session.AutoRollbackOnError);
                     }
                 }
             }
@@ -414,6 +474,37 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         }
     }
 
+    public async Task<int> StopSessionsForAppAsync(
+        Guid appId,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        List<ManagedSession> matches = _sessionsById.Values
+            .Where(s => !s.IsDisposed && s.AppId == appId)
+            .ToList();
+
+        int stopped = 0;
+        foreach (ManagedSession match in matches)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            SemaphoreSlim userAppGate = GetUserAppGate(match.UserId, match.AppId);
+            await userAppGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (!match.IsDisposed && await RemoveAndDisposeSessionAsync(match).ConfigureAwait(false))
+                {
+                    stopped++;
+                }
+            }
+            finally
+            {
+                userAppGate.Release();
+            }
+        }
+
+        return stopped;
+    }
+
     public async Task<int> EvictIdleSessionsAsync(
         TimeSpan idleTimeout,
         CancellationToken cancellationToken = default)
@@ -470,6 +561,8 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         }
 
         int maxInstructions;
+        int effectiveMaxUndoSteps;
+        bool effectiveAutoRollback;
         await using (HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false))
         {
             AppUser user = await AppCatalogService.EnsureActiveUserAsync(db, userId, cancellationToken).ConfigureAwait(false);
@@ -492,6 +585,8 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 .ConfigureAwait(false)
                 ?? new PlatformSettings();
             maxInstructions = settings.MaxStepInstructionsPerTurn;
+            effectiveMaxUndoSteps = Math.Max(0, settings.MaxUndoSteps ?? _hostOptions.MaxUndoSteps);
+            effectiveAutoRollback = settings.AutoRollbackOnError ?? _hostOptions.AutoRollbackOnError;
         }
 
         bool isAutoResolveRequest = !explicitVersionId.HasValue && string.IsNullOrWhiteSpace(explicitLanguageCode);
@@ -575,7 +670,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     ownsVfs: true,
                     options: loadOptions,
                     preloadedModule: sharedPackage.Module);
-                host.Engine.MaxUndoSteps = Math.Max(0, _hostOptions.MaxUndoSteps);
+                host.Engine.MaxUndoSteps = effectiveMaxUndoSteps;
 
                 if (allowSharpPlugins)
                 {
@@ -596,10 +691,11 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                     audioTracker: audioTracker,
                     yieldDetector: yieldDetector,
                     customFonts: customFonts,
+                    autoRollbackOnError: effectiveAutoRollback,
                     pluginManager: pluginManager,
                     extractedPluginsDir: extractedPluginsTempDir);
 
-                ExecuteTurnWithBudgetLocked(managed, maxInstructions, _hostOptions.StepWallClockTimeout, _hostOptions.AutoRollbackOnError);
+                ExecuteTurnWithBudgetLocked(managed, maxInstructions, _hostOptions.StepWallClockTimeout, effectiveAutoRollback);
 
                 _sessionsById[newSessionId] = managed;
                 _activeSessionByUserApp[(userId, appId)] = newSessionId;
@@ -840,13 +936,16 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             if (int.TryParse(assetKey[(colon + 1)..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int gId) &&
                 engine.Graphics.TryGetSurface(gId, out GraphicsSurface surface))
             {
+                engine.Graphics.TryGetSurfaceVersion(gId, out long surfVer);
                 return new SessionAssetPayload(
                     Data: surface.EncodeToPng(),
                     MimeType: "image/png",
                     FileName: $"g_{gId}.png",
                     Width: surface.Width,
                     Height: surface.Height,
-                    IsAnimated: false);
+                    IsAnimated: false,
+                    IsDynamic: true,
+                    ContentVersion: surfVer);
             }
 
             return null;
@@ -861,6 +960,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             }
 
             bool isAnim = engine.Sprites.TryGetDefinition(spriteName, out SpriteDefinition def) && def.IsAnimated;
+            engine.Sprites.TryGetAssetVersion(spriteName, engine.Graphics, out long spriteVer, out bool isDyn);
             byte[] png = EncodeSpriteFramePng(frame);
             return new SessionAssetPayload(
                 Data: png,
@@ -868,7 +968,9 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
                 FileName: $"{spriteName}.png",
                 Width: frame.LogicalWidth,
                 Height: frame.LogicalHeight,
-                IsAnimated: isAnim);
+                IsAnimated: isAnim,
+                IsDynamic: isDyn,
+                ContentVersion: spriteVer);
         }
 
         if (assetKey.StartsWith("font:", StringComparison.OrdinalIgnoreCase))
@@ -949,6 +1051,107 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         var dst = new SKRect(0, 0, w, h);
         canvas.DrawImage(srcImg, src, dst, SkiaFrameCompositor.CrispSampling);
         return ImageCodecDecoder.EncodeToPng(cropped);
+    }
+
+    private static Dictionary<string, long> CollectDynamicAssetVersions(
+        ConsoleScene scene,
+        GraphicsManager graphics,
+        SpriteRegistry sprites)
+    {
+        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+        void RecordKey(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return;
+            }
+
+            string trimmed = raw.Trim();
+            if (trimmed.StartsWith("g:", StringComparison.OrdinalIgnoreCase) ||
+                trimmed.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase))
+            {
+                int colon = trimmed.IndexOf(':');
+                if (int.TryParse(trimmed[(colon + 1)..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int gId) &&
+                    graphics.TryGetSurfaceVersion(gId, out long surfVer))
+                {
+                    result[trimmed] = surfVer;
+                }
+
+                return;
+            }
+
+            if (trimmed.StartsWith("vfs:", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            string spriteName = trimmed.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase)
+                ? trimmed["sprite:".Length..].Trim()
+                : trimmed;
+            string canonicalKey = $"sprite:{spriteName}";
+            if (result.ContainsKey(canonicalKey))
+            {
+                return;
+            }
+
+            if (sprites.TryGetAssetVersion(spriteName, graphics, out long spriteVer, out bool isDynamic) && isDynamic)
+            {
+                result[canonicalKey] = spriteVer;
+            }
+        }
+
+        void VisitLines(IReadOnlyList<ConsoleLine> lines)
+        {
+            for (int i = 0; i < lines.Count; i++)
+            {
+                IReadOnlyList<ConsoleRenderPart> parts = lines[i].Parts;
+                for (int p = 0; p < parts.Count; p++)
+                {
+                    ConsoleRenderPart part = parts[p];
+                    if (part.Kind == ConsolePartKind.Image)
+                    {
+                        RecordKey(part.ImageSrc);
+                        RecordKey(part.ImageSrcHover);
+                    }
+                    else if (part.Kind == ConsolePartKind.Div && part.Div is not null)
+                    {
+                        VisitLines(part.Div.Children);
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < scene.BackgroundImages.Count; i++)
+        {
+            RecordKey(scene.BackgroundImages[i].SpriteName);
+        }
+
+        for (int i = 0; i < scene.CbgLayers.Count; i++)
+        {
+            CbgLayer cbg = scene.CbgLayers[i];
+            if (!string.IsNullOrWhiteSpace(cbg.SpriteName))
+            {
+                RecordKey(cbg.SpriteName);
+            }
+            else if (cbg.GraphicsId.HasValue)
+            {
+                RecordKey($"g:{cbg.GraphicsId.Value}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(cbg.HoverSpriteName))
+            {
+                RecordKey(cbg.HoverSpriteName);
+            }
+        }
+
+        VisitLines(scene.VisibleLines);
+        for (int i = 0; i < scene.IslandLayers.Count; i++)
+        {
+            VisitLines(scene.IslandLayers[i].Lines);
+        }
+
+        return result;
     }
 
     private static IReadOnlyList<SessionFontDescriptor> DiscoverCustomFonts(IVirtualFileSystem vfs)
@@ -1239,6 +1442,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             WebAudioTracker audioTracker,
             TurnYieldDetector yieldDetector,
             IReadOnlyList<SessionFontDescriptor> customFonts,
+            bool autoRollbackOnError,
             PluginManager? pluginManager,
             string? extractedPluginsDir)
         {
@@ -1253,6 +1457,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
             AudioTracker = audioTracker;
             YieldDetector = yieldDetector;
             CustomFonts = customFonts;
+            AutoRollbackOnError = autoRollbackOnError;
             _pluginManager = pluginManager;
             _extractedPluginsDir = extractedPluginsDir;
 
@@ -1273,6 +1478,7 @@ public sealed class RuntimeSessionManager : IRuntimeSessionManager, IDisposable
         public TurnYieldDetector YieldDetector { get; }
         public IReadOnlyList<SessionFontDescriptor> CustomFonts { get; }
         public DateTime CreatedAtUtc { get; }
+        public bool AutoRollbackOnError { get; }
         public SemaphoreSlim Gate { get; } = new(1, 1);
 
         public bool IsDisposed => Volatile.Read(ref _disposed);

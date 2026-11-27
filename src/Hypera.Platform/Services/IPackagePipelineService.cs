@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Text.Json;
+using Hypera.Configuration;
 using Hypera.Diagnostics;
 using Hypera.Localization;
 using Hypera.Platform.Domain;
@@ -12,7 +13,23 @@ public sealed record PackageUploadRequest(
     Guid UploadedByUserId,
     bool AllowSourceDownload,
     Stream ZipArchiveStream,
-    long? DeclaredByteLength = null);
+    long? DeclaredByteLength = null,
+    CompilerOptionsOverride? CompilerOptions = null);
+
+public sealed record LocalPackageFileImportRequest(
+    Guid VersionId,
+    string LanguageCode,
+    Guid UploadedByUserId,
+    string FilePath,
+    CompilerOptionsOverride? CompilerOptions = null,
+    bool ForceRecompile = false);
+
+public sealed record LocalDirectoryImportRequest(
+    Guid VersionId,
+    string LanguageCode,
+    Guid UploadedByUserId,
+    string DirectoryPath,
+    CompilerOptionsOverride? CompilerOptions = null);
 
 /// <summary>
 /// Structured compiler diagnostic payload persisted in <see cref="GameLanguageSubmission.DiagnosticsJson"/>.
@@ -133,6 +150,32 @@ public interface IPackagePipelineService
     /// </summary>
     Task<GameLanguageSubmission> SubmitZipPackageAsync(
         PackageUploadRequest request,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Imports a local <c>.zip</c> or pre-packaged <c>.hep</c> file directly from disk without WebView stream buffering.
+    /// Intended for <see cref="PlatformHostMode.SingleUserLocalAdmin"/> and local administrator imports.
+    /// </summary>
+    Task<GameLanguageSubmission> SubmitLocalFileAsync(
+        LocalPackageFileImportRequest request,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Compiles and imports an unpacked local game folder directly into an immutable <c>.hep</c> package.
+    /// Intended for <see cref="PlatformHostMode.SingleUserLocalAdmin"/> and local administrator imports.
+    /// </summary>
+    Task<GameLanguageSubmission> SubmitLocalDirectoryAsync(
+        LocalDirectoryImportRequest request,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Creates a new compilation job from an existing submission's source archive, compiled <c>.hep</c>, or local source
+    /// directory using the supplied <paramref name="compilerOptions"/> override.
+    /// </summary>
+    Task<GameLanguageSubmission> RecompileSubmissionAsync(
+        Guid actorUserId,
+        Guid submissionId,
+        CompilerOptionsOverride? compilerOptions = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>

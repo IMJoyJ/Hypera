@@ -56,6 +56,10 @@ public sealed class UiSessionState : IDisposable
 
     public bool ShowAdminNav => IsMultiUserServer && IsAdmin;
 
+    public bool IsPlayStageActive { get; private set; }
+
+    public bool IsFullscreen { get; private set; }
+
     public bool IsInitialized { get; private set; }
 
     public IReadOnlyList<LocaleInfo> AvailableLocales => _localizer.AvailableLocales;
@@ -152,6 +156,33 @@ public sealed class UiSessionState : IDisposable
     }
 
     public void ToggleDarkMode() => SetDarkMode(!IsDarkMode);
+
+    public void SetPlayStageActive(bool active)
+    {
+        if (IsPlayStageActive == active)
+        {
+            return;
+        }
+
+        IsPlayStageActive = active;
+        if (!active && IsFullscreen)
+        {
+            IsFullscreen = false;
+        }
+
+        NotifyChanged();
+    }
+
+    public void SetFullscreen(bool fullscreen)
+    {
+        if (IsFullscreen == fullscreen)
+        {
+            return;
+        }
+
+        IsFullscreen = fullscreen;
+        NotifyChanged();
+    }
 
     private async Task<AppUser?> ResolveUserFromPrincipalAsync(ClaimsPrincipal principal, CancellationToken cancellationToken)
     {

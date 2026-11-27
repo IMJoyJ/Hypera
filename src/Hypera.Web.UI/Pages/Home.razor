@@ -5,10 +5,20 @@
 @inject IDialogService DialogService
 @inject NavigationManager Navigation
 
-<div class="d-flex flex-wrap align-center justify-space-between gap-3 mb-4">
-    <MudText Typo="Typo.h5" Style="font-weight: 600;">@Ui.T("catalog.title")</MudText>
-
+<div class="hypera-page-header">
     <div class="d-flex align-center gap-2">
+        <MudText Typo="Typo.h5" Style="font-weight: 600;">
+            @(Ui.IsLocalSingleUser ? Ui.T("catalog.libraryTitle") : Ui.T("catalog.title"))
+        </MudText>
+        @if (!_loading && _apps.Count > 0)
+        {
+            <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined" Color="Color.Secondary">
+                @Ui.T("catalog.gameCount", _apps.Count.ToString())
+            </MudChip>
+        }
+    </div>
+
+    <div class="d-flex flex-wrap align-center gap-2">
         <MudTextField @bind-Value="_search"
                       Placeholder="@Ui.T("app.search")"
                       Adornment="Adornment.Start"
@@ -25,7 +35,7 @@
                        Color="Color.Primary"
                        StartIcon="@Icons.Material.Filled.Add"
                        OnClick="@OpenCreateDialogAsync">
-                @Ui.T("catalog.newApp")
+                @(Ui.IsLocalSingleUser ? Ui.T("catalog.importGame") : Ui.T("catalog.newApp"))
             </MudButton>
         }
         else if (Ui.IsMultiUserServer)
@@ -46,8 +56,24 @@
 }
 else if (FilteredApps.Count == 0)
 {
-    <MudPaper Outlined="true" Class="pa-8 text-center">
-        <MudText Typo="Typo.body1" Color="Color.Secondary">@Ui.T("catalog.empty")</MudText>
+    <MudPaper Outlined="true" Class="pa-10 text-center">
+        <MudStack AlignItems="AlignItems.Center" Spacing="3">
+            <MudIcon Icon="@Icons.Material.Filled.LibraryBooks" Size="Size.Large" Color="Color.Secondary" />
+            <MudText Typo="Typo.body1" Color="Color.Secondary" Style="max-width: 480px;">
+                @(Ui.IsLocalSingleUser && string.IsNullOrWhiteSpace(_search)
+                    ? Ui.T("catalog.emptyLocalHint")
+                    : Ui.T("catalog.empty"))
+            </MudText>
+            @if (Ui.IsAuthenticated && string.IsNullOrWhiteSpace(_search))
+            {
+                <MudButton Variant="Variant.Filled"
+                           Color="Color.Primary"
+                           StartIcon="@Icons.Material.Filled.Add"
+                           OnClick="@OpenCreateDialogAsync">
+                    @(Ui.IsLocalSingleUser ? Ui.T("catalog.importGame") : Ui.T("catalog.newApp"))
+                </MudButton>
+            }
+        </MudStack>
     </MudPaper>
 }
 else
@@ -63,25 +89,52 @@ else
                 .ToList();
 
             bool playable = languages.Count > 0;
+            SubmissionStatus? latestStatus = app.Versions
+                .SelectMany(static v => v.Submissions)
+                .OrderByDescending(static s => s.CreatedAtUtc)
+                .Select(static s => (SubmissionStatus?)s.Status)
+                .FirstOrDefault();
 
             <MudItem xs="12" sm="6" md="4">
-                <MudCard Outlined="true" Class="d-flex flex-column" Style="height: 100%;">
+                <MudCard Outlined="true" Class="hypera-app-card">
                     <MudCardHeader Class="pb-1">
                         <CardHeaderContent>
-                            <div class="d-flex align-center gap-2">
-                                <MudLink Href="@($"/apps/{app.Id}")" Typo="Typo.h6" Underline="Underline.Hover" Color="Color.Default" Style="font-weight: 600;">
-                                    @app.Title
-                                </MudLink>
-                            </div>
+                            <MudLink Href="@($"/apps/{app.Id}")"
+                                     Typo="Typo.h6"
+                                     Underline="Underline.Hover"
+                                     Color="Color.Default"
+                                     Class="hypera-ellipsis d-block"
+                                     Style="font-weight: 600;">
+                                @app.Title
+                            </MudLink>
                         </CardHeaderContent>
                         <CardHeaderActions>
-                            @if (!app.IsPublicPool)
+                            @if (!playable && latestStatus == SubmissionStatus.Compiling)
+                            {
+                                <MudChip T="string" Size="Size.Small" Color="Color.Info" Variant="Variant.Outlined">
+                                    <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-1" Style="width:11px;height:11px;" />
+                                    @Ui.T("catalog.statusCompiling")
+                                </MudChip>
+                            }
+                            else if (!playable && latestStatus == SubmissionStatus.CompileFailed)
+                            {
+                                <MudChip T="string" Size="Size.Small" Color="Color.Error" Variant="Variant.Outlined">
+                                    @Ui.T("catalog.statusFailed")
+                                </MudChip>
+                            }
+                            else if (!Ui.IsLocalSingleUser && !app.IsPublicPool)
                             {
                                 <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Text">
                                     @Ui.T("catalog.privatePending")
                                 </MudChip>
                             }
-                            @if (app.ForkedFromAppId.HasValue)
+                            else if (app.Versions.Count > 0)
+                            {
+                                <MudChip T="string" Size="Size.Small" Color="Color.Default" Variant="Variant.Text">
+                                    @Ui.T("catalog.versionCount", app.Versions.Count.ToString())
+                                </MudChip>
+                            }
+                            @if (!Ui.IsLocalSingleUser && app.ForkedFromAppId.HasValue)
                             {
                                 <MudTooltip Text="@Ui.T("catalog.forkedFrom")">
                                     <MudIcon Icon="@Icons.Material.Filled.AccountTree" Size="Size.Small" Color="Color.Secondary" Class="mt-2 mr-1" />
@@ -91,12 +144,9 @@ else
                     </MudCardHeader>
 
                     <MudCardContent Class="pt-1 flex-grow-1">
-                        @if (!string.IsNullOrWhiteSpace(app.Summary))
-                        {
-                            <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mb-2" Style="display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">
-                                @app.Summary
-                            </MudText>
-                        }
+                        <MudText Typo="Typo.body2" Color="Color.Secondary" Class="hypera-summary-clamp mb-2">
+                            @app.Summary
+                        </MudText>
 
                         <div class="d-flex flex-wrap align-center gap-1 mt-1">
                             @if (playable)
@@ -117,8 +167,10 @@ else
                         </div>
                     </MudCardContent>
 
-                    <MudCardActions Class="px-4 pb-3 pt-0 d-flex justify-space-between">
-                        <div class="d-flex gap-1">
+                    <MudDivider />
+
+                    <MudCardActions Class="px-3 py-2 d-flex align-center justify-space-between">
+                        <div class="d-flex align-center gap-1">
                             <MudButton Variant="Variant.Filled"
                                        Color="Color.Primary"
                                        Size="Size.Small"
@@ -137,11 +189,12 @@ else
 
                         @if (Ui.IsAuthenticated)
                         {
-                            <MudIconButton Icon="@Icons.Material.Filled.Save"
-                                           Size="Size.Small"
-                                           Color="Color.Secondary"
-                                           title="@Ui.T("saves.title")"
-                                           Href="@($"/apps/{app.Id}/saves")" />
+                            <MudTooltip Text="@Ui.T("saves.title")">
+                                <MudIconButton Icon="@Icons.Material.Filled.Save"
+                                               Size="Size.Small"
+                                               Color="Color.Secondary"
+                                               Href="@($"/apps/{app.Id}/saves")" />
+                            </MudTooltip>
                         }
                     </MudCardActions>
                 </MudCard>
@@ -154,6 +207,7 @@ else
     private List<GameApp> _apps = [];
     private string _search = string.Empty;
     private bool _loading = true;
+    private CancellationTokenSource? _pollCts;
 
     private IReadOnlyList<GameApp> FilteredApps
     {
@@ -180,11 +234,21 @@ else
 
     private async Task LoadAppsAsync()
     {
-        _loading = true;
         try
         {
             IReadOnlyList<GameApp> list = await CatalogService.ListVisibleAppsAsync(Ui.CurrentUser?.Id);
             _apps = list.ToList();
+
+            bool anyCompiling = _apps.Any(static a =>
+                a.Versions.Any(static v => v.Submissions.Any(static s => s.Status == SubmissionStatus.Compiling)));
+            if (anyCompiling)
+            {
+                StartPolling();
+            }
+            else
+            {
+                StopPolling();
+            }
         }
         finally
         {
@@ -205,7 +269,15 @@ else
             { x => x.UserId, Ui.CurrentUser!.Id },
         };
 
-        IDialogReference dialog = await DialogService.ShowAsync<CreateAppDialog>(Ui.T("catalog.newApp"), parameters);
+        var options = new DialogOptions
+        {
+            MaxWidth = MaxWidth.Medium,
+            FullWidth = true,
+            CloseOnEscapeKey = true,
+        };
+
+        string title = Ui.IsLocalSingleUser ? Ui.T("catalog.importGame") : Ui.T("catalog.newApp");
+        IDialogReference dialog = await DialogService.ShowAsync<CreateAppDialog>(title, parameters, options);
         DialogResult? result = await dialog.Result;
         if (result is { Canceled: false, Data: Guid createdAppId })
         {
@@ -213,7 +285,53 @@ else
         }
     }
 
+    private void StartPolling()
+    {
+        if (_pollCts is not null)
+        {
+            return;
+        }
+
+        _pollCts = new CancellationTokenSource();
+        CancellationToken token = _pollCts.Token;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2.5));
+                while (await timer.WaitForNextTickAsync(token))
+                {
+                    await InvokeAsync(async () =>
+                    {
+                        await LoadAppsAsync();
+                        StateHasChanged();
+                    });
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on dispose or completion
+            }
+        }, token);
+    }
+
+    private void StopPolling()
+    {
+        if (_pollCts is null)
+        {
+            return;
+        }
+
+        _pollCts.Cancel();
+        _pollCts.Dispose();
+        _pollCts = null;
+    }
+
     private void OnUiChanged() => _ = InvokeAsync(StateHasChanged);
 
-    public void Dispose() => Ui.Changed -= OnUiChanged;
+    public void Dispose()
+    {
+        StopPolling();
+        Ui.Changed -= OnUiChanged;
+    }
 }

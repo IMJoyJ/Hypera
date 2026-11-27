@@ -13,12 +13,14 @@ public sealed class AppCatalogService : IAppCatalogService
     private readonly IDbContextFactory<HyperaDbContext> _dbFactory;
     private readonly PlatformHostOptions _hostOptions;
     private readonly IPackagePipelineService _packagePipeline;
+    private readonly IRuntimeSessionManager? _sessionManager;
     private readonly SemaphoreSlim _versionChainGate = new(1, 1);
 
     public AppCatalogService(
         IDbContextFactory<HyperaDbContext> dbFactory,
         PlatformHostOptions hostOptions,
-        IPackagePipelineService packagePipeline)
+        IPackagePipelineService packagePipeline,
+        IRuntimeSessionManager? sessionManager = null)
     {
         ArgumentNullException.ThrowIfNull(dbFactory);
         ArgumentNullException.ThrowIfNull(hostOptions);
@@ -26,6 +28,7 @@ public sealed class AppCatalogService : IAppCatalogService
         _dbFactory = dbFactory;
         _hostOptions = hostOptions;
         _packagePipeline = packagePipeline;
+        _sessionManager = sessionManager;
     }
 
     public async Task<IReadOnlyList<GameApp>> ListVisibleAppsAsync(
@@ -126,7 +129,7 @@ public sealed class AppCatalogService : IAppCatalogService
             Title = normalizedTitle,
             Summary = (summary ?? string.Empty).Trim(),
             CreatedByUserId = creatorUserId,
-            IsPublicPool = false,
+            IsPublicPool = _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin,
             IsUnlistedOrDeleted = false,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
@@ -176,7 +179,7 @@ public sealed class AppCatalogService : IAppCatalogService
             Title = normalizedTitle,
             Summary = (summary ?? string.Empty).Trim(),
             CreatedByUserId = userId,
-            IsPublicPool = false,
+            IsPublicPool = _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin,
             IsUnlistedOrDeleted = false,
             ForkedFromAppId = sourceApp.Id,
             ForkedFromVersionId = sourceVersion.Id,
@@ -444,6 +447,291 @@ public sealed class AppCatalogService : IAppCatalogService
         finally
         {
             _versionChainGate.Release();
+        }
+    }
+
+    public async Task DeleteAppAsync(
+        Guid actorUserId,
+        Guid appId,
+        CancellationToken cancellationToken = default)
+    {
+        if (_sessionManager is not null)
+        {
+            await _sessionManager.StopSessionsForAppAsync(appId, cancellationToken).ConfigureAwait(false);
+        }
+
+        List<string> candidateStoragePaths = [];
+        await _versionChainGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            await using var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+            AppUser actor = await EnsureActiveUserAsync(db, actorUserId, cancellationToken).ConfigureAwait(false);
+            bool isAdmin = actor.Role == UserRole.Admin || _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin;
+
+            GameApp? app = await db.GameApps
+                .FirstOrDefaultAsync(a => a.Id == appId, cancellationToken)
+                .ConfigureAwait(false);
+            if (app is null)
+            {
+                return;
+            }
+
+            if (!isAdmin && (app.IsPublicPool || app.CreatedByUserId != actorUserId))
+            {
+                throw new UnauthorizedAccessException("Only an administrator can delete this app.");
+            }
+
+            List<GameLanguageSubmission> subs = await db.GameLanguageSubmissions
+                .Where(s => s.Version != null && s.Version.AppId == appId)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            foreach (GameLanguageSubmission sub in subs)
+            {
+                if (!string.IsNullOrWhiteSpace(sub.HepStoragePath))
+                {
+                    candidateStoragePaths.Add(sub.HepStoragePath);
+                }
+
+                if (!string.IsNullOrWhiteSpace(sub.SourceZipStoragePath))
+                {
+                    candidateStoragePaths.Add(sub.SourceZipStoragePath);
+                }
+            }
+
+            // Clear variant active pointers first to avoid FK cycle issues on SQLite delete.
+            List<GameLanguageVariant> variants = await db.GameLanguageVariants
+                .Where(v => v.Version != null && v.Version.AppId == appId)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            foreach (GameLanguageVariant v in variants)
+            {
+                v.ActiveSubmissionId = null;
+            }
+
+            List<GameVersion> versions = await db.GameVersions
+                .Where(v => v.AppId == appId)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            HashSet<Guid> versionIdSet = versions.Select(static v => v.Id).ToHashSet();
+
+            // Clear fork references on other apps pointing to this app or its versions.
+            List<GameApp> forkedChildren = await db.GameApps
+                .Where(a => a.ForkedFromAppId == appId || (a.ForkedFromVersionId != null && versionIdSet.Contains(a.ForkedFromVersionId.Value)))
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            foreach (GameApp child in forkedChildren)
+            {
+                if (child.ForkedFromAppId == appId)
+                {
+                    child.ForkedFromAppId = null;
+                }
+
+                if (child.ForkedFromVersionId.HasValue && versionIdSet.Contains(child.ForkedFromVersionId.Value))
+                {
+                    child.ForkedFromVersionId = null;
+                }
+            }
+
+            List<UserAppLaunchState> launchStates = await db.UserAppLaunchStates
+                .Where(ls => ls.AppId == appId)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (launchStates.Count > 0)
+            {
+                db.UserAppLaunchStates.RemoveRange(launchStates);
+            }
+
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+            // Explicitly delete submissions first because GameLanguageSubmission.Version uses DeleteBehavior.NoAction.
+            if (subs.Count > 0)
+            {
+                db.GameLanguageSubmissions.RemoveRange(subs);
+                await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (variants.Count > 0)
+            {
+                db.GameLanguageVariants.RemoveRange(variants);
+            }
+
+            if (versions.Count > 0)
+            {
+                db.GameVersions.RemoveRange(versions);
+            }
+
+            db.GameApps.Remove(app);
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            await CleanupUnreferencedStoragePathsAsync(db, candidateStoragePaths, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _versionChainGate.Release();
+        }
+    }
+
+    public async Task DeleteVersionAsync(
+        Guid actorUserId,
+        Guid versionId,
+        CancellationToken cancellationToken = default)
+    {
+        List<string> candidateStoragePaths = [];
+        await _versionChainGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            await using var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+            AppUser actor = await EnsureActiveUserAsync(db, actorUserId, cancellationToken).ConfigureAwait(false);
+            bool isAdmin = actor.Role == UserRole.Admin || _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin;
+
+            GameVersion? version = await db.GameVersions
+                .Include(v => v.App)
+                .Include(v => v.Variants)
+                .Include(v => v.Submissions)
+                .FirstOrDefaultAsync(v => v.Id == versionId, cancellationToken)
+                .ConfigureAwait(false);
+            if (version is null)
+            {
+                return;
+            }
+
+            if (!isAdmin && (version.App is { IsPublicPool: true } || version.CreatedByUserId != actorUserId))
+            {
+                throw new UnauthorizedAccessException("Only an administrator can delete this version.");
+            }
+
+            Guid appId = version.AppId;
+            if (_sessionManager is not null)
+            {
+                await _sessionManager.StopSessionsForAppAsync(appId, cancellationToken).ConfigureAwait(false);
+            }
+
+            foreach (GameLanguageSubmission sub in version.Submissions)
+            {
+                if (!string.IsNullOrWhiteSpace(sub.HepStoragePath))
+                {
+                    candidateStoragePaths.Add(sub.HepStoragePath);
+                }
+
+                if (!string.IsNullOrWhiteSpace(sub.SourceZipStoragePath))
+                {
+                    candidateStoragePaths.Add(sub.SourceZipStoragePath);
+                }
+            }
+
+            foreach (GameLanguageVariant v in version.Variants)
+            {
+                v.ActiveSubmissionId = null;
+            }
+
+            List<GameApp> forkedFromThisVersion = await db.GameApps
+                .Where(a => a.ForkedFromVersionId == versionId)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            foreach (GameApp child in forkedFromThisVersion)
+            {
+                child.ForkedFromVersionId = null;
+            }
+
+            List<UserAppLaunchState> launchStates = await db.UserAppLaunchStates
+                .Where(ls => ls.LastRunVersionId == versionId)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            foreach (UserAppLaunchState ls in launchStates)
+            {
+                ls.LastRunVersionId = null;
+            }
+
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+            // Explicitly delete submissions before removing GameVersion (DeleteBehavior.NoAction on VersionId).
+            if (version.Submissions.Count > 0)
+            {
+                db.GameLanguageSubmissions.RemoveRange(version.Submissions);
+                await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (version.Variants.Count > 0)
+            {
+                db.GameLanguageVariants.RemoveRange(version.Variants);
+            }
+
+            db.GameVersions.Remove(version);
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+            List<GameVersion> remaining = await db.GameVersions
+                .Where(v => v.AppId == appId)
+                .OrderBy(v => v.OrderIndex)
+                .ThenBy(v => v.CreatedAtUtc)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            for (int i = 0; i < remaining.Count; i++)
+            {
+                remaining[i].OrderIndex = i;
+            }
+
+            if (version.App is not null)
+            {
+                version.App.UpdatedAtUtc = DateTime.UtcNow;
+            }
+
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            await CleanupUnreferencedStoragePathsAsync(db, candidateStoragePaths, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _versionChainGate.Release();
+        }
+    }
+
+    private async Task CleanupUnreferencedStoragePathsAsync(
+        HyperaDbContext db,
+        IReadOnlyCollection<string> candidateRelativePaths,
+        CancellationToken cancellationToken)
+    {
+        if (candidateRelativePaths.Count == 0)
+        {
+            return;
+        }
+
+        string root = _hostOptions.GetResolvedDataRoot();
+        string rootWithSep = root.EndsWith(Path.DirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar;
+        StringComparison cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+        foreach (string relPath in candidateRelativePaths.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            bool stillReferenced = await db.GameLanguageSubmissions
+                .AsNoTracking()
+                .AnyAsync(
+                    s => s.HepStoragePath == relPath || s.SourceZipStoragePath == relPath,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (stillReferenced)
+            {
+                continue;
+            }
+
+            try
+            {
+                string combined = Path.GetFullPath(Path.Combine(root, relPath.Replace('/', Path.DirectorySeparatorChar)));
+                if (combined.StartsWith(rootWithSep, cmp) && File.Exists(combined))
+                {
+                    File.Delete(combined);
+                }
+            }
+            catch
+            {
+                // Ignore best-effort disk cleanup errors (e.g., locked handles).
+            }
         }
     }
 

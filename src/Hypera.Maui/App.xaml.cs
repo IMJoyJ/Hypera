@@ -9,6 +9,18 @@ public partial class App : Application
 
     protected override Window CreateWindow(IActivationState? activationState)
     {
-        return new Window(new MainPage()) { Title = "Hypera" };
+        var window = new Window(new MainPage())
+        {
+            Title = "Hypera",
+        };
+
+#if WINDOWS || MACCATALYST
+        window.Width = 1280;
+        window.Height = 820;
+        window.MinimumWidth = 720;
+        window.MinimumHeight = 520;
+#endif
+
+        return window;
     }
 }

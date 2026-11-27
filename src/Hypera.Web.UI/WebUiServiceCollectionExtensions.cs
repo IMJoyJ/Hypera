@@ -15,6 +15,8 @@ public static class WebUiServiceCollectionExtensions
 
         services.TryAddSingleton(HyperaLocalizer.Default);
         services.AddScoped<UiSessionState>();
+        services.TryAddScoped<IHostWindowService, BrowserHostWindowService>();
+        services.TryAddSingleton<ILocalFilePickerService, NoOpLocalFilePickerService>();
         services.AddMudServices(config =>
         {
             config.SnackbarConfiguration.PositionClass = Defaults.Classes.Position.BottomRight;

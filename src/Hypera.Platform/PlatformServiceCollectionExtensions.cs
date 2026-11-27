@@ -169,6 +169,7 @@ public static class PlatformServiceCollectionExtensions
         IDbContextFactory<HyperaDbContext> factory = services.GetRequiredService<IDbContextFactory<HyperaDbContext>>();
         await using HyperaDbContext db = await factory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await db.Database.EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await EnsureSqliteSchemaColumnsAsync(db, cancellationToken).ConfigureAwait(false);
 
         if (string.IsNullOrWhiteSpace(options.SqliteConnectionStringOverride))
         {
@@ -181,6 +182,83 @@ public static class PlatformServiceCollectionExtensions
         if (pipeline is not null)
         {
             await pipeline.ResumePendingCompilationsAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task EnsureSqliteSchemaColumnsAsync(HyperaDbContext db, CancellationToken cancellationToken)
+    {
+        var conn = db.Database.GetDbConnection();
+        bool openedHere = conn.State != System.Data.ConnectionState.Open;
+        if (openedHere)
+        {
+            await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        try
+        {
+            await EnsureTableColumnsAsync(
+                conn,
+                "PlatformSettings",
+                [
+                    ("DefaultCompilerOptionsJson", "TEXT NULL"),
+                    ("MaxUndoSteps", "INTEGER NULL"),
+                    ("AutoRollbackOnError", "INTEGER NULL"),
+                ],
+                cancellationToken).ConfigureAwait(false);
+
+            await EnsureTableColumnsAsync(
+                conn,
+                "GameLanguageSubmissions",
+                [
+                    ("CompilerOptionsJson", "TEXT NULL"),
+                    ("LocalSourcePath", "TEXT NULL"),
+                ],
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (openedHere)
+            {
+                await conn.CloseAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static async Task EnsureTableColumnsAsync(
+        System.Data.Common.DbConnection conn,
+        string tableName,
+        (string ColumnName, string SqlType)[] requiredColumns,
+        CancellationToken cancellationToken)
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var pragma = conn.CreateCommand())
+        {
+            pragma.CommandText = $"PRAGMA table_info(\"{tableName}\");";
+            await using var reader = await pragma.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (!reader.IsDBNull(1))
+                {
+                    existing.Add(reader.GetString(1));
+                }
+            }
+        }
+
+        if (existing.Count == 0)
+        {
+            return;
+        }
+
+        foreach ((string col, string sqlType) in requiredColumns)
+        {
+            if (existing.Contains(col))
+            {
+                continue;
+            }
+
+            await using var alter = conn.CreateCommand();
+            alter.CommandText = $"ALTER TABLE \"{tableName}\" ADD COLUMN \"{col}\" {sqlType};";
+            await alter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 }

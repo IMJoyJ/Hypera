@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Channels;
 using Hypera.Compiler;
+using Hypera.Configuration;
 using Hypera.Data;
 using Hypera.Diagnostics;
 using Hypera.Persistence;
@@ -16,13 +17,14 @@ namespace Hypera.Platform.Services;
 
 /// <summary>
 /// Implements <see cref="IPackagePipelineService"/> with zip-bomb/path-traversal guards, read-only native/managed
-/// binary SHA-256 scanning, bounded parallel background <see cref="ErbProjectCompiler"/> compilation, immutable
-/// <c>.hep</c> packaging, and atomic zero-downtime publication/supersede workflow.
+/// binary SHA-256 scanning (server mode), bounded parallel background <see cref="ErbProjectCompiler"/> compilation
+/// with tri-state <see cref="CompilerOptionsOverride"/> support, immutable <c>.hep</c> packaging, local direct import,
+/// and atomic zero-downtime publication/supersede workflow.
 /// </summary>
 public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisposable, IDisposable
 {
     public const int MaxZipEntryCount = 50_000;
-    public const long MaxUncompressedTotalBytes = 2L * 1024 * 1024 * 1024; // 2 GiB
+    public const long MaxUncompressedTotalBytes = 8L * 1024 * 1024 * 1024; // 8 GiB
 
     private static readonly HashSet<string> ScannedBinaryExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -116,6 +118,7 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
         }
 
         long maxUploadBytes;
+        string? defaultCompilerOptionsJson;
         await using (HyperaDbContext preCheckDb = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false))
         {
             AppUser uploader = await AppCatalogService.EnsureActiveUserAsync(preCheckDb, request.UploadedByUserId, cancellationToken).ConfigureAwait(false);
@@ -149,7 +152,12 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                 .ConfigureAwait(false)
                 ?? new PlatformSettings();
             maxUploadBytes = settings.MaxUploadBytes;
+            defaultCompilerOptionsJson = settings.DefaultCompilerOptionsJson;
         }
+
+        string? effectiveCompilerOptionsJson = request.CompilerOptions is not null
+            ? request.CompilerOptions.ToJson()
+            : CompilerOptionsOverride.FromJson(defaultCompilerOptionsJson)?.ToJson();
 
         if (request.DeclaredByteLength.HasValue && request.DeclaredByteLength.Value > maxUploadBytes)
         {
@@ -163,6 +171,7 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
 
         string sourceRelPath = $"sources/{submissionId:N}.zip";
         string sourceFullPath = ResolveStoragePath(sourceRelPath);
+        bool scanBinaries = _hostOptions.HostMode == PlatformHostMode.MultiUserServer;
 
         long persistedBytes = 0;
         List<SubmissionBinaryEntry> scannedBinaries;
@@ -179,7 +188,7 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                 throw new InvalidDataException("Uploaded .zip archive cannot be empty.");
             }
 
-            scannedBinaries = InspectZipAndScanBinaries(sourceFullPath, submissionId);
+            scannedBinaries = InspectZipAndScanBinaries(sourceFullPath, submissionId, scanBinaries);
         }
         catch
         {
@@ -194,28 +203,13 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
             await using HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
             await using var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-            GameLanguageVariant? variant = await db.GameLanguageVariants
-                .FirstOrDefaultAsync(
-                    lv => lv.VersionId == request.VersionId && lv.LanguageCode == requestedLang,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            GameLanguageVariant variant = await GetOrCreateVariantInTransactionAsync(
+                db,
+                request.VersionId,
+                requestedLang,
+                cancellationToken).ConfigureAwait(false);
 
             DateTime now = DateTime.UtcNow;
-            if (variant is null)
-            {
-                variant = new GameLanguageVariant
-                {
-                    Id = Guid.NewGuid(),
-                    VersionId = request.VersionId,
-                    LanguageCode = requestedLang,
-                    ActiveSubmissionId = null,
-                    CreatedAtUtc = now,
-                    UpdatedAtUtc = now,
-                };
-                db.GameLanguageVariants.Add(variant);
-                await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            }
-
             createdSubmission = new GameLanguageSubmission
             {
                 Id = submissionId,
@@ -226,6 +220,7 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                 AllowSourceDownload = request.AllowSourceDownload,
                 Status = SubmissionStatus.Compiling,
                 IsActivePublished = false,
+                CompilerOptionsJson = effectiveCompilerOptionsJson,
                 SourceZipStoragePath = sourceRelPath,
                 SourceZipByteSize = persistedBytes,
                 CreatedAtUtc = now,
@@ -246,11 +241,452 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
             _publishGate.Release();
         }
 
+        await EnqueueCompilationAsync(submissionId, cancellationToken).ConfigureAwait(false);
+        return createdSubmission;
+    }
+
+    public async Task<GameLanguageSubmission> SubmitLocalFileAsync(
+        LocalPackageFileImportRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(request);
+
+        string requestedLang = ValidateLanguageCode(request.LanguageCode);
+        if (string.IsNullOrWhiteSpace(request.FilePath))
+        {
+            throw new ArgumentException("File path cannot be empty.", nameof(request));
+        }
+
+        string fullFilePath = Path.GetFullPath(request.FilePath.Trim());
+        if (!File.Exists(fullFilePath))
+        {
+            throw new FileNotFoundException($"Local package file was not found: '{fullFilePath}'.", fullFilePath);
+        }
+
+        string? defaultCompilerOptionsJson = await ValidateLocalImportAccessAsync(
+            request.UploadedByUserId,
+            request.VersionId,
+            cancellationToken).ConfigureAwait(false);
+
+        CompilerOptionsOverride? effectiveOverride = request.CompilerOptions
+            ?? CompilerOptionsOverride.FromJson(defaultCompilerOptionsJson);
+        string? effectiveCompilerOptionsJson = effectiveOverride?.ToJson();
+
+        string ext = Path.GetExtension(fullFilePath);
+        if (ext.Equals(".hep", StringComparison.OrdinalIgnoreCase))
+        {
+            bool hasPrebuilt;
+            bool hasErb;
+            using (var hepVfs = new HepArchiveVfs(fullFilePath))
+            {
+                hasPrebuilt = hepVfs.FileExists(HepPackageWriter.DefaultPrebuiltBytecodePath);
+                hasErb = hepVfs.EnumerateFiles(string.Empty, "*.erb", recursive: true).Any();
+            }
+
+            if (!hasPrebuilt && !hasErb)
+            {
+                throw new InvalidDataException("Selected .hep package contains neither prebuilt bytecode nor .ERB script files.");
+            }
+
+            Guid submissionId = Guid.NewGuid();
+            bool directPublish = hasPrebuilt && !request.ForceRecompile && !(effectiveOverride?.HasAnyOverride ?? false);
+            if (directPublish)
+            {
+                Directory.CreateDirectory(_hostOptions.GetPackagesDirectory());
+                string hepRelPath = $"packages/{submissionId:N}.hep";
+                string hepFullPath = ResolveStoragePath(hepRelPath);
+                File.Copy(fullFilePath, hepFullPath, overwrite: true);
+                long hepByteSize = new FileInfo(hepFullPath).Length;
+
+                await _publishGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await using HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+                    await using var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+                    GameLanguageVariant variant = await GetOrCreateVariantInTransactionAsync(
+                        db,
+                        request.VersionId,
+                        requestedLang,
+                        cancellationToken).ConfigureAwait(false);
+
+                    DateTime now = DateTime.UtcNow;
+                    var directSub = new GameLanguageSubmission
+                    {
+                        Id = submissionId,
+                        VariantId = variant.Id,
+                        VersionId = request.VersionId,
+                        LanguageCode = variant.LanguageCode,
+                        UploadedByUserId = request.UploadedByUserId,
+                        AllowSourceDownload = false,
+                        Status = SubmissionStatus.Compiling,
+                        IsActivePublished = false,
+                        CompilerOptionsJson = effectiveCompilerOptionsJson,
+                        LocalSourcePath = fullFilePath,
+                        HepStoragePath = hepRelPath,
+                        HepByteSize = hepByteSize,
+                        CreatedAtUtc = now,
+                    };
+
+                    db.GameLanguageSubmissions.Add(directSub);
+                    await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+                    bool isSingleUserLocal = _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin;
+                    await ActivateSubmissionInTransactionAsync(
+                        db,
+                        directSub,
+                        reviewerId: isSingleUserLocal ? null : request.UploadedByUserId,
+                        markBinariesTrusted: false,
+                        cancellationToken).ConfigureAwait(false);
+
+                    await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    TryDeleteFileQuietly(hepFullPath);
+                    throw;
+                }
+                finally
+                {
+                    _publishGate.Release();
+                }
+
+                return (await GetSubmissionAsync(submissionId, cancellationToken).ConfigureAwait(false))!;
+            }
+
+            if (!hasErb)
+            {
+                throw new InvalidDataException("This .hep package is compiled-only (no .ERB sources included) and cannot be recompiled with new compiler options.");
+            }
+
+            return await CreateAndEnqueueLocalSubmissionAsync(
+                request.VersionId,
+                requestedLang,
+                request.UploadedByUserId,
+                effectiveCompilerOptionsJson,
+                sourceZipRelPath: null,
+                sourceZipByteSize: 0,
+                localSourcePath: fullFilePath,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        if (ext.Equals(".zip", StringComparison.OrdinalIgnoreCase))
+        {
+            Guid submissionId = Guid.NewGuid();
+            string sourcesDir = _hostOptions.GetSourcesDirectory();
+            Directory.CreateDirectory(sourcesDir);
+            string sourceRelPath = $"sources/{submissionId:N}.zip";
+            string sourceFullPath = ResolveStoragePath(sourceRelPath);
+            bool scanBinaries = _hostOptions.HostMode == PlatformHostMode.MultiUserServer;
+
+            List<SubmissionBinaryEntry> scannedBinaries;
+            long persistedBytes;
+            try
+            {
+                File.Copy(fullFilePath, sourceFullPath, overwrite: true);
+                persistedBytes = new FileInfo(sourceFullPath).Length;
+                if (persistedBytes <= 0)
+                {
+                    throw new InvalidDataException("Selected .zip archive cannot be empty.");
+                }
+
+                scannedBinaries = InspectZipAndScanBinaries(sourceFullPath, submissionId, scanBinaries);
+            }
+            catch
+            {
+                TryDeleteFileQuietly(sourceFullPath);
+                throw;
+            }
+
+            return await CreateAndEnqueueLocalSubmissionAsync(
+                request.VersionId,
+                requestedLang,
+                request.UploadedByUserId,
+                effectiveCompilerOptionsJson,
+                sourceZipRelPath: sourceRelPath,
+                sourceZipByteSize: persistedBytes,
+                localSourcePath: fullFilePath,
+                cancellationToken,
+                explicitSubmissionId: submissionId,
+                binaryEntries: scannedBinaries).ConfigureAwait(false);
+        }
+
+        throw new InvalidDataException($"Unsupported local package extension '{ext}'. Select a .zip or .hep file.");
+    }
+
+    public async Task<GameLanguageSubmission> SubmitLocalDirectoryAsync(
+        LocalDirectoryImportRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(request);
+
+        string requestedLang = ValidateLanguageCode(request.LanguageCode);
+        if (string.IsNullOrWhiteSpace(request.DirectoryPath))
+        {
+            throw new ArgumentException("Directory path cannot be empty.", nameof(request));
+        }
+
+        string fullDirPath = Path.GetFullPath(request.DirectoryPath.Trim());
+        if (!Directory.Exists(fullDirPath))
+        {
+            throw new DirectoryNotFoundException($"Game directory was not found: '{fullDirPath}'.");
+        }
+
+        string? defaultCompilerOptionsJson = await ValidateLocalImportAccessAsync(
+            request.UploadedByUserId,
+            request.VersionId,
+            cancellationToken).ConfigureAwait(false);
+
+        CompilerOptionsOverride? effectiveOverride = request.CompilerOptions
+            ?? CompilerOptionsOverride.FromJson(defaultCompilerOptionsJson);
+
+        return await CreateAndEnqueueLocalSubmissionAsync(
+            request.VersionId,
+            requestedLang,
+            request.UploadedByUserId,
+            effectiveOverride?.ToJson(),
+            sourceZipRelPath: null,
+            sourceZipByteSize: 0,
+            localSourcePath: fullDirPath,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<GameLanguageSubmission> RecompileSubmissionAsync(
+        Guid actorUserId,
+        Guid submissionId,
+        CompilerOptionsOverride? compilerOptions = null,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        GameLanguageSubmission? original = await GetSubmissionAsync(submissionId, cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Submission '{submissionId}' was not found.");
+
+        await using (HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false))
+        {
+            AppUser actor = await AppCatalogService.EnsureActiveUserAsync(db, actorUserId, cancellationToken).ConfigureAwait(false);
+            bool isAdmin = actor.Role == UserRole.Admin || _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin;
+            if (!isAdmin && original.UploadedByUserId != actor.Id)
+            {
+                throw new UnauthorizedAccessException("Only the uploader or an administrator can recompile this build.");
+            }
+        }
+
+        string? sourceZipRel = null;
+        long sourceZipBytes = 0;
+        string? localSourcePath = null;
+
+        if (!string.IsNullOrWhiteSpace(original.SourceZipStoragePath))
+        {
+            string fullZip = ResolveStoragePath(original.SourceZipStoragePath);
+            if (File.Exists(fullZip))
+            {
+                sourceZipRel = original.SourceZipStoragePath;
+                sourceZipBytes = original.SourceZipByteSize;
+            }
+        }
+
+        if (sourceZipRel is null &&
+            _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin &&
+            !string.IsNullOrWhiteSpace(original.LocalSourcePath) &&
+            (Directory.Exists(original.LocalSourcePath) || File.Exists(original.LocalSourcePath)))
+        {
+            localSourcePath = original.LocalSourcePath;
+        }
+
+        if (sourceZipRel is null && localSourcePath is null && !string.IsNullOrWhiteSpace(original.HepStoragePath))
+        {
+            string fullHep = ResolveStoragePath(original.HepStoragePath);
+            if (File.Exists(fullHep))
+            {
+                using var testHep = new HepArchiveVfs(fullHep);
+                if (testHep.EnumerateFiles(string.Empty, "*.erb", recursive: true).Any())
+                {
+                    localSourcePath = fullHep;
+                }
+            }
+        }
+
+        if (sourceZipRel is null && localSourcePath is null)
+        {
+            throw new InvalidOperationException(
+                "No modifiable source files (.zip, unpacked folder, or source-bearing .hep) are available to recompile this build.");
+        }
+
+        Guid newSubmissionId = Guid.NewGuid();
+        List<SubmissionBinaryEntry> clonedBinaries = [];
+        if (_hostOptions.HostMode == PlatformHostMode.MultiUserServer && original.BinaryEntries.Count > 0)
+        {
+            foreach (SubmissionBinaryEntry b in original.BinaryEntries)
+            {
+                clonedBinaries.Add(new SubmissionBinaryEntry
+                {
+                    Id = Guid.NewGuid(),
+                    SubmissionId = newSubmissionId,
+                    RelativePath = b.RelativePath,
+                    Sha256Hex = b.Sha256Hex,
+                    ByteSize = b.ByteSize,
+                });
+            }
+        }
+
+        return await CreateAndEnqueueLocalSubmissionAsync(
+            original.VersionId,
+            original.LanguageCode,
+            actorUserId,
+            compilerOptions?.ToJson(),
+            sourceZipRelPath: sourceZipRel,
+            sourceZipByteSize: sourceZipBytes,
+            localSourcePath: localSourcePath,
+            cancellationToken,
+            allowSourceDownload: original.AllowSourceDownload,
+            explicitSubmissionId: newSubmissionId,
+            binaryEntries: clonedBinaries).ConfigureAwait(false);
+    }
+
+    private static string ValidateLanguageCode(string languageCode)
+    {
+        if (string.IsNullOrWhiteSpace(languageCode))
+        {
+            throw new ArgumentException("Language code cannot be empty.", nameof(languageCode));
+        }
+
+        string trimmed = languageCode.Trim();
+        if (trimmed.Length > 32)
+        {
+            throw new ArgumentException("Language code cannot exceed 32 characters.", nameof(languageCode));
+        }
+
+        return trimmed;
+    }
+
+    private async Task<string?> ValidateLocalImportAccessAsync(
+        Guid actorUserId,
+        Guid versionId,
+        CancellationToken cancellationToken)
+    {
+        await using HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        AppUser actor = await AppCatalogService.EnsureActiveUserAsync(db, actorUserId, cancellationToken).ConfigureAwait(false);
+        bool isAllowed = _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin || actor.Role == UserRole.Admin;
+        if (!isAllowed)
+        {
+            throw new UnauthorizedAccessException("Local filesystem import is only available in single-user local mode or for administrators.");
+        }
+
+        bool versionExists = await db.GameVersions
+            .AsNoTracking()
+            .AnyAsync(v => v.Id == versionId, cancellationToken)
+            .ConfigureAwait(false);
+        if (!versionExists)
+        {
+            throw new KeyNotFoundException($"Version '{versionId}' was not found.");
+        }
+
+        PlatformSettings? settings = await db.PlatformSettings
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Id == PlatformSettings.SingletonId, cancellationToken)
+            .ConfigureAwait(false);
+        return settings?.DefaultCompilerOptionsJson;
+    }
+
+    private static async Task<GameLanguageVariant> GetOrCreateVariantInTransactionAsync(
+        HyperaDbContext db,
+        Guid versionId,
+        string requestedLang,
+        CancellationToken cancellationToken)
+    {
+        GameLanguageVariant? variant = await db.GameLanguageVariants
+            .FirstOrDefaultAsync(
+                lv => lv.VersionId == versionId && lv.LanguageCode == requestedLang,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        if (variant is not null)
+        {
+            return variant;
+        }
+
+        DateTime now = DateTime.UtcNow;
+        variant = new GameLanguageVariant
+        {
+            Id = Guid.NewGuid(),
+            VersionId = versionId,
+            LanguageCode = requestedLang,
+            ActiveSubmissionId = null,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        db.GameLanguageVariants.Add(variant);
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return variant;
+    }
+
+    private async Task<GameLanguageSubmission> CreateAndEnqueueLocalSubmissionAsync(
+        Guid versionId,
+        string requestedLang,
+        Guid uploaderUserId,
+        string? compilerOptionsJson,
+        string? sourceZipRelPath,
+        long sourceZipByteSize,
+        string? localSourcePath,
+        CancellationToken cancellationToken,
+        bool allowSourceDownload = false,
+        Guid? explicitSubmissionId = null,
+        List<SubmissionBinaryEntry>? binaryEntries = null)
+    {
+        Guid submissionId = explicitSubmissionId ?? Guid.NewGuid();
+        GameLanguageSubmission created;
+        await _publishGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            await using var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+            GameLanguageVariant variant = await GetOrCreateVariantInTransactionAsync(
+                db,
+                versionId,
+                requestedLang,
+                cancellationToken).ConfigureAwait(false);
+
+            DateTime now = DateTime.UtcNow;
+            created = new GameLanguageSubmission
+            {
+                Id = submissionId,
+                VariantId = variant.Id,
+                VersionId = versionId,
+                LanguageCode = variant.LanguageCode,
+                UploadedByUserId = uploaderUserId,
+                AllowSourceDownload = allowSourceDownload,
+                Status = SubmissionStatus.Compiling,
+                IsActivePublished = false,
+                CompilerOptionsJson = compilerOptionsJson,
+                SourceZipStoragePath = sourceZipRelPath,
+                SourceZipByteSize = sourceZipByteSize,
+                LocalSourcePath = localSourcePath,
+                CreatedAtUtc = now,
+                BinaryEntries = binaryEntries ?? [],
+            };
+
+            db.GameLanguageSubmissions.Add(created);
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _publishGate.Release();
+        }
+
+        await EnqueueCompilationAsync(submissionId, cancellationToken).ConfigureAwait(false);
+        return created;
+    }
+
+    private async Task EnqueueCompilationAsync(Guid submissionId, CancellationToken cancellationToken)
+    {
         var tcs = new TaskCompletionSource<GameLanguageSubmission>(TaskCreationOptions.RunContinuationsAsynchronously);
         _completionWaiters[submissionId] = tcs;
-
         await _compileChannel.Writer.WriteAsync(submissionId, cancellationToken).ConfigureAwait(false);
-        return createdSubmission;
     }
 
     public async Task<GameLanguageSubmission> WaitForCompilationAsync(
@@ -540,8 +976,11 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
     private async Task ExecuteSingleCompilationJobAsync(Guid submissionId, CancellationToken cancellationToken)
     {
         string? sourceRelPath = null;
+        string? localSourcePath = null;
+        string? compilerOptionsJson = null;
         Guid uploaderId = Guid.Empty;
         UserRole uploaderRole = UserRole.User;
+        bool isSingleUserLocal = _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin;
 
         try
         {
@@ -553,6 +992,8 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                     .Select(s => new
                     {
                         s.SourceZipStoragePath,
+                        s.LocalSourcePath,
+                        s.CompilerOptionsJson,
                         s.UploadedByUserId,
                         UploaderRole = s.UploadedByUser != null ? s.UploadedByUser.Role : UserRole.User,
                     })
@@ -565,25 +1006,24 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                 }
 
                 sourceRelPath = meta.SourceZipStoragePath;
+                localSourcePath = meta.LocalSourcePath;
+                compilerOptionsJson = meta.CompilerOptionsJson;
                 uploaderId = meta.UploadedByUserId;
                 uploaderRole = meta.UploaderRole;
             }
 
-            if (string.IsNullOrWhiteSpace(sourceRelPath))
-            {
-                throw new FileNotFoundException("Missing source zip path on compiling submission.");
-            }
-
-            string sourceFullPath = ResolveStoragePath(sourceRelPath);
+            string? sourceFullPath = !string.IsNullOrWhiteSpace(sourceRelPath)
+                ? ResolveStoragePath(sourceRelPath)
+                : null;
             string hepRelPath = $"packages/{submissionId:N}.hep";
             string hepFullPath = ResolveStoragePath(hepRelPath);
             long hepByteSize;
 
             try
             {
-                using (var rawZipVfs = new ZipArchiveVfs(sourceFullPath))
+                using (IVirtualFileSystem rawVfs = OpenCompilationSourceVfs(sourceFullPath, localSourcePath))
                 {
-                    IVirtualFileSystem effectiveVfs = UnwrapSingleTopFolderIfNeeded(rawZipVfs);
+                    IVirtualFileSystem effectiveVfs = UnwrapSingleTopFolderIfNeeded(rawVfs);
 
                     if (!effectiveVfs.EnumerateFiles(string.Empty, "*.erb", recursive: true).Any())
                     {
@@ -592,15 +1032,20 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                             new Diagnostic(
                                 "ERA0001",
                                 DiagnosticSeverity.Error,
-                                "No .ERB script files were found in the uploaded .zip archive.",
+                                "No .ERB script files were found in the uploaded package.",
                                 SourceSpan.SingleLine(0, 1)),
                         ]);
                     }
 
                     ConfigLoadResult config = ConfigLoader.Default.Load(effectiveVfs);
-                    GameData gameData = CsvGameDataLoader.Default.Load(effectiveVfs, config.CompilerOptions);
-                    CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, config.CompilerOptions.IgnoreCase);
-                    var compiler = new ErbProjectCompiler(config.CompilerOptions, external);
+                    CompilerOptionsOverride? overrides = CompilerOptionsOverride.FromJson(compilerOptionsJson);
+                    CompilerOptions effectiveCompilerOptions = overrides is not null
+                        ? overrides.ApplyTo(config.CompilerOptions)
+                        : config.CompilerOptions;
+
+                    GameData gameData = CsvGameDataLoader.Default.Load(effectiveVfs, effectiveCompilerOptions);
+                    CompilerExternalContext external = CompilerExternalContext.FromGameData(gameData, effectiveCompilerOptions.IgnoreCase);
+                    var compiler = new ErbProjectCompiler(effectiveCompilerOptions, external);
                     CompilationResult compilation = compiler.CompileProject(effectiveVfs, throwOnError: true);
 
                     byte[] prebuiltHeb = BytecodeSerializer.Serialize(compilation.Module);
@@ -612,8 +1057,8 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                 }
 
                 // Compilation & .hep packaging succeeded!
-                bool autoApprove = _hostOptions.HostMode == PlatformHostMode.SingleUserLocalAdmin
-                    || uploaderRole == UserRole.Admin;
+                // In SingleUserLocalAdmin mode, bypass all review & binary reputation ledger steps completely.
+                bool autoApprove = isSingleUserLocal || uploaderRole == UserRole.Admin;
 
                 await _publishGate.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
@@ -635,8 +1080,8 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                         await ActivateSubmissionInTransactionAsync(
                             db,
                             submission,
-                            reviewerId: uploaderId,
-                            markBinariesTrusted: true,
+                            reviewerId: isSingleUserLocal ? null : uploaderId,
+                            markBinariesTrusted: !isSingleUserLocal,
                             cancellationToken).ConfigureAwait(false);
                     }
                     else
@@ -655,15 +1100,21 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
             catch (EmueraCompileException compileEx)
             {
                 TryDeleteFileQuietly(hepFullPath);
-                TryDeleteFileQuietly(sourceFullPath);
+                if (!isSingleUserLocal)
+                {
+                    await TryDeleteUnreferencedSourceZipAsync(submissionId, sourceRelPath, sourceFullPath).ConfigureAwait(false);
+                }
 
                 string diagJson = SubmissionDiagnosticsSerializer.Serialize(compileEx.Diagnostics);
-                await PersistCompileFailureAsync(submissionId, diagJson).ConfigureAwait(false);
+                await PersistCompileFailureAsync(submissionId, diagJson, clearSourceZipPath: !isSingleUserLocal).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 TryDeleteFileQuietly(hepFullPath);
-                TryDeleteFileQuietly(sourceFullPath);
+                if (!isSingleUserLocal)
+                {
+                    await TryDeleteUnreferencedSourceZipAsync(submissionId, sourceRelPath, sourceFullPath).ConfigureAwait(false);
+                }
 
                 var fallbackDiag = new Diagnostic(
                     "ERA0000",
@@ -671,7 +1122,7 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                     ex.Message,
                     SourceSpan.SingleLine(0, 1));
                 string diagJson = SubmissionDiagnosticsSerializer.Serialize([fallbackDiag]);
-                await PersistCompileFailureAsync(submissionId, diagJson).ConfigureAwait(false);
+                await PersistCompileFailureAsync(submissionId, diagJson, clearSourceZipPath: !isSingleUserLocal).ConfigureAwait(false);
             }
 
             GameLanguageSubmission? completed = await GetSubmissionAsync(submissionId, CancellationToken.None).ConfigureAwait(false);
@@ -689,7 +1140,57 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
         }
     }
 
-    private async Task PersistCompileFailureAsync(Guid submissionId, string diagnosticsJson)
+    private static IVirtualFileSystem OpenCompilationSourceVfs(string? sourceZipFullPath, string? localSourcePath)
+    {
+        if (!string.IsNullOrWhiteSpace(sourceZipFullPath) && File.Exists(sourceZipFullPath))
+        {
+            return new ZipArchiveVfs(sourceZipFullPath);
+        }
+
+        if (!string.IsNullOrWhiteSpace(localSourcePath))
+        {
+            if (Directory.Exists(localSourcePath))
+            {
+                return new PhysicalDirectoryVfs(localSourcePath);
+            }
+
+            if (File.Exists(localSourcePath))
+            {
+                string ext = Path.GetExtension(localSourcePath);
+                if (ext.Equals(".hep", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new HepArchiveVfs(localSourcePath);
+                }
+
+                if (ext.Equals(".zip", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new ZipArchiveVfs(localSourcePath);
+                }
+            }
+        }
+
+        throw new FileNotFoundException("Compilation source archive or directory was not found.");
+    }
+
+    private async Task TryDeleteUnreferencedSourceZipAsync(Guid currentSubmissionId, string? sourceRelPath, string? sourceFullPath)
+    {
+        if (string.IsNullOrWhiteSpace(sourceRelPath) || string.IsNullOrWhiteSpace(sourceFullPath))
+        {
+            return;
+        }
+
+        await using HyperaDbContext db = await _dbFactory.CreateDbContextAsync(CancellationToken.None).ConfigureAwait(false);
+        bool shared = await db.GameLanguageSubmissions
+            .AsNoTracking()
+            .AnyAsync(s => s.Id != currentSubmissionId && s.SourceZipStoragePath == sourceRelPath, CancellationToken.None)
+            .ConfigureAwait(false);
+        if (!shared)
+        {
+            TryDeleteFileQuietly(sourceFullPath);
+        }
+    }
+
+    private async Task PersistCompileFailureAsync(Guid submissionId, string diagnosticsJson, bool clearSourceZipPath = true)
     {
         await _publishGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
@@ -704,8 +1205,12 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
                 submission.Status = SubmissionStatus.CompileFailed;
                 submission.IsActivePublished = false;
                 submission.DiagnosticsJson = diagnosticsJson;
-                submission.SourceZipStoragePath = null;
-                submission.SourceZipByteSize = 0;
+                if (clearSourceZipPath)
+                {
+                    submission.SourceZipStoragePath = null;
+                    submission.SourceZipByteSize = 0;
+                }
+
                 await db.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
             }
         }
@@ -746,7 +1251,7 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
         submission.Status = SubmissionStatus.Published;
         submission.IsActivePublished = true;
         submission.ReviewedByUserId = reviewerId;
-        submission.ReviewedAtUtc = now;
+        submission.ReviewedAtUtc = reviewerId.HasValue ? now : null;
         submission.PublishedAtUtc = now;
         submission.RejectionReason = null;
 
@@ -879,7 +1384,10 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
         return total;
     }
 
-    private static List<SubmissionBinaryEntry> InspectZipAndScanBinaries(string zipFullPath, Guid submissionId)
+    private static List<SubmissionBinaryEntry> InspectZipAndScanBinaries(
+        string zipFullPath,
+        Guid submissionId,
+        bool scanBinaries = true)
     {
         using var fs = new FileStream(zipFullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
         using var archive = new ZipArchive(fs, ZipArchiveMode.Read, leaveOpen: false);
@@ -929,7 +1437,7 @@ public sealed class PackagePipelineService : IPackagePipelineService, IAsyncDisp
             }
 
             string ext = VfsPathNormalizer.GetExtension(normalizedPath);
-            bool isScannedBinary = ScannedBinaryExtensions.Contains(ext);
+            bool isScannedBinary = scanBinaries && ScannedBinaryExtensions.Contains(ext);
 
             using Stream entryStream = entry.Open();
             using IncrementalHash? hasher = isScannedBinary ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256) : null;

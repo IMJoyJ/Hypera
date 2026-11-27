@@ -135,6 +135,17 @@ public sealed class GameLanguageSubmission
     /// </summary>
     public string? DiagnosticsJson { get; set; }
 
+    /// <summary>
+    /// JSON-serialized <see cref="Hypera.Configuration.CompilerOptionsOverride"/> snapshot applied during compilation.
+    /// </summary>
+    public string? CompilerOptionsJson { get; set; }
+
+    /// <summary>
+    /// Optional local directory or package path recorded in <see cref="PlatformHostMode.SingleUserLocalAdmin"/> mode
+    /// so failed or existing local imports can be recompiled with updated options without re-selecting files.
+    /// </summary>
+    public string? LocalSourcePath { get; set; }
+
     public string? HepStoragePath { get; set; }
 
     public long HepByteSize { get; set; }

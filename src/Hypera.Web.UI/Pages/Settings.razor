@@ -2,16 +2,23 @@
 @implements IDisposable
 @inject UiSessionState Ui
 @inject IAuthService AuthService
+@inject PlatformHostOptions HostOptions
 @inject ISnackbar Snackbar
 @inject IJSRuntime Js
 
 <MudContainer MaxWidth="MaxWidth.Medium" Class="px-0">
-    <MudText Typo="Typo.h5" Class="mb-4" Style="font-weight: 600;">@Ui.T("settings.title")</MudText>
+    <div class="hypera-page-header">
+        <MudText Typo="Typo.h5" Style="font-weight: 600;">@Ui.T("settings.title")</MudText>
+    </div>
 
     <MudStack Spacing="4">
-        @* UI Language & Theme *@
-        <MudPaper Outlined="true" Class="pa-4">
-            <MudGrid Spacing="3" Class="align-center">
+        @* 1. Appearance, Language & Version Resolution *@
+        <MudPaper Outlined="true" Class="hypera-section-card">
+            <MudText Typo="Typo.subtitle1" Style="font-weight: 600;" Class="mb-3">
+                @Ui.T("settings.sectionGeneral")
+            </MudText>
+
+            <MudGrid Spacing="3" Class="align-center mb-3">
                 <MudItem xs="12" sm="6">
                     <MudSelect T="string"
                                Value="_uiLanguage"
@@ -33,13 +40,12 @@
                                Label="@Ui.T("settings.darkMode")" />
                 </MudItem>
             </MudGrid>
-        </MudPaper>
 
-        @if (Ui.IsAuthenticated)
-        {
-            @* Known Languages with Explicit Priority Ordering *@
-            <MudPaper Outlined="true" Class="pa-4">
-                <MudText Typo="Typo.subtitle1" Style="font-weight: 600;">@Ui.T("settings.knownLanguages")</MudText>
+            @if (Ui.IsAuthenticated)
+            {
+                <MudDivider Class="my-4" />
+
+                <MudText Typo="Typo.subtitle2" Style="font-weight: 600;">@Ui.T("settings.knownLanguages")</MudText>
                 <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-3 d-block">
                     @Ui.T("settings.knownLanguagesHint")
                 </MudText>
@@ -54,7 +60,7 @@
                                 <MudChip T="string" Size="Size.Small" Color="Color.Primary" Variant="Variant.Outlined">
                                     @(index + 1)
                                 </MudChip>
-                                <MudText Typo="Typo.body1">@FormatHelpers.GetLanguageLabel(lang, Ui.Localizer)</MudText>
+                                <MudText Typo="Typo.body2">@FormatHelpers.GetLanguageLabel(lang, Ui.Localizer)</MudText>
                             </div>
                             <div class="d-flex align-center gap-1">
                                 <MudIconButton Icon="@Icons.Material.Filled.ArrowUpward"
@@ -77,7 +83,7 @@
 
                 @if (AddableLanguages.Count > 0)
                 {
-                    <div class="d-flex align-center gap-2">
+                    <div class="d-flex flex-wrap align-center gap-2 mb-4">
                         <MudSelect T="string"
                                    @bind-Value="_langToAdd"
                                    Label="@Ui.T("settings.addLanguage")"
@@ -98,11 +104,10 @@
                         </MudButton>
                     </div>
                 }
-            </MudPaper>
 
-            @* Version Resolution Strategy *@
-            <MudPaper Outlined="true" Class="pa-4">
-                <MudText Typo="Typo.subtitle1" Class="mb-2" Style="font-weight: 600;">
+                <MudDivider Class="my-4" />
+
+                <MudText Typo="Typo.subtitle2" Class="mb-2" Style="font-weight: 600;">
                     @Ui.T("settings.versionStrategy")
                 </MudText>
 
@@ -110,7 +115,7 @@
                     <MudStack Spacing="2">
                         <div>
                             <MudRadio Value="VersionResolutionStrategy.KnownLanguagePriority" Color="Color.Primary">
-                                <MudText Typo="Typo.body1" Style="font-weight: 500;">@Ui.T("settings.strategyKnownLang")</MudText>
+                                <MudText Typo="Typo.body2" Style="font-weight: 500;">@Ui.T("settings.strategyKnownLang")</MudText>
                             </MudRadio>
                             <MudText Typo="Typo.caption" Color="Color.Secondary" Class="ml-8 d-block">
                                 @Ui.T("settings.strategyKnownLangDesc")
@@ -119,7 +124,7 @@
 
                         <div>
                             <MudRadio Value="VersionResolutionStrategy.VersionPriority" Color="Color.Primary">
-                                <MudText Typo="Typo.body1" Style="font-weight: 500;">@Ui.T("settings.strategyVersion")</MudText>
+                                <MudText Typo="Typo.body2" Style="font-weight: 500;">@Ui.T("settings.strategyVersion")</MudText>
                             </MudRadio>
                             <MudText Typo="Typo.caption" Color="Color.Secondary" Class="ml-8 d-block">
                                 @Ui.T("settings.strategyVersionDesc")
@@ -128,7 +133,7 @@
 
                         <div>
                             <MudRadio Value="VersionResolutionStrategy.AlwaysLastRun" Color="Color.Primary">
-                                <MudText Typo="Typo.body1" Style="font-weight: 500;">@Ui.T("settings.strategyLastRun")</MudText>
+                                <MudText Typo="Typo.body2" Style="font-weight: 500;">@Ui.T("settings.strategyLastRun")</MudText>
                             </MudRadio>
                             <MudText Typo="Typo.caption" Color="Color.Secondary" Class="ml-8 d-block">
                                 @Ui.T("settings.strategyLastRunDesc")
@@ -136,17 +141,91 @@
                         </div>
                     </MudStack>
                 </MudRadioGroup>
-            </MudPaper>
 
-            <div class="d-flex justify-end">
-                <MudButton Variant="Variant.Filled"
-                           Color="Color.Primary"
-                           StartIcon="@Icons.Material.Filled.Save"
-                           Disabled="@_saving"
-                           OnClick="@SavePreferencesAsync">
-                    @Ui.T("app.save")
-                </MudButton>
-            </div>
+                <div class="d-flex justify-end mt-4">
+                    <MudButton Variant="Variant.Filled"
+                               Color="Color.Primary"
+                               StartIcon="@Icons.Material.Filled.Save"
+                               Disabled="@_savingPrefs"
+                               OnClick="@SavePreferencesAsync">
+                        @Ui.T("app.save")
+                    </MudButton>
+                </div>
+            }
+        </MudPaper>
+
+        @* 2. Default Compiler Options & Runtime Configuration (Local Admin / Server Admin) *@
+        @if (Ui.IsAuthenticated && (Ui.IsLocalSingleUser || Ui.IsAdmin))
+        {
+            <MudPaper Outlined="true" Class="hypera-section-card">
+                <MudText Typo="Typo.subtitle1" Style="font-weight: 600;">
+                    @Ui.T("settings.sectionCompiler")
+                </MudText>
+                <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mb-3 d-block">
+                    @Ui.T("settings.sectionCompilerHint")
+                </MudText>
+
+                <CompilerOptionsEditor @bind-Value="_defaultCompilerOptions"
+                                       Collapsible="false"
+                                       Disabled="@_savingPlatform" />
+
+                <MudDivider Class="my-5" />
+
+                <MudText Typo="Typo.subtitle1" Style="font-weight: 600;" Class="mb-3">
+                    @Ui.T("settings.sectionRuntime")
+                </MudText>
+
+                <MudGrid Spacing="3">
+                    <MudItem xs="12" sm="6">
+                        <MudNumericField T="int"
+                                         @bind-Value="_maxUndoSteps"
+                                         Label="@Ui.T("settings.maxUndoSteps")"
+                                         Variant="Variant.Outlined"
+                                         Margin="Margin.Dense"
+                                         Min="0"
+                                         Max="50" />
+                    </MudItem>
+                    <MudItem xs="12" sm="6" Class="d-flex align-center">
+                        <MudSwitch @bind-Value="_autoRollbackOnError"
+                                   Color="Color.Primary"
+                                   Label="@Ui.T("settings.autoRollbackOnError")" />
+                    </MudItem>
+                    <MudItem xs="12" sm="4">
+                        <MudNumericField T="int"
+                                         @bind-Value="_maxStepsPerTurn"
+                                         Label="@Ui.T("admin.maxStepsPerTurn")"
+                                         Variant="Variant.Outlined"
+                                         Margin="Margin.Dense"
+                                         Min="1000" />
+                    </MudItem>
+                    <MudItem xs="12" sm="4">
+                        <MudNumericField T="long"
+                                         @bind-Value="_maxUploadMiB"
+                                         Label="@Ui.T("admin.maxUploadMb")"
+                                         Variant="Variant.Outlined"
+                                         Margin="Margin.Dense"
+                                         Min="1" />
+                    </MudItem>
+                    <MudItem xs="12" sm="4">
+                        <MudNumericField T="long"
+                                         @bind-Value="_maxSaveQuotaMiB"
+                                         Label="@Ui.T("admin.maxSaveQuotaMb")"
+                                         Variant="Variant.Outlined"
+                                         Margin="Margin.Dense"
+                                         Min="1" />
+                    </MudItem>
+                </MudGrid>
+
+                <div class="d-flex justify-end mt-4">
+                    <MudButton Variant="Variant.Filled"
+                               Color="Color.Primary"
+                               StartIcon="@Icons.Material.Filled.Save"
+                               Disabled="@_savingPlatform"
+                               OnClick="@SavePlatformSettingsAsync">
+                        @Ui.T("settings.saveCompilerAndRuntime")
+                    </MudButton>
+                </div>
+            </MudPaper>
         }
     </MudStack>
 </MudContainer>
@@ -156,7 +235,16 @@
     private List<string> _knownLanguages = [HyperaLocalizer.DefaultLocaleCode];
     private string? _langToAdd;
     private VersionResolutionStrategy _strategy = VersionResolutionStrategy.KnownLanguagePriority;
-    private bool _saving;
+    private bool _savingPrefs;
+
+    private PlatformSettings? _loadedPlatformSettings;
+    private CompilerOptionsOverride? _defaultCompilerOptions;
+    private int _maxUndoSteps = 5;
+    private bool _autoRollbackOnError = true;
+    private int _maxStepsPerTurn = PlatformSettings.DefaultMaxStepInstructionsPerTurn;
+    private long _maxUploadMiB = 512;
+    private long _maxSaveQuotaMiB = 64;
+    private bool _savingPlatform;
 
     private IReadOnlyList<string> AddableLanguages =>
         Ui.AvailableLocales.Select(static l => l.Code)
@@ -170,6 +258,10 @@
         Ui.Changed += OnUiChanged;
         await Ui.InitializeAsync();
         LoadFromState();
+        if (Ui.IsAuthenticated && (Ui.IsLocalSingleUser || Ui.IsAdmin))
+        {
+            await LoadPlatformSettingsAsync();
+        }
     }
 
     private void LoadFromState()
@@ -186,6 +278,25 @@
         }
 
         _langToAdd = AddableLanguages.FirstOrDefault();
+    }
+
+    private async Task LoadPlatformSettingsAsync()
+    {
+        try
+        {
+            PlatformSettings settings = await AuthService.GetSettingsAsync();
+            _loadedPlatformSettings = settings;
+            _defaultCompilerOptions = CompilerOptionsOverride.FromJson(settings.DefaultCompilerOptionsJson);
+            _maxUndoSteps = settings.MaxUndoSteps ?? HostOptions.MaxUndoSteps;
+            _autoRollbackOnError = settings.AutoRollbackOnError ?? HostOptions.AutoRollbackOnError;
+            _maxStepsPerTurn = settings.MaxStepInstructionsPerTurn;
+            _maxUploadMiB = Math.Max(1L, settings.MaxUploadBytes / (1024L * 1024L));
+            _maxSaveQuotaMiB = Math.Max(1L, settings.MaxSaveQuotaBytesPerApp / (1024L * 1024L));
+        }
+        catch
+        {
+            // Keep defaults
+        }
     }
 
     private async Task OnUiLanguageSelectedAsync(string code)
@@ -252,7 +363,7 @@
             return;
         }
 
-        _saving = true;
+        _savingPrefs = true;
         try
         {
             await AuthService.UpdateUserPreferencesAsync(
@@ -272,7 +383,44 @@
         }
         finally
         {
-            _saving = false;
+            _savingPrefs = false;
+        }
+    }
+
+    private async Task SavePlatformSettingsAsync()
+    {
+        if (!Ui.IsAuthenticated || !(Ui.IsLocalSingleUser || Ui.IsAdmin))
+        {
+            return;
+        }
+
+        _savingPlatform = true;
+        try
+        {
+            PlatformSettings baseSettings = _loadedPlatformSettings ?? await AuthService.GetSettingsAsync();
+            var updated = new PlatformSettings
+            {
+                Id = PlatformSettings.SingletonId,
+                AllowOpenRegistration = baseSettings.AllowOpenRegistration,
+                SessionIdleTimeoutMinutes = baseSettings.SessionIdleTimeoutMinutes,
+                MaxUploadBytes = Math.Max(1L, _maxUploadMiB) * 1024L * 1024L,
+                MaxSaveQuotaBytesPerApp = Math.Max(1L, _maxSaveQuotaMiB) * 1024L * 1024L,
+                MaxStepInstructionsPerTurn = Math.Max(1000, _maxStepsPerTurn),
+                DefaultCompilerOptionsJson = _defaultCompilerOptions?.ToJson(),
+                MaxUndoSteps = Math.Max(0, _maxUndoSteps),
+                AutoRollbackOnError = _autoRollbackOnError,
+            };
+
+            _loadedPlatformSettings = await AuthService.UpdateSettingsAsync(Ui.CurrentUser!.Id, updated);
+            Snackbar.Add(Ui.T("settings.saved"), Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add(ex.Message, Severity.Error);
+        }
+        finally
+        {
+            _savingPlatform = false;
         }
     }
 

@@ -90,9 +90,9 @@ public static class FormatHelpers
     {
         SubmissionStatus.Compiling => ui.T("appDetail.statusCompiling"),
         SubmissionStatus.CompileFailed => ui.T("appDetail.statusCompileFailed"),
-        SubmissionStatus.PendingReview => ui.T("appDetail.statusPendingReview"),
-        SubmissionStatus.Published => ui.T("appDetail.statusPublished"),
-        SubmissionStatus.Superseded => ui.T("appDetail.statusSuperseded"),
+        SubmissionStatus.PendingReview => ui.IsLocalSingleUser ? ui.T("appDetail.statusCompiling") : ui.T("appDetail.statusPendingReview"),
+        SubmissionStatus.Published => ui.IsLocalSingleUser ? ui.T("appDetail.statusReady") : ui.T("appDetail.statusPublished"),
+        SubmissionStatus.Superseded => ui.IsLocalSingleUser ? ui.T("appDetail.statusArchived") : ui.T("appDetail.statusSuperseded"),
         SubmissionStatus.Rejected => ui.T("appDetail.statusRejected"),
         _ => status.ToString(),
     };

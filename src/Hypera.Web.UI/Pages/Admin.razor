@@ -625,6 +625,7 @@ else
         _busy = true;
         try
         {
+            PlatformSettings existing = await AuthService.GetSettingsAsync();
             var updated = new PlatformSettings
             {
                 Id = PlatformSettings.SingletonId,
@@ -633,6 +634,9 @@ else
                 MaxSaveQuotaBytesPerApp = Math.Max(1L, _maxSaveQuotaMiB) * 1024L * 1024L,
                 MaxStepInstructionsPerTurn = Math.Max(1000, _maxStepsPerTurn),
                 SessionIdleTimeoutMinutes = Math.Max(1, _idleTimeoutMinutes),
+                DefaultCompilerOptionsJson = existing.DefaultCompilerOptionsJson,
+                MaxUndoSteps = existing.MaxUndoSteps,
+                AutoRollbackOnError = existing.AutoRollbackOnError,
             };
 
             await AuthService.UpdateSettingsAsync(Ui.CurrentUser!.Id, updated);

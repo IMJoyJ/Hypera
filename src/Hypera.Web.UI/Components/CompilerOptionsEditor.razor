@@ -1,0 +1,216 @@
+@inject UiSessionState Ui
+
+<MudStack Spacing="2">
+    <div class="d-flex flex-wrap align-center justify-space-between gap-2">
+        <div class="d-flex align-center gap-2">
+            <MudText Typo="Typo.subtitle2" Style="font-weight: 600;">@Ui.T("compiler.title")</MudText>
+            @if (EffectiveValue.HasAnyOverride)
+            {
+                <MudChip T="string" Size="Size.Small" Color="Color.Primary" Variant="Variant.Outlined">
+                    @Ui.T("compiler.overrideCount", EffectiveValue.OverrideCount.ToString())
+                </MudChip>
+            }
+            else
+            {
+                <MudChip T="string" Size="Size.Small" Color="Color.Default" Variant="Variant.Text">
+                    @Ui.T("compiler.allDefault")
+                </MudChip>
+            }
+        </div>
+
+        @if (EffectiveValue.HasAnyOverride)
+        {
+            <MudButton Variant="Variant.Text"
+                       Size="Size.Small"
+                       Color="Color.Secondary"
+                       StartIcon="@Icons.Material.Filled.RestartAlt"
+                       Disabled="@Disabled"
+                       OnClick="@ResetAllAsync">
+                @Ui.T("compiler.resetAll")
+            </MudButton>
+        }
+    </div>
+
+    <MudText Typo="Typo.caption" Color="Color.Secondary">@Ui.T("compiler.hint")</MudText>
+
+    @if (Collapsible)
+    {
+        <MudExpansionPanels Elevation="0" Dense="true" Outlined="true">
+            <MudExpansionPanel Text="@CommonPanelTitle" Expanded="@DefaultExpanded">
+                @RenderCommonGrid()
+            </MudExpansionPanel>
+            <MudExpansionPanel Text="@Ui.T("compiler.sectionAdvanced")">
+                @RenderAdvancedGrid()
+            </MudExpansionPanel>
+        </MudExpansionPanels>
+    }
+    else
+    {
+        <MudText Typo="Typo.caption" Color="Color.Primary" Style="font-weight: 600; letter-spacing: 0.02em;">
+            @Ui.T("compiler.sectionCommon")
+        </MudText>
+        @RenderCommonGrid()
+
+        <MudExpansionPanels Elevation="0" Dense="true" Outlined="true" Class="mt-1">
+            <MudExpansionPanel Text="@Ui.T("compiler.sectionAdvanced")">
+                @RenderAdvancedGrid()
+            </MudExpansionPanel>
+        </MudExpansionPanels>
+    }
+</MudStack>
+
+@code {
+    [Parameter]
+    public CompilerOptionsOverride? Value { get; set; }
+
+    [Parameter]
+    public EventCallback<CompilerOptionsOverride?> ValueChanged { get; set; }
+
+    [Parameter]
+    public bool Collapsible { get; set; }
+
+    [Parameter]
+    public bool DefaultExpanded { get; set; }
+
+    [Parameter]
+    public bool Disabled { get; set; }
+
+    private CompilerOptionsOverride EffectiveValue => Value ?? new CompilerOptionsOverride();
+
+    private string CommonPanelTitle => EffectiveValue.HasAnyOverride
+        ? $"{Ui.T("compiler.sectionCommon")} ({Ui.T("compiler.overrideCount", EffectiveValue.OverrideCount.ToString())})"
+        : Ui.T("compiler.sectionCommon");
+
+    private RenderFragment RenderCommonGrid() => __builder =>
+    {
+        <MudGrid Spacing="2" Class="pt-1">
+            <MudItem xs="12" sm="6">
+                <MudSelect T="string"
+                           Value="@BoolToChoice(EffectiveValue.UseNewRandom)"
+                           ValueChanged="@(v => UpdateAsync(o => o with { UseNewRandom = ChoiceToBool(v) }))"
+                           Label="@Ui.T("compiler.opt.UseNewRandom")"
+                           Variant="Variant.Outlined"
+                           Margin="Margin.Dense"
+                           Dense="true"
+                           Disabled="@Disabled">
+                    <MudSelectItem Value="@("default")">@Ui.T("compiler.followGame")</MudSelectItem>
+                    <MudSelectItem Value="@("false")">@Ui.T("compiler.opt.UseNewRandom.sfmt")</MudSelectItem>
+                    <MudSelectItem Value="@("true")">@Ui.T("compiler.opt.UseNewRandom.new")</MudSelectItem>
+                </MudSelect>
+            </MudItem>
+
+            @RenderBoolField("compiler.opt.IgnoreUncalledFunction", EffectiveValue.IgnoreUncalledFunction, (o, b) => o with { IgnoreUncalledFunction = b })
+            @RenderBoolField("compiler.opt.AllowFunctionOverloading", EffectiveValue.AllowFunctionOverloading, (o, b) => o with { AllowFunctionOverloading = b })
+            @RenderBoolField("compiler.opt.CompatiFuncArgOptional", EffectiveValue.CompatiFuncArgOptional, (o, b) => o with { CompatiFuncArgOptional = b })
+            @RenderBoolField("compiler.opt.CompatiFuncArgAutoConvert", EffectiveValue.CompatiFuncArgAutoConvert, (o, b) => o with { CompatiFuncArgAutoConvert = b })
+            @RenderBoolField("compiler.opt.CompatiCallEvent", EffectiveValue.CompatiCallEvent, (o, b) => o with { CompatiCallEvent = b })
+            @RenderBoolField("compiler.opt.CompatiErrorLine", EffectiveValue.CompatiErrorLine, (o, b) => o with { CompatiErrorLine = b })
+            @RenderBoolField("compiler.opt.UseERD", EffectiveValue.UseERD, (o, b) => o with { UseERD = b })
+            @RenderBoolField("compiler.opt.UseScopedVariableInstruction", EffectiveValue.UseScopedVariableInstruction, (o, b) => o with { UseScopedVariableInstruction = b })
+            @RenderBoolField("compiler.opt.UseButtonFocusBackgroundColor", EffectiveValue.UseButtonFocusBackgroundColor, (o, b) => o with { UseButtonFocusBackgroundColor = b })
+        </MudGrid>
+    };
+
+    private RenderFragment RenderAdvancedGrid() => __builder =>
+    {
+        <MudGrid Spacing="2" Class="pt-1">
+            <MudItem xs="12" sm="6">
+                <MudSelect T="string"
+                           Value="@SifToChoice(EffectiveValue.SifBlankLineBehavior)"
+                           ValueChanged="@(v => UpdateAsync(o => o with { SifBlankLineBehavior = ChoiceToSif(v) }))"
+                           Label="@Ui.T("compiler.opt.SifBlankLineBehavior")"
+                           Variant="Variant.Outlined"
+                           Margin="Margin.Dense"
+                           Dense="true"
+                           Disabled="@Disabled">
+                    <MudSelectItem Value="@("default")">@Ui.T("compiler.followGame")</MudSelectItem>
+                    <MudSelectItem Value="@("standard")">@Ui.T("compiler.opt.SifBlankLineBehavior.standard")</MudSelectItem>
+                    <MudSelectItem Value="@("eramaker")">@Ui.T("compiler.opt.SifBlankLineBehavior.eramaker")</MudSelectItem>
+                </MudSelect>
+            </MudItem>
+
+            @RenderBoolField("compiler.opt.IgnoreCase", EffectiveValue.IgnoreCase, (o, b) => o with { IgnoreCase = b })
+            @RenderBoolField("compiler.opt.CompatiFunctionNoIgnoreCase", EffectiveValue.CompatiFunctionNoIgnoreCase, (o, b) => o with { CompatiFunctionNoIgnoreCase = b })
+            @RenderBoolField("compiler.opt.SystemAllowFullSpace", EffectiveValue.SystemAllowFullSpace, (o, b) => o with { SystemAllowFullSpace = b })
+            @RenderBoolField("compiler.opt.SystemIgnoreTripleSymbol", EffectiveValue.SystemIgnoreTripleSymbol, (o, b) => o with { SystemIgnoreTripleSymbol = b })
+            @RenderBoolField("compiler.opt.CompatiRAND", EffectiveValue.CompatiRAND, (o, b) => o with { CompatiRAND = b })
+            @RenderBoolField("compiler.opt.CompatiCALLNAME", EffectiveValue.CompatiCALLNAME, (o, b) => o with { CompatiCALLNAME = b })
+            @RenderBoolField("compiler.opt.CompatiSPChara", EffectiveValue.CompatiSPChara, (o, b) => o with { CompatiSPChara = b })
+            @RenderBoolField("compiler.opt.CompatiLinefeedAs1739", EffectiveValue.CompatiLinefeedAs1739, (o, b) => o with { CompatiLinefeedAs1739 = b })
+            @RenderBoolField("compiler.opt.TimesNotRigorousCalculation", EffectiveValue.TimesNotRigorousCalculation, (o, b) => o with { TimesNotRigorousCalculation = b })
+            @RenderBoolField("compiler.opt.SystemNoTarget", EffectiveValue.SystemNoTarget, (o, b) => o with { SystemNoTarget = b })
+            @RenderBoolField("compiler.opt.SystemIgnoreStringSet", EffectiveValue.SystemIgnoreStringSet, (o, b) => o with { SystemIgnoreStringSet = b })
+            @RenderBoolField("compiler.opt.WarnFunctionOverloading", EffectiveValue.WarnFunctionOverloading, (o, b) => o with { WarnFunctionOverloading = b })
+            @RenderBoolField("compiler.opt.WarnNormalFunctionOverloading", EffectiveValue.WarnNormalFunctionOverloading, (o, b) => o with { WarnNormalFunctionOverloading = b })
+            @RenderBoolField("compiler.opt.CheckDuplicateIdentifier", EffectiveValue.CheckDuplicateIdentifier, (o, b) => o with { CheckDuplicateIdentifier = b })
+            @RenderBoolField("compiler.opt.UseRenameFile", EffectiveValue.UseRenameFile, (o, b) => o with { UseRenameFile = b })
+            @RenderBoolField("compiler.opt.UseReplaceFile", EffectiveValue.UseReplaceFile, (o, b) => o with { UseReplaceFile = b })
+            @RenderBoolField("compiler.opt.SearchSubdirectory", EffectiveValue.SearchSubdirectory, (o, b) => o with { SearchSubdirectory = b })
+            @RenderBoolField("compiler.opt.SortWithFilename", EffectiveValue.SortWithFilename, (o, b) => o with { SortWithFilename = b })
+            @RenderBoolField("compiler.opt.VarsizeDimConfig", EffectiveValue.VarsizeDimConfig, (o, b) => o with { VarsizeDimConfig = b })
+        </MudGrid>
+    };
+
+    private RenderFragment RenderBoolField(
+        string labelKey,
+        bool? currentValue,
+        Func<CompilerOptionsOverride, bool?, CompilerOptionsOverride> mutator) => __builder =>
+    {
+        <MudItem xs="12" sm="6">
+            <MudSelect T="string"
+                       Value="@BoolToChoice(currentValue)"
+                       ValueChanged="@(v => UpdateAsync(o => mutator(o, ChoiceToBool(v))))"
+                       Label="@Ui.T(labelKey)"
+                       Variant="Variant.Outlined"
+                       Margin="Margin.Dense"
+                       Dense="true"
+                       Disabled="@Disabled">
+                <MudSelectItem Value="@("default")">@Ui.T("compiler.followGame")</MudSelectItem>
+                <MudSelectItem Value="@("true")">@Ui.T("compiler.enabled")</MudSelectItem>
+                <MudSelectItem Value="@("false")">@Ui.T("compiler.disabled")</MudSelectItem>
+            </MudSelect>
+        </MudItem>
+    };
+
+    private async Task UpdateAsync(Func<CompilerOptionsOverride, CompilerOptionsOverride> mutator)
+    {
+        CompilerOptionsOverride next = mutator(EffectiveValue);
+        CompilerOptionsOverride? normalized = next.HasAnyOverride ? next : null;
+        Value = normalized;
+        await ValueChanged.InvokeAsync(normalized);
+    }
+
+    private async Task ResetAllAsync()
+    {
+        Value = null;
+        await ValueChanged.InvokeAsync(null);
+    }
+
+    private static string BoolToChoice(bool? value) => value switch
+    {
+        true => "true",
+        false => "false",
+        null => "default",
+    };
+
+    private static bool? ChoiceToBool(string? choice) => choice switch
+    {
+        "true" => true,
+        "false" => false,
+        _ => null,
+    };
+
+    private static string SifToChoice(SifBlankLineBehavior? value) => value switch
+    {
+        SifBlankLineBehavior.EmueraStandard => "standard",
+        SifBlankLineBehavior.EramakerBlankLineConsumesCondition => "eramaker",
+        _ => "default",
+    };
+
+    private static SifBlankLineBehavior? ChoiceToSif(string? choice) => choice switch
+    {
+        "standard" => SifBlankLineBehavior.EmueraStandard,
+        "eramaker" => SifBlankLineBehavior.EramakerBlankLineConsumesCondition,
+        _ => null,
+    };
+}

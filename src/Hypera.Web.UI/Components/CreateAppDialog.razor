@@ -2,11 +2,12 @@
 @inject IAppCatalogService CatalogService
 @inject IPackagePipelineService PipelineService
 @inject IAuthService AuthService
+@inject ILocalFilePickerService LocalPicker
 @inject ISnackbar Snackbar
 
 <MudDialog>
     <TitleContent>
-        <MudText Typo="Typo.h6">@Ui.T("catalog.newApp")</MudText>
+        <MudText Typo="Typo.h6">@(Ui.IsLocalSingleUser ? Ui.T("catalog.importGame") : Ui.T("catalog.newApp"))</MudText>
     </TitleContent>
     <DialogContent>
         <MudStack Spacing="3">
@@ -29,7 +30,7 @@
                           Lines="2" />
 
             <MudGrid Spacing="2">
-                <MudItem xs="6">
+                <MudItem xs="12" sm="6">
                     <MudTextField @bind-Value="_versionLabel"
                                   Label="@Ui.T("catalog.initialVersion")"
                                   Variant="Variant.Outlined"
@@ -37,7 +38,7 @@
                                   Immediate="true"
                                   Required="true" />
                 </MudItem>
-                <MudItem xs="6">
+                <MudItem xs="12" sm="6">
                     <MudSelect T="string"
                                @bind-Value="_languageCode"
                                Label="@Ui.T("catalog.languageCode")"
@@ -51,34 +52,98 @@
                 </MudItem>
             </MudGrid>
 
-            <MudSwitch @bind-Value="_allowSourceDownload"
-                       Color="Color.Primary"
-                       Label="@Ui.T("catalog.allowSourceDownload")" />
+            @if (!Ui.IsLocalSingleUser)
+            {
+                <MudSwitch @bind-Value="_allowSourceDownload"
+                           Color="Color.Primary"
+                           Label="@Ui.T("catalog.allowSourceDownload")" />
+            }
 
-            <div class="d-flex align-center gap-3">
-                <MudFileUpload T="IBrowserFile"
-                               Accept=".zip"
-                               FilesChanged="@OnFileSelected">
-                    <ActivatorContent>
-                        <MudButton Variant="Variant.Outlined"
-                                   Color="Color.Primary"
-                                   StartIcon="@Icons.Material.Filled.UploadFile"
-                                   Disabled="@_submitting">
-                            @Ui.T("appDetail.selectZip")
-                        </MudButton>
-                    </ActivatorContent>
-                </MudFileUpload>
-                @if (_zipFile is not null)
-                {
-                    <MudText Typo="Typo.body2">@_zipFile.Name (@FormatHelpers.FormatBytes(_zipFile.Size))</MudText>
-                }
-                else
-                {
-                    <MudText Typo="Typo.caption" Color="Color.Secondary">
-                        @Ui.T("appDetail.maxSize", FormatHelpers.FormatBytes(_maxUploadBytes))
-                    </MudText>
-                }
-            </div>
+            <MudPaper Outlined="true" Class="pa-3">
+                <MudStack Spacing="2">
+                    <MudText Typo="Typo.subtitle2" Style="font-weight: 600;">@Ui.T("catalog.importSource")</MudText>
+
+                    @if (LocalPicker.SupportsLocalFilePick)
+                    {
+                        <div class="d-flex flex-wrap align-center gap-2">
+                            <MudButton Variant="Variant.Outlined"
+                                       Color="Color.Primary"
+                                       StartIcon="@Icons.Material.Filled.FolderZip"
+                                       Disabled="@_submitting"
+                                       OnClick="@PickLocalFileAsync">
+                                @Ui.T("catalog.pickPackageFile")
+                            </MudButton>
+
+                            @if (LocalPicker.SupportsLocalFolderPick)
+                            {
+                                <MudButton Variant="Variant.Outlined"
+                                           Color="Color.Secondary"
+                                           StartIcon="@Icons.Material.Filled.FolderOpen"
+                                           Disabled="@_submitting"
+                                           OnClick="@PickLocalFolderAsync">
+                                    @Ui.T("catalog.pickFolder")
+                                </MudButton>
+                            }
+                        </div>
+
+                        @if (_localFile is not null)
+                        {
+                            <MudText Typo="Typo.body2" Class="hypera-mono">
+                                @_localFile.FileName (@FormatHelpers.FormatBytes(_localFile.ByteSize))
+                            </MudText>
+                            @if (IsSelectedLocalHep)
+                            {
+                                <MudAlert Severity="Severity.Info" Dense="true">@Ui.T("catalog.prebuiltHepHint")</MudAlert>
+                                <MudSwitch @bind-Value="_forceRecompileHep"
+                                           Color="Color.Primary"
+                                           Size="Size.Small"
+                                           Label="@Ui.T("catalog.forceRecompileHep")" />
+                            }
+                        }
+                        else if (!string.IsNullOrWhiteSpace(_localFolderPath))
+                        {
+                            <MudText Typo="Typo.body2" Class="hypera-mono" Style="word-break: break-all;">
+                                @_localFolderPath
+                            </MudText>
+                        }
+                        else
+                        {
+                            <MudText Typo="Typo.caption" Color="Color.Secondary">@Ui.T("catalog.noSourceSelected")</MudText>
+                        }
+                    }
+                    else
+                    {
+                        <div class="d-flex flex-wrap align-center gap-3">
+                            <MudFileUpload T="IBrowserFile"
+                                           Accept=".zip"
+                                           FilesChanged="@OnBrowserFileSelected">
+                                <ActivatorContent>
+                                    <MudButton Variant="Variant.Outlined"
+                                               Color="Color.Primary"
+                                               StartIcon="@Icons.Material.Filled.UploadFile"
+                                               Disabled="@_submitting">
+                                        @Ui.T("appDetail.selectZip")
+                                    </MudButton>
+                                </ActivatorContent>
+                            </MudFileUpload>
+                            @if (_browserZipFile is not null)
+                            {
+                                <MudText Typo="Typo.body2">@_browserZipFile.Name (@FormatHelpers.FormatBytes(_browserZipFile.Size))</MudText>
+                            }
+                            else
+                            {
+                                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                    @Ui.T("appDetail.maxSize", FormatHelpers.FormatBytes(_maxUploadBytes))
+                                </MudText>
+                            }
+                        </div>
+                    }
+                </MudStack>
+            </MudPaper>
+
+            <CompilerOptionsEditor @bind-Value="_compilerOptions"
+                                   Collapsible="true"
+                                   Disabled="@_submitting" />
 
             @if (_submitting)
             {
@@ -92,7 +157,7 @@
                    Color="Color.Primary"
                    OnClick="@SubmitAsync"
                    Disabled="@(!CanSubmit)">
-            @Ui.T("catalog.createAndUpload")
+            @(Ui.IsLocalSingleUser ? Ui.T("catalog.createAndImport") : Ui.T("catalog.createAndUpload"))
         </MudButton>
     </DialogActions>
 </MudDialog>
@@ -109,22 +174,35 @@
     private string _versionLabel = "v1.0";
     private string _languageCode = "ja";
     private bool _allowSourceDownload = true;
-    private IBrowserFile? _zipFile;
+    private bool _forceRecompileHep;
+    private IBrowserFile? _browserZipFile;
+    private PickedLocalFile? _localFile;
+    private string? _localFolderPath;
+    private CompilerOptionsOverride? _compilerOptions;
     private long _maxUploadBytes = PlatformSettings.DefaultMaxUploadBytes;
     private bool _submitting;
     private string? _error;
+
+    private bool IsSelectedLocalHep =>
+        _localFile is not null
+        && string.Equals(Path.GetExtension(_localFile.FileName), ".hep", StringComparison.OrdinalIgnoreCase);
 
     private IEnumerable<string> AvailableLanguageChoices =>
         Ui.AvailableLocales.Select(static l => l.Code)
             .Concat(FormatHelpers.CommonLanguageCodes)
             .Distinct(StringComparer.OrdinalIgnoreCase);
 
+    private bool HasSelectedSource =>
+        _localFile is not null
+        || !string.IsNullOrWhiteSpace(_localFolderPath)
+        || _browserZipFile is not null;
+
     private bool CanSubmit =>
         !_submitting
         && !string.IsNullOrWhiteSpace(_title)
         && !string.IsNullOrWhiteSpace(_versionLabel)
         && !string.IsNullOrWhiteSpace(_languageCode)
-        && _zipFile is not null;
+        && HasSelectedSource;
 
     protected override async Task OnInitializedAsync()
     {
@@ -133,54 +211,155 @@
         {
             PlatformSettings settings = await AuthService.GetSettingsAsync();
             _maxUploadBytes = settings.MaxUploadBytes;
+            _compilerOptions = CompilerOptionsOverride.FromJson(settings.DefaultCompilerOptionsJson);
         }
         catch
         {
-            // Keep default max upload size
+            // Keep default settings
         }
     }
 
-    private void OnFileSelected(IBrowserFile? file)
+    private async Task PickLocalFileAsync()
     {
-        _zipFile = file;
         _error = null;
+        try
+        {
+            PickedLocalFile? picked = await LocalPicker.PickPackageFileAsync();
+            if (picked is null)
+            {
+                return;
+            }
+
+            _localFile = picked;
+            _localFolderPath = null;
+            _browserZipFile = null;
+            _forceRecompileHep = false;
+            if (string.IsNullOrWhiteSpace(_title))
+            {
+                _title = Path.GetFileNameWithoutExtension(picked.FileName);
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    private async Task PickLocalFolderAsync()
+    {
+        _error = null;
+        try
+        {
+            string? folder = await LocalPicker.PickGameFolderAsync();
+            if (string.IsNullOrWhiteSpace(folder))
+            {
+                return;
+            }
+
+            _localFolderPath = folder;
+            _localFile = null;
+            _browserZipFile = null;
+            _forceRecompileHep = false;
+            if (string.IsNullOrWhiteSpace(_title))
+            {
+                string trimmed = folder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string folderName = Path.GetFileName(trimmed);
+                if (!string.IsNullOrWhiteSpace(folderName))
+                {
+                    _title = folderName;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    private void OnBrowserFileSelected(IBrowserFile? file)
+    {
+        _browserZipFile = file;
+        _localFile = null;
+        _localFolderPath = null;
+        _error = null;
+        if (file is not null && string.IsNullOrWhiteSpace(_title))
+        {
+            _title = Path.GetFileNameWithoutExtension(file.Name);
+        }
     }
 
     private void Cancel() => MudDialog.Cancel();
 
     private async Task SubmitAsync()
     {
-        if (!CanSubmit || _zipFile is null)
+        if (!CanSubmit)
         {
             return;
         }
 
         _submitting = true;
         _error = null;
+        GameApp? createdApp = null;
         try
         {
-            GameApp app = await CatalogService.CreateAppAsync(UserId, _title.Trim(), _summary.Trim());
+            createdApp = await CatalogService.CreateAppAsync(UserId, _title.Trim(), _summary.Trim());
             GameVersion version = await CatalogService.InsertVersionAsync(
                 UserId,
-                app.Id,
+                createdApp.Id,
                 _versionLabel.Trim(),
                 string.Empty,
                 VersionInsertPosition.NewestHead);
 
-            await using Stream stream = _zipFile.OpenReadStream(_maxUploadBytes);
-            await PipelineService.SubmitZipPackageAsync(new PackageUploadRequest(
-                VersionId: version.Id,
-                LanguageCode: _languageCode.Trim(),
-                UploadedByUserId: UserId,
-                AllowSourceDownload: _allowSourceDownload,
-                ZipArchiveStream: stream,
-                DeclaredByteLength: _zipFile.Size));
+            CompilerOptionsOverride effectiveOptions = _compilerOptions ?? new CompilerOptionsOverride();
+            if (_localFile is not null)
+            {
+                await PipelineService.SubmitLocalFileAsync(new LocalPackageFileImportRequest(
+                    VersionId: version.Id,
+                    LanguageCode: _languageCode.Trim(),
+                    UploadedByUserId: UserId,
+                    FilePath: _localFile.FullPath,
+                    CompilerOptions: effectiveOptions,
+                    ForceRecompile: _forceRecompileHep));
+            }
+            else if (!string.IsNullOrWhiteSpace(_localFolderPath))
+            {
+                await PipelineService.SubmitLocalDirectoryAsync(new LocalDirectoryImportRequest(
+                    VersionId: version.Id,
+                    LanguageCode: _languageCode.Trim(),
+                    UploadedByUserId: UserId,
+                    DirectoryPath: _localFolderPath,
+                    CompilerOptions: effectiveOptions));
+            }
+            else if (_browserZipFile is not null)
+            {
+                await using Stream stream = _browserZipFile.OpenReadStream(_maxUploadBytes);
+                await PipelineService.SubmitZipPackageAsync(new PackageUploadRequest(
+                    VersionId: version.Id,
+                    LanguageCode: _languageCode.Trim(),
+                    UploadedByUserId: UserId,
+                    AllowSourceDownload: _allowSourceDownload,
+                    ZipArchiveStream: stream,
+                    DeclaredByteLength: _browserZipFile.Size,
+                    CompilerOptions: effectiveOptions));
+            }
 
-            Snackbar.Add(Ui.T("appDetail.uploaded"), Severity.Success);
-            MudDialog.Close(DialogResult.Ok(app.Id));
+            Snackbar.Add(Ui.IsLocalSingleUser ? Ui.T("appDetail.imported") : Ui.T("appDetail.uploaded"), Severity.Success);
+            MudDialog.Close(DialogResult.Ok(createdApp.Id));
         }
         catch (Exception ex)
         {
+            if (createdApp is not null)
+            {
+                try
+                {
+                    await CatalogService.DeleteAppAsync(UserId, createdApp.Id);
+                }
+                catch
+                {
+                    // Best-effort cleanup of empty shell app
+                }
+            }
+
             _error = ex.Message;
         }
         finally

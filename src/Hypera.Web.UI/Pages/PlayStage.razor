@@ -6,228 +6,332 @@
 @inject UiSessionState Ui
 @inject IAppCatalogService CatalogService
 @inject IRuntimeSessionManager SessionManager
+@inject IHostWindowService HostWindow
 @inject ISnackbar Snackbar
 @inject IJSRuntime Js
 @inject NavigationManager Navigation
 
-@* Top Compact Control Bar *@
-<MudPaper Outlined="true" Class="px-3 py-2 mb-3">
-    <div class="d-flex flex-wrap align-center gap-2">
-        <MudIconButton Icon="@Icons.Material.Filled.ArrowBack"
-                       Size="Size.Small"
-                       title="@Ui.T("player.backToApp")"
-                       Href="@($"/apps/{AppId}")" />
-
-        <MudText Typo="Typo.subtitle1" Style="font-weight: 600;" Class="mr-2">
-            @(_app?.Title ?? "Hypera")
-        </MudText>
-
-        @if (_playableVersions.Count > 0)
-        {
-            <MudSelect T="Guid"
-                       Value="_activeVersionId"
-                       ValueChanged="@OnVersionChangedAsync"
-                       Dense="true"
-                       Variant="Variant.Outlined"
-                       Margin="Margin.Dense"
-                       Style="max-width: 150px;">
-                @foreach (GameVersion ver in _playableVersions)
-                {
-                    <MudSelectItem Value="@ver.Id">@ver.VersionLabel</MudSelectItem>
-                }
-            </MudSelect>
-
-            <MudSelect T="string"
-                       Value="_activeLanguageCode"
-                       ValueChanged="@OnLanguageChangedAsync"
-                       Dense="true"
-                       Variant="Variant.Outlined"
-                       Margin="Margin.Dense"
-                       Style="max-width: 120px;">
-                @foreach (string lang in ActiveVersionLanguages)
-                {
-                    <MudSelectItem Value="@lang">@lang</MudSelectItem>
-                }
-            </MudSelect>
-        }
-
-        <MudSpacer />
-
-        <MudIconButton Icon="@(_muted ? Icons.Material.Filled.VolumeOff : Icons.Material.Filled.VolumeUp)"
-                       Size="Size.Small"
-                       Color="@(_muted ? Color.Secondary : Color.Default)"
-                       title="@(_muted ? Ui.T("player.unmute") : Ui.T("player.mute"))"
-                       OnClick="@ToggleMuteAsync" />
-
-        <MudSlider T="int"
-                   Value="_masterVolume"
-                   ValueChanged="@OnVolumeChangedAsync"
-                   Min="0"
-                   Max="100"
-                   Size="Size.Small"
-                   Style="width: 84px;" />
-
-        @if (_renderState is { Summary.MaxUndoSteps: > 0 })
-        {
-            <MudButton Variant="Variant.Outlined"
-                       Size="Size.Small"
-                       StartIcon="@Icons.Material.Filled.Undo"
-                       Disabled="@(_busy || !_renderState.Summary.CanUndo)"
-                       title="@Ui.T("player.undoTooltip", _renderState.Summary.UndoCount.ToString(CultureInfo.InvariantCulture), _renderState.Summary.MaxUndoSteps.ToString(CultureInfo.InvariantCulture))"
-                       OnClick="@UndoSessionAsync">
-                @(_renderState.Summary.MaxUndoSteps > 1
-                    ? $"{Ui.T("player.undo")} ({_renderState.Summary.UndoCount}/{_renderState.Summary.MaxUndoSteps})"
-                    : Ui.T("player.undo"))
-            </MudButton>
-        }
-
-        <MudButton Variant="Variant.Outlined"
-                   Size="Size.Small"
-                   StartIcon="@Icons.Material.Filled.Replay"
-                   Disabled="@_busy"
-                   OnClick="@RestartSessionAsync">
-            @Ui.T("app.restart")
-        </MudButton>
-
-        <MudButton Variant="Variant.Outlined"
-                   Size="Size.Small"
-                   StartIcon="@Icons.Material.Filled.Save"
-                   OnClick="@(() => _savesDrawerOpen = !_savesDrawerOpen)">
-            @Ui.T("saves.title")
-        </MudButton>
-    </div>
-</MudPaper>
-
-@if (!string.IsNullOrWhiteSpace(_error))
-{
-    <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
-}
-
-@if (_renderState is not null && !string.IsNullOrWhiteSpace(_renderState.FaultMessage) && !_faultBannerDismissed)
-{
-    <MudAlert Severity="@(_renderState.AutoRolledBackOnFault ? Severity.Warning : Severity.Error)"
-              Dense="true"
-              ShowCloseIcon="@_renderState.AutoRolledBackOnFault"
-              CloseIconClicked="@(() => _faultBannerDismissed = true)"
-              Class="mb-3">
-        <div class="d-flex flex-wrap align-center justify-space-between gap-2">
-            <div>
-                <strong>@Ui.T("player.faulted"):</strong> @_renderState.FaultMessage
-                @if (_renderState.AutoRolledBackOnFault)
-                {
-                    <div class="mt-1">@Ui.T("player.autoRolledBack")</div>
-                }
-            </div>
-            @if (!_renderState.AutoRolledBackOnFault && _renderState.Summary.CanUndo)
-            {
-                <MudButton Variant="Variant.Outlined"
-                           Color="Color.Warning"
+<div class="@(Ui.IsFullscreen ? "hypera-play-shell hypera-play-shell-fullscreen" : "hypera-play-shell")">
+    @* Compact Single-Row Top Bar (hidden in fullscreen; replaced by translucent corner overlay) *@
+    @if (!Ui.IsFullscreen)
+    {
+        <div class="hypera-play-topbar">
+            <MudIconButton Icon="@Icons.Material.Filled.ArrowBack"
                            Size="Size.Small"
-                           StartIcon="@Icons.Material.Filled.Undo"
-                           Disabled="@_busy"
-                           OnClick="@UndoSessionAsync">
-                    @Ui.T("player.undo")
-                </MudButton>
-            }
-        </div>
-    </MudAlert>
-}
+                           title="@Ui.T("player.backToApp")"
+                           Href="@($"/apps/{AppId}")" />
 
-@* Locked LogicalViewport Stage with Smooth Transform Scaling *@
-<div class="hypera-stage-wrapper" @ref="_wrapperRef">
-    @if (_loading)
-    {
-        <MudProgressCircular Indeterminate="true" Color="Color.Primary" />
-    }
-    else if (_renderState is null)
-    {
-        <MudStack AlignItems="AlignItems.Center" Spacing="2">
-            <MudText Typo="Typo.body1" Color="Color.Secondary">@Ui.T("player.noActiveSession")</MudText>
-            <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="@StartOrAttachSessionAsync">
-                @Ui.T("player.startSession")
-            </MudButton>
-        </MudStack>
-    }
-    else
-    {
-        ConsoleScene scene = _renderState.Scene;
-        LogicalViewport vp = scene.Viewport;
-        string bgCss = FormatHelpers.FormatRgbaCss(scene.BackgroundColorRgba);
+            <span class="hypera-play-title" title="@(_app?.Title ?? "Hypera")">
+                @(_app?.Title ?? "Hypera")
+            </span>
 
-        <div class="hypera-stage-box">
-            <div class="hypera-stage"
-                 tabindex="0"
-                 @ref="_stageRef"
-                 style="@($"width:{vp.LogicalWidth}px;height:{vp.LogicalHeight}px;background-color:{bgCss};")"
-                 @onclick="@OnStageClickAsync"
-                 @onkeydown="@OnStageKeyDownAsync">
-
-                @foreach (StageRenderItem item in _renderItems)
+            @if (_playableVersions.Count > 0)
+            {
+                bool hasMultipleBuilds = _playableVersions.Count > 1 || ActiveVersionLanguages.Count() > 1;
+                if (hasMultipleBuilds)
                 {
-                    switch (item.Kind)
-                    {
-                        case StageItemKind.Image:
-                        {
-                            string? resolvedKey = _hoveredItemKey == item.Key && !string.IsNullOrEmpty(item.HoverAssetKey)
-                                ? item.HoverAssetKey
-                                : item.AssetKey;
-
-                            if (!string.IsNullOrEmpty(resolvedKey) && _assetCache.TryGetValue(resolvedKey, out AssetCacheEntry? asset) && !string.IsNullOrEmpty(asset.BlobUrl))
+                    <MudMenu Dense="true"
+                             AnchorOrigin="Origin.BottomLeft"
+                             TransformOrigin="Origin.TopLeft">
+                        <ActivatorContent>
+                            <MudButton Variant="Variant.Outlined"
+                                       Size="Size.Small"
+                                       EndIcon="@Icons.Material.Filled.ArrowDropDown"
+                                       Class="text-none px-2"
+                                       Style="height: 28px; min-width: 0; font-size: 0.78rem;">
+                                @ActiveBuildLabel
+                            </MudButton>
+                        </ActivatorContent>
+                        <ChildContent>
+                            @foreach (GameVersion ver in _playableVersions)
                             {
-                                string imgClass = BuildImageClass(item);
-                                string imgStyle = BuildImageStyle(item, asset, vp);
-                                <img @key="item.Key"
-                                     class="@imgClass"
-                                     src="@asset.BlobUrl"
-                                     style="@imgStyle"
-                                     title="@item.Tooltip"
-                                     alt=""
-                                     @onmouseenter="@(() => OnItemHover(item, true))"
-                                     @onmouseleave="@(() => OnItemHover(item, false))" />
+                                foreach (string lang in GetPlayableLanguagesFor(ver))
+                                {
+                                    bool isCurrent = ver.Id == _activeVersionId
+                                        && string.Equals(lang, _activeLanguageCode, StringComparison.OrdinalIgnoreCase);
+                                    <MudMenuItem OnClick="@(() => SwitchBuildAsync(ver.Id, lang))">
+                                        <div class="d-flex align-center justify-space-between gap-3" style="min-width: 150px;">
+                                            <MudText Typo="Typo.body2" Style="@(isCurrent ? "font-weight: 600;" : "")">
+                                                @ver.VersionLabel · @lang
+                                            </MudText>
+                                            @if (isCurrent)
+                                            {
+                                                <MudIcon Icon="@Icons.Material.Filled.Check" Size="Size.Small" Color="Color.Primary" />
+                                            }
+                                        </div>
+                                    </MudMenuItem>
+                                }
+                            }
+                        </ChildContent>
+                    </MudMenu>
+                }
+                else if (!string.IsNullOrWhiteSpace(ActiveBuildLabel))
+                {
+                    <MudChip T="string"
+                             Size="Size.Small"
+                             Variant="Variant.Outlined"
+                             Color="Color.Secondary"
+                             Class="ma-0"
+                             Style="height: 24px; font-size: 0.74rem;">
+                        @ActiveBuildLabel
+                    </MudChip>
+                }
+            }
+
+            <MudSpacer />
+
+            @if (_renderState is { Summary.MaxUndoSteps: > 0 })
+            {
+                <MudTooltip Text="@Ui.T("player.undoTooltip", _renderState.Summary.UndoCount.ToString(CultureInfo.InvariantCulture), _renderState.Summary.MaxUndoSteps.ToString(CultureInfo.InvariantCulture))">
+                    <MudIconButton Icon="@Icons.Material.Filled.Undo"
+                                   Size="Size.Small"
+                                   Color="@(_renderState.Summary.CanUndo ? Color.Primary : Color.Default)"
+                                   Disabled="@(_busy || !_renderState.Summary.CanUndo)"
+                                   OnClick="@UndoSessionAsync" />
+                </MudTooltip>
+            }
+
+            <MudMenu Dense="true"
+                     AnchorOrigin="Origin.BottomRight"
+                     TransformOrigin="Origin.TopRight">
+                <ActivatorContent>
+                    <MudTooltip Text="@Ui.T("settings.audio")">
+                        <MudIconButton Icon="@VolumeIcon"
+                                       Size="Size.Small"
+                                       Color="@(_muted ? Color.Secondary : Color.Default)" />
+                    </MudTooltip>
+                </ActivatorContent>
+                <ChildContent>
+                    <div class="px-3 py-2 d-flex align-center gap-2" style="width: 210px;" @onclick:stopPropagation="true">
+                        <MudIconButton Icon="@(_muted ? Icons.Material.Filled.VolumeOff : Icons.Material.Filled.VolumeUp)"
+                                       Size="Size.Small"
+                                       Color="@(_muted ? Color.Secondary : Color.Primary)"
+                                       title="@(_muted ? Ui.T("player.unmute") : Ui.T("player.mute"))"
+                                       OnClick="@ToggleMuteAsync" />
+                        <MudSlider T="int"
+                                   Value="_masterVolume"
+                                   ValueChanged="@OnVolumeChangedAsync"
+                                   Min="0"
+                                   Max="100"
+                                   Size="Size.Small"
+                                   Class="flex-grow-1" />
+                        <MudText Typo="Typo.caption" Style="min-width: 28px; text-align: right;">@_masterVolume%</MudText>
+                    </div>
+                </ChildContent>
+            </MudMenu>
+
+            <MudTooltip Text="@Ui.T("saves.title")">
+                <MudIconButton Icon="@Icons.Material.Filled.Save"
+                               Size="Size.Small"
+                               OnClick="@(() => _savesDrawerOpen = !_savesDrawerOpen)" />
+            </MudTooltip>
+
+            <MudTooltip Text="@Ui.T("app.restart")">
+                <MudIconButton Icon="@Icons.Material.Filled.Replay"
+                               Size="Size.Small"
+                               Disabled="@_busy"
+                               OnClick="@RestartSessionAsync" />
+            </MudTooltip>
+
+            <MudTooltip Text="@Ui.T("player.fullscreenTooltip")">
+                <MudIconButton Icon="@Icons.Material.Filled.Fullscreen"
+                               Size="Size.Small"
+                               OnClick="@ToggleFullscreenAsync" />
+            </MudTooltip>
+        </div>
+    }
+
+    @* Optional inline error / fault alert banner (never breaks 100dvh because stage-wrapper flex-shrinks cleanly) *@
+    @if (!string.IsNullOrWhiteSpace(_error))
+    {
+        <div class="hypera-play-banner">
+            <MudAlert Severity="Severity.Error"
+                      Dense="true"
+                      ShowCloseIcon="true"
+                      CloseIconClicked="@(() => _error = null)">
+                @_error
+            </MudAlert>
+        </div>
+    }
+
+    @if (_renderState is not null && !string.IsNullOrWhiteSpace(_renderState.FaultMessage) && !_faultBannerDismissed)
+    {
+        <div class="hypera-play-banner">
+            <MudAlert Severity="@(_renderState.AutoRolledBackOnFault ? Severity.Warning : Severity.Error)"
+                      Dense="true"
+                      ShowCloseIcon="true"
+                      CloseIconClicked="@(() => _faultBannerDismissed = true)">
+                <div class="d-flex flex-wrap align-center justify-space-between gap-2">
+                    <span>
+                        <strong>@Ui.T("player.faulted"):</strong> @_renderState.FaultMessage
+                        @if (_renderState.AutoRolledBackOnFault)
+                        {
+                            <span class="ml-2">(@Ui.T("player.autoRolledBack"))</span>
+                        }
+                    </span>
+                    @if (!_renderState.AutoRolledBackOnFault && _renderState.Summary.CanUndo)
+                    {
+                        <MudButton Variant="Variant.Outlined"
+                                   Color="Color.Warning"
+                                   Size="Size.Small"
+                                   StartIcon="@Icons.Material.Filled.Undo"
+                                   Disabled="@_busy"
+                                   OnClick="@UndoSessionAsync">
+                            @Ui.T("player.undo")
+                        </MudButton>
+                    }
+                </div>
+            </MudAlert>
+        </div>
+    }
+
+    @* Locked LogicalViewport Stage filling exact remaining flex space *@
+    <div class="hypera-stage-wrapper" @ref="_wrapperRef">
+        @if (Ui.IsFullscreen)
+        {
+            <div class="hypera-fs-overlay" @onclick:stopPropagation="true">
+                @if (_renderState is { Summary.MaxUndoSteps: > 0 })
+                {
+                    <MudIconButton Icon="@Icons.Material.Filled.Undo"
+                                   Size="Size.Small"
+                                   Color="Color.Inherit"
+                                   Style="color: #E2E8F0;"
+                                   title="@Ui.T("player.undo")"
+                                   Disabled="@(_busy || !_renderState.Summary.CanUndo)"
+                                   OnClick="@UndoSessionAsync" />
+                }
+
+                <MudIconButton Icon="@VolumeIcon"
+                               Size="Size.Small"
+                               Color="Color.Inherit"
+                               Style="color: #E2E8F0;"
+                               title="@(_muted ? Ui.T("player.unmute") : Ui.T("player.mute"))"
+                               OnClick="@ToggleMuteAsync" />
+
+                <MudIconButton Icon="@Icons.Material.Filled.Save"
+                               Size="Size.Small"
+                               Color="Color.Inherit"
+                               Style="color: #E2E8F0;"
+                               title="@Ui.T("saves.title")"
+                               OnClick="@(() => _savesDrawerOpen = !_savesDrawerOpen)" />
+
+                <MudIconButton Icon="@Icons.Material.Filled.FullscreenExit"
+                               Size="Size.Small"
+                               Color="Color.Primary"
+                               title="@Ui.T("player.exitFullscreenTooltip")"
+                               OnClick="@ToggleFullscreenAsync" />
+            </div>
+        }
+
+        @if (_loading)
+        {
+            <MudProgressCircular Indeterminate="true" Color="Color.Primary" />
+        }
+        else if (_renderState is null)
+        {
+            <MudStack AlignItems="AlignItems.Center" Spacing="2">
+                <MudText Typo="Typo.body1" Color="Color.Secondary">@Ui.T("player.noActiveSession")</MudText>
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="@StartOrAttachSessionAsync">
+                    @Ui.T("player.startSession")
+                </MudButton>
+            </MudStack>
+        }
+        else
+        {
+            ConsoleScene scene = _renderState.Scene;
+            LogicalViewport vp = scene.Viewport;
+            string bgCss = FormatHelpers.FormatRgbaCss(scene.BackgroundColorRgba);
+
+            <div class="hypera-stage-box">
+                <div class="hypera-stage"
+                     tabindex="0"
+                     @ref="_stageRef"
+                     style="@($"width:{vp.LogicalWidth}px;height:{vp.LogicalHeight}px;background-color:{bgCss};")"
+                     @onclick="@OnStageClickAsync"
+                     @onkeydown="@OnStageKeyDownAsync"
+                     @onwheel="@OnStageWheelAsync"
+                     @onwheel:preventDefault="true">
+
+                    @foreach (StageRenderItem item in _renderItems)
+                    {
+                        switch (item.Kind)
+                        {
+                            case StageItemKind.Image:
+                            {
+                                string? resolvedKey = _hoveredItemKey == item.Key && !string.IsNullOrEmpty(item.HoverAssetKey)
+                                    ? item.HoverAssetKey
+                                    : item.AssetKey;
+
+                                if (!string.IsNullOrEmpty(resolvedKey) && _assetCache.TryGetValue(resolvedKey, out AssetCacheEntry? asset) && !string.IsNullOrEmpty(asset.BlobUrl))
+                                {
+                                    string imgClass = BuildImageClass(item);
+                                    string imgStyle = BuildImageStyle(item, asset, vp);
+                                    <img @key="item.Key"
+                                         class="@imgClass"
+                                         src="@asset.BlobUrl"
+                                         style="@imgStyle"
+                                         title="@item.Tooltip"
+                                         alt=""
+                                         @onmouseenter="@(() => OnItemHover(item, true))"
+                                         @onmouseleave="@(() => OnItemHover(item, false))" />
+                                }
+
+                                break;
                             }
 
-                            break;
+                            case StageItemKind.Shape:
+                                <div @key="item.Key"
+                                     class="hypera-op hypera-op-shape"
+                                     style="@BuildShapeStyle(item)"></div>
+                                break;
+
+                            case StageItemKind.DivBox:
+                                <div @key="item.Key"
+                                     class="hypera-op hypera-op-div"
+                                     style="@BuildDivStyle(item)"></div>
+                                break;
+
+                            case StageItemKind.Text:
+                                <span @key="item.Key"
+                                      class="@BuildTextClass("hypera-op hypera-op-text", item)"
+                                      style="@BuildTextStyle(item)">@item.Text</span>
+                                break;
+
+                            case StageItemKind.Button:
+                                <span @key="item.Key"
+                                      class="@BuildTextClass("hypera-op hypera-op-button", item)"
+                                      style="@BuildTextStyle(item)"
+                                      title="@item.Tooltip"
+                                      @onclick="@(e => OnButtonClickAsync(item, e))"
+                                      @onclick:stopPropagation="true">@item.Text</span>
+                                break;
                         }
-
-                        case StageItemKind.Shape:
-                            <div @key="item.Key"
-                                 class="hypera-op hypera-op-shape"
-                                 style="@BuildShapeStyle(item)"></div>
-                            break;
-
-                        case StageItemKind.DivBox:
-                            <div @key="item.Key"
-                                 class="hypera-op hypera-op-div"
-                                 style="@BuildDivStyle(item)"></div>
-                            break;
-
-                        case StageItemKind.Text:
-                            <span @key="item.Key"
-                                  class="@BuildTextClass("hypera-op hypera-op-text", item)"
-                                  style="@BuildTextStyle(item)">@item.Text</span>
-                            break;
-
-                        case StageItemKind.Button:
-                            <span @key="item.Key"
-                                  class="@BuildTextClass("hypera-op hypera-op-button", item)"
-                                  style="@BuildTextStyle(item)"
-                                  title="@item.Tooltip"
-                                  @onclick="@(e => OnButtonClickAsync(item, e))"
-                                  @onclick:stopPropagation="true">@item.Text</span>
-                            break;
                     }
-                }
+                </div>
             </div>
-        </div>
-    }
-</div>
 
-@* Interactive Input Bar *@
-@if (_renderState is not null)
-{
-    InputRequest? pending = _renderState.PendingInput;
-    <MudPaper Outlined="true" Class="px-3 py-2 mt-2">
-        <div class="d-flex flex-wrap align-center gap-2">
+            @if (_renderState.ScrollOffsetLines > 0)
+            {
+                <button type="button"
+                        class="hypera-scrollback-pill"
+                        @onclick="@ScrollToBottomAsync"
+                        @onclick:stopPropagation="true">
+                    <span>@Ui.T("player.scrollbackLines", _renderState.ScrollOffsetLines.ToString(CultureInfo.InvariantCulture))</span>
+                    <strong>@Ui.T("player.scrollToBottom")</strong>
+                </button>
+            }
+        }
+    </div>
+
+    @* Dedicated Non-Overlapping Bottom Input Bar *@
+    @if (ShouldShowInputBar && _renderState is not null)
+    {
+        InputRequest? pending = _renderState.PendingInput;
+        bool isCompactPrompt = pending is not null
+            && pending.Kind is not (InputRequestKind.IntValue or InputRequestKind.StringValue or InputRequestKind.OneInt or InputRequestKind.OneString)
+            && _renderState.Summary.EngineStatus != EngineStepStatus.Completed;
+
+        <div class="@(isCompactPrompt ? "hypera-play-inputbar hypera-play-inputbar-compact" : "hypera-play-inputbar")">
             @if (_renderState.Summary.EngineStatus == EngineStepStatus.Completed)
             {
                 <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("player.completed")</MudText>
@@ -238,14 +342,15 @@
             }
             else if (pending is not null && (pending.Kind == InputRequestKind.IntValue || pending.Kind == InputRequestKind.StringValue))
             {
-                <MudTextField @bind-Value="_inputText"
-                              Placeholder="@Ui.T("player.inputPlaceholder")"
-                              Variant="Variant.Outlined"
-                              Margin="Margin.Dense"
-                              Immediate="true"
-                              Disabled="@_busy"
-                              OnKeyDown="@OnInputFieldKeyDownAsync"
-                              Class="flex-grow-1" />
+                <input type="text"
+                       class="hypera-play-input"
+                       @ref="_inputElRef"
+                       value="@_inputText"
+                       @oninput="@(e => _inputText = e.Value?.ToString() ?? string.Empty)"
+                       @onkeydown="@OnInputFieldKeyDownAsync"
+                       placeholder="@Ui.T("player.inputPlaceholder")"
+                       disabled="@_busy"
+                       autocomplete="off" />
 
                 <MudButton Variant="Variant.Filled"
                            Color="Color.Primary"
@@ -257,32 +362,41 @@
             }
             else if (pending is not null && (pending.Kind == InputRequestKind.OneInt || pending.Kind == InputRequestKind.OneString))
             {
-                <MudTextField Value="@_oneCharText"
-                              ValueChanged="@((string v) => OnOneCharChangedAsync(v))"
-                              Placeholder="@Ui.T("player.inputPlaceholder")"
-                              Variant="Variant.Outlined"
-                              Margin="Margin.Dense"
-                              Immediate="true"
-                              Disabled="@_busy"
-                              MaxLength="1"
-                              Style="max-width: 180px;" />
+                <input type="text"
+                       class="hypera-play-input"
+                       style="max-width: 220px;"
+                       @ref="_inputElRef"
+                       value="@_oneCharText"
+                       @oninput="@(e => OnOneCharChangedAsync(e.Value?.ToString() ?? string.Empty))"
+                       placeholder="@Ui.T("player.inputPlaceholder")"
+                       disabled="@_busy"
+                       maxlength="1"
+                       autocomplete="off" />
             }
             else if (pending is not null)
             {
-                <MudText Typo="Typo.body2" Color="Color.Secondary">
+                <MudText Typo="Typo.caption" Color="Color.Secondary">
                     @(pending.Kind == InputRequestKind.MouseClick ? Ui.T("player.clickToContinue") : Ui.T("player.pressAnyKey"))
                 </MudText>
+                <MudSpacer />
+                <MudButton Variant="Variant.Text"
+                           Color="Color.Primary"
+                           Size="Size.Small"
+                           Disabled="@_busy"
+                           OnClick="@ContinuePromptAsync">
+                    @Ui.T("player.continue")
+                </MudButton>
             }
 
-            @if (_remainingSeconds.HasValue)
+            @if (_showTimeoutBadge && _remainingSeconds.HasValue)
             {
-                <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Filled">
+                <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Filled" Class="ma-0">
                     @Ui.T("player.timeoutRemaining", _remainingSeconds.Value.ToString("0.0", CultureInfo.InvariantCulture))
                 </MudChip>
             }
         </div>
-    </MudPaper>
-}
+    }
+</div>
 
 @* Slide-over Save Manager Drawer *@
 @if (Ui.IsAuthenticated)
@@ -290,7 +404,7 @@
     <MudDrawer @bind-Open="_savesDrawerOpen"
                Anchor="Anchor.End"
                Variant="DrawerVariant.Temporary"
-               Width="460px"
+               Width="440px"
                Elevation="4">
         <div class="pa-4">
             <SaveManagerPanel AppId="@AppId" UserId="@Ui.CurrentUser!.Id" />
@@ -329,8 +443,12 @@
 
     private ElementReference _wrapperRef;
     private ElementReference _stageRef;
+    private ElementReference _inputElRef;
     private int _lastScaledW;
     private int _lastScaledH;
+    private bool _lastScaledFullscreen;
+    private bool _hooksRegistered;
+    private DotNetObjectReference<PlayStage>? _selfRef;
 
     private readonly Dictionary<string, AssetCacheEntry> _assetCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _registeredFontPaths = new(StringComparer.OrdinalIgnoreCase);
@@ -344,30 +462,87 @@
     private CancellationTokenSource? _timeoutCts;
     private long _timeoutGenId = -1;
     private double? _remainingSeconds;
+    private bool _showTimeoutBadge;
 
     private CancellationTokenSource? _animCts;
+    private CancellationTokenSource? _yieldCts;
     private bool _disposed;
 
-    private IEnumerable<string> ActiveVersionLanguages
+    private string VolumeIcon =>
+        _muted || _masterVolume == 0
+            ? Icons.Material.Filled.VolumeOff
+            : _masterVolume < 50
+                ? Icons.Material.Filled.VolumeDown
+                : Icons.Material.Filled.VolumeUp;
+
+    private string ActiveBuildLabel
     {
         get
         {
             GameVersion? ver = _playableVersions.FirstOrDefault(v => v.Id == _activeVersionId);
             if (ver is null)
             {
-                return [];
+                return _activeLanguageCode;
             }
 
-            return ver.Variants
-                .Where(static vr => vr.ActiveSubmissionId.HasValue)
-                .Select(static vr => vr.LanguageCode)
-                .Distinct(StringComparer.OrdinalIgnoreCase);
+            return string.IsNullOrWhiteSpace(_activeLanguageCode)
+                ? ver.VersionLabel
+                : $"{ver.VersionLabel} · {_activeLanguageCode}";
         }
     }
+
+    private bool ShouldShowInputBar
+    {
+        get
+        {
+            if (_renderState is null)
+            {
+                return false;
+            }
+
+            if (_renderState.Summary.EngineStatus == EngineStepStatus.Completed)
+            {
+                return true;
+            }
+
+            InputRequest? pending = _renderState.PendingInput;
+            if (pending is null)
+            {
+                return false;
+            }
+
+            if (!Ui.IsFullscreen)
+            {
+                return true;
+            }
+
+            // In fullscreen mode, hide the bottom bar during click/any-key/fade pauses to maximize canvas area.
+            return pending.Kind is InputRequestKind.IntValue or InputRequestKind.StringValue or InputRequestKind.OneInt or InputRequestKind.OneString;
+        }
+    }
+
+    private IEnumerable<string> ActiveVersionLanguages
+    {
+        get
+        {
+            GameVersion? ver = _playableVersions.FirstOrDefault(v => v.Id == _activeVersionId);
+            return ver is null ? [] : GetPlayableLanguagesFor(ver);
+        }
+    }
+
+    private static IEnumerable<string> GetPlayableLanguagesFor(GameVersion ver) =>
+        ver.Variants
+            .Where(static vr => vr.ActiveSubmissionId.HasValue)
+            .Select(static vr => vr.LanguageCode)
+            .Distinct(StringComparer.OrdinalIgnoreCase);
 
     protected override async Task OnInitializedAsync()
     {
         Ui.Changed += OnUiChanged;
+        HostWindow.FullscreenChanged += OnHostFullscreenChanged;
+        Ui.SetPlayStageActive(true);
+        Ui.SetFullscreen(HostWindow.IsFullscreen);
+
         await Ui.InitializeAsync();
         if (!Ui.IsAuthenticated)
         {
@@ -389,25 +564,76 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        if (!_hooksRegistered && !_disposed)
+        {
+            _hooksRegistered = true;
+            _selfRef = DotNetObjectReference.Create(this);
+            await TryJsVoidAsync("hyperaPlayer.registerPlayKeyAndFullscreenHooks", _selfRef);
+        }
+
         if (_renderState is null)
         {
             return;
         }
 
         LogicalViewport vp = _renderState.Scene.Viewport;
-        if (vp.LogicalWidth != _lastScaledW || vp.LogicalHeight != _lastScaledH)
+        bool isFs = Ui.IsFullscreen;
+        if (vp.LogicalWidth != _lastScaledW || vp.LogicalHeight != _lastScaledH || isFs != _lastScaledFullscreen)
         {
             _lastScaledW = vp.LogicalWidth;
             _lastScaledH = vp.LogicalHeight;
-            try
-            {
-                await Js.InvokeVoidAsync("hyperaPlayer.attachStageScaler", _wrapperRef, _stageRef, vp.LogicalWidth, vp.LogicalHeight);
-            }
-            catch
-            {
-                // Ignore if element is not yet mounted
-            }
+            _lastScaledFullscreen = isFs;
+            int padPx = isFs ? 0 : 4;
+            await TryJsVoidAsync("hyperaPlayer.attachStageScaler", _wrapperRef, _stageRef, vp.LogicalWidth, vp.LogicalHeight, padPx);
         }
+    }
+
+    [JSInvokable]
+    public void OnDocumentFullscreenChanged(bool isFullscreen)
+    {
+        if (HostWindow is BrowserHostWindowService browserWindow)
+        {
+            browserWindow.SyncFromBrowser(isFullscreen);
+        }
+        else if (Ui.IsFullscreen != isFullscreen && !HostWindow.IsFullscreen)
+        {
+            Ui.SetFullscreen(isFullscreen);
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnFullscreenShortcutAsync()
+    {
+        await ToggleFullscreenAsync();
+    }
+
+    [JSInvokable]
+    public async Task OnEscapeShortcutAsync()
+    {
+        if (Ui.IsFullscreen)
+        {
+            await SetFullscreenAsync(false);
+        }
+    }
+
+    private async Task ToggleFullscreenAsync()
+    {
+        await SetFullscreenAsync(!Ui.IsFullscreen);
+    }
+
+    private async Task SetFullscreenAsync(bool fullscreen)
+    {
+        bool actual = await HostWindow.SetFullscreenAsync(fullscreen);
+        Ui.SetFullscreen(actual);
+        _lastScaledW = 0; // force re-measure with updated padding & viewport height
+        StateHasChanged();
+    }
+
+    private void OnHostFullscreenChanged(bool fullscreen)
+    {
+        Ui.SetFullscreen(fullscreen);
+        _lastScaledW = 0;
+        _ = InvokeAsync(StateHasChanged);
     }
 
     private async Task StartOrAttachSessionAsync()
@@ -474,6 +700,7 @@
         _error = null;
         _faultBannerDismissed = false;
         CancelTimeout();
+        CancelYieldPump();
         try
         {
             Guid userId = Ui.CurrentUser!.Id;
@@ -495,13 +722,14 @@
     private void InvalidateDynamicSpriteAndGraphicsCache()
     {
         List<string> staleKeys = [];
-        foreach (string key in _assetCache.Keys)
+        foreach (KeyValuePair<string, AssetCacheEntry> kv in _assetCache)
         {
-            if (key.StartsWith("g:", StringComparison.OrdinalIgnoreCase) ||
-                key.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase) ||
-                key.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase))
+            if (kv.Value.IsDynamic ||
+                kv.Key.StartsWith("g:", StringComparison.OrdinalIgnoreCase) ||
+                kv.Key.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase) ||
+                kv.Key.StartsWith("sprite:", StringComparison.OrdinalIgnoreCase))
             {
-                staleKeys.Add(key);
+                staleKeys.Add(kv.Key);
             }
         }
 
@@ -521,6 +749,7 @@
         _busy = true;
         _error = null;
         CancelTimeout();
+        CancelYieldPump();
         StopAnimationLoop();
         try
         {
@@ -544,20 +773,14 @@
         }
     }
 
-    private async Task OnVersionChangedAsync(Guid versionId)
+    private async Task SwitchBuildAsync(Guid versionId, string lang)
     {
-        _activeVersionId = versionId;
-        List<string> langs = ActiveVersionLanguages.ToList();
-        if (!langs.Contains(_activeLanguageCode, StringComparer.OrdinalIgnoreCase))
+        if (_activeVersionId == versionId && string.Equals(_activeLanguageCode, lang, StringComparison.OrdinalIgnoreCase))
         {
-            _activeLanguageCode = langs.FirstOrDefault() ?? string.Empty;
+            return;
         }
 
-        await RestartSessionAsync();
-    }
-
-    private async Task OnLanguageChangedAsync(string lang)
-    {
+        _activeVersionId = versionId;
         _activeLanguageCode = lang;
         await RestartSessionAsync();
     }
@@ -575,20 +798,13 @@
         _lastScaledH = 0;
         _animationClock.Restart();
 
-        try
-        {
-            await Js.InvokeVoidAsync("hyperaPlayer.stopAllAudio");
-            await Js.InvokeVoidAsync("hyperaPlayer.revokeAllAssets");
-        }
-        catch
-        {
-            // Ignore when circuit/JS is unavailable
-        }
+        await TryJsVoidAsync("hyperaPlayer.stopAllAudio");
+        await TryJsVoidAsync("hyperaPlayer.revokeAllAssets");
     }
 
     private async Task RefreshRenderStateAsync(Guid sessionId, bool resetIfSessionChanged = false)
     {
-        if (!Ui.IsAuthenticated)
+        if (!Ui.IsAuthenticated || _disposed)
         {
             return;
         }
@@ -634,12 +850,78 @@
         await RegisterCustomFontsAsync(sessionId, userId, state.CustomFonts);
 
         List<StageRenderItem> items = BuildRenderItems(state.Scene, state.VisibleLineTops);
-        await EnsureSceneAssetsLoadedAsync(sessionId, userId, items);
+        await EnsureSceneAssetsLoadedAsync(sessionId, userId, items, state.DynamicAssetVersions);
         _renderItems = items;
 
         await SyncWebAudioAsync(sessionId, userId, state.Audio);
         ConfigurePendingTimeout(state.PendingInput);
+        ConfigureYieldPump(state.Summary.EngineStatus);
         UpdateAnimationLoop();
+    }
+
+    private void ConfigureYieldPump(EngineStepStatus status)
+    {
+        if (status != EngineStepStatus.Yielded || _disposed)
+        {
+            CancelYieldPump();
+            return;
+        }
+
+        if (_yieldCts is not null)
+        {
+            return;
+        }
+
+        _yieldCts = new CancellationTokenSource();
+        CancellationToken ct = _yieldCts.Token;
+        Guid sid = _activeSessionId;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(33, ct);
+                await InvokeAsync(async () =>
+                {
+                    if (_disposed || _busy || _activeSessionId != sid || !Ui.IsAuthenticated)
+                    {
+                        CancelYieldPump();
+                        return;
+                    }
+
+                    CancelYieldPump();
+                    _busy = true;
+                    try
+                    {
+                        await SessionManager.StepYieldedSessionAsync(sid, Ui.CurrentUser!.Id);
+                        await RefreshRenderStateAsync(sid);
+                    }
+                    catch (Exception ex)
+                    {
+                        _error = ex.Message;
+                    }
+                    finally
+                    {
+                        _busy = false;
+                        StateHasChanged();
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on cancel/dispose
+            }
+        }, ct);
+    }
+
+    private void CancelYieldPump()
+    {
+        if (_yieldCts is not null)
+        {
+            _yieldCts.Cancel();
+            _yieldCts.Dispose();
+            _yieldCts = null;
+        }
     }
 
     private async Task RegisterCustomFontsAsync(
@@ -706,7 +988,8 @@
     private async Task EnsureSceneAssetsLoadedAsync(
         Guid sessionId,
         Guid userId,
-        IReadOnlyList<StageRenderItem> items)
+        IReadOnlyList<StageRenderItem> items,
+        IReadOnlyDictionary<string, long>? dynamicVersions)
     {
         var keysToLoad = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (StageRenderItem item in items)
@@ -730,13 +1013,27 @@
         long elapsedMs = _animationClock.ElapsedMilliseconds;
         foreach (string key in keysToLoad)
         {
-            bool isDynamicGraphics = key.StartsWith("g:", StringComparison.OrdinalIgnoreCase)
+            bool isDirectGraphics = key.StartsWith("g:", StringComparison.OrdinalIgnoreCase)
                 || key.StartsWith("graphics:", StringComparison.OrdinalIgnoreCase);
+            long serverVersion = 0;
+            bool hasDynamicVer = dynamicVersions is not null && dynamicVersions.TryGetValue(key, out serverVersion);
             bool alreadyCached = _assetCache.TryGetValue(key, out AssetCacheEntry? existing);
 
-            if (alreadyCached && !isDynamicGraphics && !existing!.IsAnimated)
+            if (alreadyCached && !existing!.IsAnimated)
             {
-                continue;
+                if (hasDynamicVer)
+                {
+                    // Dynamic sprite or graphics surface: only skip fetch if exact content version is unchanged!
+                    if (existing.ContentVersion == serverVersion)
+                    {
+                        continue;
+                    }
+                }
+                else if (!isDirectGraphics && !existing.IsDynamic)
+                {
+                    // Pure static file-backed sprite
+                    continue;
+                }
             }
 
             await FetchAndRegisterAssetAsync(sessionId, userId, key, elapsedMs);
@@ -773,7 +1070,13 @@
 
             if (!string.IsNullOrEmpty(blobUrl))
             {
-                _assetCache[assetKey] = new AssetCacheEntry(blobUrl, payload.Width, payload.Height, payload.IsAnimated);
+                _assetCache[assetKey] = new AssetCacheEntry(
+                    blobUrl,
+                    payload.Width,
+                    payload.Height,
+                    payload.IsAnimated,
+                    payload.IsDynamic,
+                    payload.ContentVersion);
             }
         }
         catch
@@ -801,7 +1104,6 @@
         }
         else if (firstSyncForSession)
         {
-            // Reconnected to an existing session whose audio was already playing
             if (audio.Bgm.IsPlaying && !string.IsNullOrWhiteSpace(audio.Bgm.VirtualPath))
             {
                 string? key = await EnsureAudioAssetCachedAsync(sessionId, userId, audio.Bgm.VirtualPath);
@@ -992,7 +1294,6 @@
         var items = new List<StageRenderItem>();
         int seq = 0;
 
-        // 1. Background images (SETBGIMAGE)
         foreach (BackgroundImageLayer bg in scene.BackgroundImages)
         {
             items.Add(new StageRenderItem(
@@ -1010,7 +1311,6 @@
                 SamplingMode: PixelSamplingMode.SmoothAntialiased));
         }
 
-        // 2. CBG Layers (bottom-left anchored)
         foreach (CbgLayer cbg in scene.CbgLayers)
         {
             string? assetKey = !string.IsNullOrWhiteSpace(cbg.SpriteName)
@@ -1044,14 +1344,12 @@
                 SamplingMode: PixelSamplingMode.CrispNearestNeighbor));
         }
 
-        // 3. Flow lines
         for (int i = 0; i < scene.VisibleLines.Count; i++)
         {
             float lineTop = i < lineTops.Count ? lineTops[i] : 0f;
             EmitLineItems(items, scene, scene.VisibleLines[i], lineTop, originOffsetX: 0f, layerGroup: 1, ref seq);
         }
 
-        // 4. Overlay HTML_PRINT_ISLAND layers
         foreach (HtmlIslandLayer island in scene.IslandLayers.OrderByDescending(static l => l.Depth))
         {
             float y = 0f;
@@ -1062,7 +1360,6 @@
             }
         }
 
-        // Exact Emuera Z-order: LayerGroup asc -> Depth desc (higher depth = further back) -> insertion order asc
         items.Sort(static (a, b) =>
         {
             int cmp = a.LayerGroup.CompareTo(b.LayerGroup);
@@ -1267,6 +1564,7 @@
         _timeoutGenId = pending.GenerationId;
         long totalMs = pending.TimeoutMilliseconds.Value;
         _remainingSeconds = totalMs / 1000.0;
+        _showTimeoutBadge = pending.Kind != InputRequestKind.TimedWait || totalMs >= 1000;
         _timeoutCts = new CancellationTokenSource();
         CancellationToken ct = _timeoutCts.Token;
         long genId = pending.GenerationId;
@@ -1274,9 +1572,10 @@
         _ = Task.Run(async () =>
         {
             var sw = Stopwatch.StartNew();
+            int lastDisplayedTenths = (int)Math.Ceiling(totalMs / 100.0);
             try
             {
-                using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
+                using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(33));
                 while (await timer.WaitForNextTickAsync(ct))
                 {
                     long leftMs = totalMs - sw.ElapsedMilliseconds;
@@ -1291,7 +1590,12 @@
                     }
 
                     _remainingSeconds = leftMs / 1000.0;
-                    await InvokeAsync(StateHasChanged);
+                    int tenths = (int)Math.Ceiling(leftMs / 100.0);
+                    if (_showTimeoutBadge && tenths != lastDisplayedTenths)
+                    {
+                        lastDisplayedTenths = tenths;
+                        await InvokeAsync(StateHasChanged);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -1312,6 +1616,7 @@
 
         _timeoutGenId = -1;
         _remainingSeconds = null;
+        _showTimeoutBadge = false;
     }
 
     private async Task SubmitResponseAsync(InputResponse response)
@@ -1324,6 +1629,7 @@
         _busy = true;
         _error = null;
         CancelTimeout();
+        CancelYieldPump();
         try
         {
             Guid sid = _renderState.Summary.SessionId;
@@ -1338,6 +1644,53 @@
         {
             _busy = false;
             StateHasChanged();
+        }
+    }
+
+    private async Task ContinuePromptAsync()
+    {
+        if (_renderState?.PendingInput is not { } pending)
+        {
+            return;
+        }
+
+        await SubmitResponseAsync(new InputResponse(pending.GenerationId, StringValue: string.Empty));
+    }
+
+    private async Task OnStageWheelAsync(WheelEventArgs e)
+    {
+        if (_busy || _renderState is null || !Ui.IsAuthenticated || _renderState.MaxScrollOffsetLines <= 0)
+        {
+            return;
+        }
+
+        int deltaLines = e.DeltaY < 0 ? 3 : -3;
+        try
+        {
+            await SessionManager.ScrollSessionAsync(_renderState.Summary.SessionId, Ui.CurrentUser!.Id, deltaLines);
+            await RefreshRenderStateAsync(_renderState.Summary.SessionId);
+        }
+        catch
+        {
+            // Ignore scroll failure
+        }
+    }
+
+    private async Task ScrollToBottomAsync()
+    {
+        if (_busy || _renderState is null || !Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        try
+        {
+            await SessionManager.ScrollSessionAsync(_renderState.Summary.SessionId, Ui.CurrentUser!.Id, 0, scrollToBottom: true);
+            await RefreshRenderStateAsync(_renderState.Summary.SessionId);
+        }
+        catch
+        {
+            // Ignore scroll failure
         }
     }
 
@@ -1357,13 +1710,13 @@
         _busy = true;
         _error = null;
         CancelTimeout();
+        CancelYieldPump();
         try
         {
             Guid sid = _renderState.Summary.SessionId;
             Guid uid = Ui.CurrentUser!.Id;
             int mouseBtn = MapMouseButton(e.Button);
 
-            // Always run authoritative ConsoleHitTester so CBGSETBMAPG / <img srcm> populate RESULT:3/4/6
             SessionHitTestActionResult hitResult = await SessionManager.HitTestAndClickAsync(
                 sid,
                 uid,
@@ -1428,6 +1781,7 @@
             if (hitResult.InputSubmitted)
             {
                 CancelTimeout();
+                CancelYieldPump();
                 await RefreshRenderStateAsync(sid);
             }
         }
@@ -1460,6 +1814,11 @@
 
         if (pending.Kind is InputRequestKind.AnyKey or InputRequestKind.TimedWait)
         {
+            if (e.Key is "F11" or "Escape")
+            {
+                return;
+            }
+
             await SubmitResponseAsync(new InputResponse(pending.GenerationId, StringValue: e.Key));
         }
         else if (pending.Kind == InputRequestKind.OneInt && e.Key.Length == 1 && long.TryParse(e.Key, out long digit))
@@ -1546,9 +1905,9 @@
 
     private static int MapMouseButton(long domButton) => domButton switch
     {
-        0 => 1, // Left click
-        2 => 2, // Right click
-        1 => 4, // Middle click
+        0 => 1,
+        2 => 2,
+        1 => 4,
         _ => 1,
     };
 
@@ -1728,18 +2087,33 @@
     {
         _disposed = true;
         Ui.Changed -= OnUiChanged;
+        HostWindow.FullscreenChanged -= OnHostFullscreenChanged;
         CancelTimeout();
+        CancelYieldPump();
         StopAnimationLoop();
-        try
+
+        if (Ui.IsFullscreen || HostWindow.IsFullscreen)
         {
-            await Js.InvokeVoidAsync("hyperaPlayer.detachStageScaler", _wrapperRef);
-            await Js.InvokeVoidAsync("hyperaPlayer.stopAllAudio");
-            await Js.InvokeVoidAsync("hyperaPlayer.revokeAllAssets");
+            try
+            {
+                await HostWindow.SetFullscreenAsync(false);
+            }
+            catch
+            {
+                // Ignore window teardown errors
+            }
         }
-        catch
-        {
-            // Circuit may already be disconnected
-        }
+
+        Ui.SetFullscreen(false);
+        Ui.SetPlayStageActive(false);
+
+        await TryJsVoidAsync("hyperaPlayer.unregisterPlayKeyAndFullscreenHooks");
+        await TryJsVoidAsync("hyperaPlayer.detachStageScaler", _wrapperRef);
+        await TryJsVoidAsync("hyperaPlayer.stopAllAudio");
+        await TryJsVoidAsync("hyperaPlayer.revokeAllAssets");
+
+        _selfRef?.Dispose();
+        _selfRef = null;
     }
 
     private enum StageItemKind
@@ -1751,7 +2125,13 @@
         Button,
     }
 
-    private sealed record AssetCacheEntry(string BlobUrl, int Width, int Height, bool IsAnimated);
+    private sealed record AssetCacheEntry(
+        string BlobUrl,
+        int Width,
+        int Height,
+        bool IsAnimated,
+        bool IsDynamic,
+        long ContentVersion);
 
     private sealed record StageRenderItem(
         string Key,

@@ -1,8 +1,11 @@
 @inject UiSessionState Ui
+@inject IDialogService DialogService
 
 @if (Submissions is null || Submissions.Count == 0)
 {
-    <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("appDetail.noSubmissions")</MudText>
+    <MudPaper Outlined="true" Class="pa-6 text-center">
+        <MudText Typo="Typo.body2" Color="Color.Secondary">@Ui.T("appDetail.noSubmissions")</MudText>
+    </MudPaper>
 }
 else
 {
@@ -14,12 +17,22 @@ else
                 Ui.Localizer,
                 Ui.UiLanguage);
 
+            CompilerOptionsOverride? overrides = CompilerOptionsOverride.FromJson(sub.CompilerOptionsJson);
+            IReadOnlyList<(string Key, string Value)> overrideList = overrides?.DescribeOverrides() ?? [];
+
+            bool canRecompile = Ui.IsAuthenticated
+                && sub.Status != SubmissionStatus.Compiling
+                && (Ui.IsLocalSingleUser || Ui.IsAdmin || sub.UploadedByUserId == Ui.CurrentUser?.Id)
+                && (!string.IsNullOrWhiteSpace(sub.SourceZipStoragePath)
+                    || !string.IsNullOrWhiteSpace(sub.LocalSourcePath)
+                    || !string.IsNullOrWhiteSpace(sub.HepStoragePath));
+
             <MudPaper Outlined="true" Class="pa-3">
                 <div class="d-flex flex-wrap align-center justify-space-between gap-2">
                     <div class="d-flex flex-wrap align-center gap-2">
                         @if (!string.IsNullOrWhiteSpace(sub.Version?.VersionLabel))
                         {
-                            <MudText Typo="Typo.subtitle2">@sub.Version!.VersionLabel</MudText>
+                            <MudText Typo="Typo.subtitle2" Style="font-weight: 600;">@sub.Version!.VersionLabel</MudText>
                         }
                         <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined" Color="Color.Default">
                             @sub.LanguageCode
@@ -41,12 +54,45 @@ else
                             </MudChip>
                         }
                     </div>
-                    <MudText Typo="Typo.caption" Color="Color.Secondary">
-                        @FormatHelpers.FormatUtc(sub.CreatedAtUtc)
-                    </MudText>
+
+                    <div class="d-flex align-center gap-2">
+                        @if (canRecompile)
+                        {
+                            <MudButton Variant="Variant.Outlined"
+                                       Size="Size.Small"
+                                       Color="Color.Primary"
+                                       StartIcon="@Icons.Material.Filled.Tune"
+                                       OnClick="@(() => OpenRecompileAsync(sub))">
+                                @Ui.T("appDetail.recompile")
+                            </MudButton>
+                        }
+                        <MudText Typo="Typo.caption" Color="Color.Secondary">
+                            @FormatHelpers.FormatUtc(sub.CreatedAtUtc)
+                        </MudText>
+                    </div>
                 </div>
 
-                @if (sub.Status == SubmissionStatus.Rejected && !string.IsNullOrWhiteSpace(sub.RejectionReason))
+                @if (!string.IsNullOrWhiteSpace(sub.LocalSourcePath))
+                {
+                    <MudText Typo="Typo.caption" Color="Color.Secondary" Class="mt-1 d-block hypera-mono hypera-ellipsis" title="@sub.LocalSourcePath">
+                        @Ui.T("appDetail.sourceFolderLabel"): @sub.LocalSourcePath
+                    </MudText>
+                }
+
+                @if (overrideList.Count > 0)
+                {
+                    <div class="d-flex flex-wrap align-center gap-1 mt-2">
+                        <MudIcon Icon="@Icons.Material.Filled.Tune" Size="Size.Small" Color="Color.Secondary" />
+                        @foreach ((string key, string val) in overrideList)
+                        {
+                            <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined" Color="Color.Info" Class="hypera-mono">
+                                @($"{key}={val}")
+                            </MudChip>
+                        }
+                    </div>
+                }
+
+                @if (!Ui.IsLocalSingleUser && sub.Status == SubmissionStatus.Rejected && !string.IsNullOrWhiteSpace(sub.RejectionReason))
                 {
                     <MudAlert Severity="Severity.Error" Dense="true" Class="mt-2">
                         <strong>@Ui.T("appDetail.rejectionReason"):</strong> @sub.RejectionReason
@@ -58,7 +104,7 @@ else
                     int errorCount = diagnostics.Count(static d => d.Severity == DiagnosticSeverity.Error);
                     int warnCount = diagnostics.Count(static d => d.Severity == DiagnosticSeverity.Warning);
 
-                    <MudExpansionPanels Class="mt-2" Dense="true" Elevation="0">
+                    <MudExpansionPanels Class="mt-2" Dense="true" Elevation="0" Outlined="true">
                         <MudExpansionPanel Expanded="@(sub.Status == SubmissionStatus.CompileFailed)">
                             <TitleContent>
                                 <div class="d-flex align-center gap-2">
@@ -123,4 +169,35 @@ else
 @code {
     [Parameter]
     public IReadOnlyList<GameLanguageSubmission>? Submissions { get; set; }
+
+    [Parameter]
+    public EventCallback OnRecompiled { get; set; }
+
+    private async Task OpenRecompileAsync(GameLanguageSubmission sub)
+    {
+        if (!Ui.IsAuthenticated)
+        {
+            return;
+        }
+
+        var parameters = new DialogParameters<RecompileDialog>
+        {
+            { x => x.Submission, sub },
+            { x => x.UserId, Ui.CurrentUser!.Id },
+        };
+
+        var options = new DialogOptions
+        {
+            MaxWidth = MaxWidth.Medium,
+            FullWidth = true,
+            CloseOnEscapeKey = true,
+        };
+
+        IDialogReference dialog = await DialogService.ShowAsync<RecompileDialog>(Ui.T("appDetail.recompileTitle"), parameters, options);
+        DialogResult? result = await dialog.Result;
+        if (result is { Canceled: false } && OnRecompiled.HasDelegate)
+        {
+            await OnRecompiled.InvokeAsync();
+        }
+    }
 }

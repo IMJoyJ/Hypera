@@ -4,6 +4,7 @@ using Hypera.Maui.Services;
 using Hypera.Platform;
 using Hypera.Platform.Domain;
 using Hypera.Web.UI;
+using Hypera.Web.UI.Services;
 using Microsoft.AspNetCore.Components.Authorization;
 using Microsoft.Extensions.Logging;
 
@@ -41,6 +42,9 @@ public static class MauiProgram
             localizer.LoadExternalDirectory(localesDir, enableWatcher: true);
             return localizer;
         });
+
+        builder.Services.AddSingleton<IHostWindowService, MauiHostWindowService>();
+        builder.Services.AddSingleton<ILocalFilePickerService, MauiLocalFilePickerService>();
 
         builder.Services.AddHyperaWebUi();
 

@@ -341,6 +341,11 @@ public sealed class AuthService : IAuthService
             throw new ArgumentOutOfRangeException(nameof(updatedSettings), "MaxSaveQuotaBytesPerApp must be positive.");
         }
 
+        if (updatedSettings.MaxUndoSteps is < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(updatedSettings), "MaxUndoSteps cannot be negative.");
+        }
+
         await using HyperaDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await EnsureActiveAdminAsync(db, adminUserId, cancellationToken).ConfigureAwait(false);
 
@@ -350,6 +355,11 @@ public sealed class AuthService : IAuthService
         settings.MaxStepInstructionsPerTurn = updatedSettings.MaxStepInstructionsPerTurn;
         settings.SessionIdleTimeoutMinutes = updatedSettings.SessionIdleTimeoutMinutes;
         settings.MaxSaveQuotaBytesPerApp = updatedSettings.MaxSaveQuotaBytesPerApp;
+        settings.DefaultCompilerOptionsJson = string.IsNullOrWhiteSpace(updatedSettings.DefaultCompilerOptionsJson)
+            ? null
+            : updatedSettings.DefaultCompilerOptionsJson.Trim();
+        settings.MaxUndoSteps = updatedSettings.MaxUndoSteps;
+        settings.AutoRollbackOnError = updatedSettings.AutoRollbackOnError;
         settings.UpdatedAtUtc = DateTime.UtcNow;
 
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);

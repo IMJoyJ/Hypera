@@ -56,6 +56,7 @@ public sealed class HyperaDbContext : DbContext
             b.ToTable("PlatformSettings");
             b.HasKey(s => s.Id);
             b.Property(s => s.Id).ValueGeneratedNever();
+            b.Property(s => s.DefaultCompilerOptionsJson).HasMaxLength(8000);
             b.HasData(new Domain.PlatformSettings
             {
                 Id = Domain.PlatformSettings.SingletonId,
@@ -64,6 +65,9 @@ public sealed class HyperaDbContext : DbContext
                 MaxStepInstructionsPerTurn = Domain.PlatformSettings.DefaultMaxStepInstructionsPerTurn,
                 SessionIdleTimeoutMinutes = Domain.PlatformSettings.DefaultSessionIdleTimeoutMinutes,
                 MaxSaveQuotaBytesPerApp = Domain.PlatformSettings.DefaultMaxSaveQuotaBytesPerApp,
+                DefaultCompilerOptionsJson = null,
+                MaxUndoSteps = null,
+                AutoRollbackOnError = null,
                 UpdatedAtUtc = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
             });
         });
@@ -144,6 +148,8 @@ public sealed class HyperaDbContext : DbContext
                 .UseCollation("NOCASE");
             b.Property(s => s.HepStoragePath).HasMaxLength(512);
             b.Property(s => s.SourceZipStoragePath).HasMaxLength(512);
+            b.Property(s => s.LocalSourcePath).HasMaxLength(1024);
+            b.Property(s => s.CompilerOptionsJson).HasMaxLength(8000);
             b.Property(s => s.RejectionReason).HasMaxLength(2000);
 
             b.HasIndex(s => new { s.Status, s.CreatedAtUtc });

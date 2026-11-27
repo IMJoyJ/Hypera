@@ -39,6 +39,7 @@ public sealed class GraphicsManager : IDisposable
     private readonly GlyphMeasurer _glyphMeasurer;
     private readonly string? _saveDirectory;
     private IWritableUserStorage? _writableStorage;
+    private long _nextSurfaceToken;
     private bool _disposed;
 
     public GraphicsManager(
@@ -87,6 +88,22 @@ public sealed class GraphicsManager : IDisposable
         }
 
         surface = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Computes an instance-unique content version for graphics surface <paramref name="id"/>,
+    /// combining its creation token and pixel mutation counter so recreate/redraw/undo are always distinguished.
+    /// </summary>
+    public bool TryGetSurfaceVersion(int id, out long version)
+    {
+        if (TryGetSurface(id, out GraphicsSurface surface))
+        {
+            version = unchecked((surface.InstanceToken * 1_000_003L) ^ surface.MutationVersion);
+            return true;
+        }
+
+        version = 0;
         return false;
     }
 
@@ -197,6 +214,7 @@ public sealed class GraphicsManager : IDisposable
 
             if (kv.Value is not null)
             {
+                kv.Value.InstanceToken = ++_nextSurfaceToken;
                 _surfaces[kv.Key] = kv.Value;
             }
         }
@@ -207,6 +225,7 @@ public sealed class GraphicsManager : IDisposable
 
     private void ReplaceSurfaceInternal(int id, GraphicsSurface replacement)
     {
+        replacement.InstanceToken = ++_nextSurfaceToken;
         if (_surfaces.Remove(id, out GraphicsSurface? existing))
         {
             if (_activeUndoDelta is not null && !_activeUndoDelta.OriginalSurfaces.ContainsKey(id))

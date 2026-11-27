@@ -1,23 +1,99 @@
-/* Hypera Slate & Teal UI + Locked Logical Viewport Stage */
+/* Hypera Slate & Teal UI + Locked Logical Viewport Stage (100dvh zero-overflow) */
+
+html,
+body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+/* Lock outer scrolling while PlayStage is active so the viewport never exceeds 100dvh */
+.hypera-layout-play {
+    height: 100dvh;
+    overflow: hidden;
+}
+
+.hypera-main-play {
+    height: 100dvh;
+    max-height: 100dvh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    padding-top: var(--mud-appbar-height, 52px) !important;
+}
+
+.hypera-main-fullscreen {
+    height: 100dvh;
+    max-height: 100dvh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+.hypera-play-shell {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+    background-color: #0B0F14;
+}
+
+.hypera-play-topbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 44px;
+    padding: 0 10px;
+    background-color: var(--mud-palette-surface);
+    border-bottom: 1px solid var(--mud-palette-divider);
+    overflow: hidden;
+}
+
+.hypera-play-title {
+    font-weight: 600;
+    font-size: 0.95rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+    max-width: 260px;
+}
+
+.hypera-play-banner {
+    flex: 0 0 auto;
+    padding: 6px 10px 0 10px;
+    background-color: #0B0F14;
+}
 
 .hypera-stage-wrapper {
     position: relative;
+    flex: 1 1 0%;
+    min-height: 0;
     width: 100%;
-    height: calc(100vh - 156px);
-    min-height: 360px;
     display: flex;
     align-items: center;
     justify-content: center;
     overflow: hidden;
-    background-color: #10151A;
-    border: 1px solid rgba(148, 163, 184, 0.22);
-    border-radius: 6px;
+    background-color: #000000;
 }
 
 .hypera-stage-box {
     position: relative;
     overflow: hidden;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+    flex-shrink: 0;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
+}
+
+.hypera-play-shell-fullscreen .hypera-stage-box {
+    box-shadow: none;
 }
 
 .hypera-stage {
@@ -28,18 +104,92 @@
     cursor: default;
     box-sizing: border-box;
     outline: none;
+    isolation: isolate;
 }
 
-.hypera-stage-png-backdrop {
+.hypera-play-inputbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 46px;
+    padding: 4px 10px;
+    background-color: var(--mud-palette-surface);
+    border-top: 1px solid var(--mud-palette-divider);
+    box-sizing: border-box;
+}
+
+.hypera-play-inputbar-compact {
+    min-height: 36px;
+    padding: 2px 10px;
+}
+
+.hypera-play-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 34px;
+    padding: 0 10px;
+    border-radius: 6px;
+    border: 1px solid var(--mud-palette-lines-inputs);
+    background-color: var(--mud-palette-background);
+    color: var(--mud-palette-text-primary);
+    font-size: 0.9rem;
+    outline: none;
+    box-sizing: border-box;
+    transition: border-color 120ms ease;
+}
+
+.hypera-play-input:focus {
+    border-color: var(--mud-palette-primary);
+}
+
+.hypera-play-input:disabled {
+    opacity: 0.6;
+}
+
+/* Minimal translucent floating corner toolbar in fullscreen mode */
+.hypera-fs-overlay {
     position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none;
-    image-rendering: pixelated;
-    object-fit: fill;
+    top: 10px;
+    right: 10px;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px;
+    border-radius: 999px;
+    background-color: rgba(16, 21, 26, 0.78);
+    border: 1px solid rgba(148, 163, 184, 0.28);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    opacity: 0.32;
+    transition: opacity 160ms ease;
 }
 
+.hypera-fs-overlay:hover,
+.hypera-fs-overlay:focus-within,
+.hypera-fs-overlay-pinned {
+    opacity: 0.96;
+}
+
+.hypera-scrollback-pill {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background-color: rgba(16, 21, 26, 0.88);
+    border: 1px solid rgba(42, 157, 143, 0.5);
+    color: #E2E8F0;
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+
+/* Stage primitives */
 .hypera-op {
     position: absolute;
     white-space: pre;
@@ -58,14 +208,13 @@
 .hypera-op-button {
     cursor: pointer;
     border-radius: 2px;
-    transition: background-color 80ms ease, filter 80ms ease;
+    transition: background-color 80ms ease;
     user-select: text;
     -webkit-user-select: text;
 }
 
 .hypera-op-button:hover {
     background-color: rgba(42, 157, 143, 0.26);
-    filter: brightness(1.18);
 }
 
 .hypera-font-crisp {
@@ -85,12 +234,16 @@
 
 .hypera-op-image {
     display: block;
+    pointer-events: none;
     user-select: none;
     -webkit-user-select: none;
     -webkit-user-drag: none;
+    transform-origin: center center;
+    filter: none;
 }
 
 .hypera-op-image-interactive {
+    pointer-events: auto;
     cursor: pointer;
 }
 
@@ -108,6 +261,52 @@
     box-sizing: border-box;
 }
 
+/* Shared page structure & typography */
+.hypera-page-shell {
+    max-width: 1200px;
+    margin: 0 auto;
+    width: 100%;
+}
+
+.hypera-page-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.hypera-app-card {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    transition: border-color 140ms ease, transform 140ms ease;
+}
+
+.hypera-app-card:hover {
+    border-color: var(--mud-palette-primary);
+}
+
+.hypera-summary-clamp {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    min-height: 2.6em;
+}
+
+.hypera-ellipsis {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.hypera-section-card {
+    padding: 20px;
+    border-radius: 8px;
+}
+
 .hypera-mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
@@ -119,6 +318,6 @@
 }
 
 .hypera-diag-list {
-    max-height: 320px;
+    max-height: 340px;
     overflow-y: auto;
 }
