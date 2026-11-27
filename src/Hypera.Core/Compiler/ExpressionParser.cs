@@ -681,13 +681,15 @@ public sealed class ExpressionParser
             return new IntLiteralExpr(0, idTok.Span);
         }
 
-        // Inside an array subscript (e.g. ABL:TARGET:技巧 or MY_ARR:HP), check CSV / ERD named index!
-        if (ctx.InSubscript && ctx.SubscriptVar is not null && _symbols.External.KeywordResolver is not null)
+        // Inside an array subscript (e.g. TALENT:小悪魔, ABL:TARGET:技巧, MY_ARR:HP), defer CSV / ERD keyword
+        // resolution until ParseVariableSubscriptsAndFold has determined the final dimension index
+        // (e.g. 1-arg 1D character variable 'TALENT:小悪魔' prepends implicit TARGET -> final dimIndex = 1).
+        if (ctx.InSubscript && ctx.SubscriptVar is not null)
         {
-            if (_symbols.External.KeywordResolver(ctx.SubscriptVar.Name, ctx.SubscriptDimension, name, out long resolvedIdx))
+            return new StrLiteralExpr(name, idTok.Span)
             {
-                return new IntLiteralExpr(resolvedIdx, idTok.Span);
-            }
+                IsBareSubscriptIdentifier = true,
+            };
         }
 
         ctx.Diagnostics.ReportError("ERA1426", $"Unknown variable or identifier '{name}'.", idTok.Span, ctx.FilePath, null, [name]);
@@ -946,21 +948,41 @@ public sealed class ExpressionParser
             return sub;
         }
 
-        // String subscript: resolve at compile time via KeywordResolver if constant and known, else runtime KeywordSubscriptExpr
-        if (sub is StrLiteralExpr constKey && _symbols.External.KeywordResolver is not null)
+        // String / bare-identifier subscript: resolve at compile time via KeywordResolver using the final dimIndex,
+        // else runtime KeywordSubscriptExpr for dynamic string expressions.
+        if (sub is StrLiteralExpr constKey)
         {
-            if (_symbols.External.KeywordResolver(variable.Name, dimIndex, constKey.Value, out long idx))
+            // Dimension 0 of a character variable is always the runtime character index (0..CHARANUM-1),
+            // never a CSV *Name / ERD / Chara*.csv keyword.
+            bool allowKeywordLookup = !(variable.IsCharaData && dimIndex == 0);
+            if (allowKeywordLookup
+                && _symbols.External.KeywordResolver is not null
+                && _symbols.External.KeywordResolver(variable.Name, dimIndex, constKey.Value, out long idx))
             {
                 return new IntLiteralExpr(idx, sub.Span);
             }
 
-            ctx.Diagnostics.ReportError(
-                "ERA1434",
-                $"Keyword '{constKey.Value}' is not defined for variable '{variable.Name}' dimension {dimIndex}.",
-                sub.Span,
-                ctx.FilePath,
-                null,
-                [constKey.Value, variable.Name, dimIndex.ToString()]);
+            if (constKey.IsBareSubscriptIdentifier)
+            {
+                ctx.Diagnostics.ReportError(
+                    "ERA1426",
+                    $"Unknown variable or identifier '{constKey.Value}'.",
+                    sub.Span,
+                    ctx.FilePath,
+                    null,
+                    [constKey.Value]);
+            }
+            else
+            {
+                ctx.Diagnostics.ReportError(
+                    "ERA1434",
+                    $"Keyword '{constKey.Value}' is not defined for variable '{variable.Name}' dimension {dimIndex}.",
+                    sub.Span,
+                    ctx.FilePath,
+                    null,
+                    [constKey.Value, variable.Name, dimIndex.ToString()]);
+            }
+
             return new IntLiteralExpr(0, sub.Span);
         }
 

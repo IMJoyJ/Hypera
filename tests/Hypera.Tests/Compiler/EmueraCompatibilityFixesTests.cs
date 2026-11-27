@@ -1013,4 +1013,53 @@ public sealed class EmueraCompatibilityFixesTests
             try { Directory.Delete(tempDir, recursive: true); } catch { }
         }
     }
+
+    [Fact]
+    public void ImplicitTargetCharaSubscript_ResolvesCsvTalentNotCollidingCharaName_AndRelationDim1ResolvesCharaNo()
+    {
+        // Regression test: Chara5514 has Name='小悪魔' AND Talent.csv has 86='小悪魔'.
+        // 'TALENT:小悪魔' has 1 subscript (implicit TARGET -> final dimIndex=1), so it MUST resolve
+        // against Talent.csv (86), NOT Chara5514 (5514). Meanwhile 'RELATION:小悪魔' (dimIndex=1)
+        // MUST resolve against Chara5514 (5514).
+        var vfs = new CompilerMemoryVfs()
+            .AddFile("CSV/VariableSize.csv", "TALENT,1000\nRELATION,10000\n")
+            .AddFile("CSV/Talent.csv", "86,小悪魔\n")
+            .AddFile("CSV/Chara0.csv", "番号,0\n名前,主人公\n呼び名,主人公\n")
+            .AddFile("CSV/Chara5514.csv", "番号,5514\n名前,小悪魔\n呼び名,小悪魔\n")
+            .AddFile("ERH/MY_CDATA.ERH", "#DIM CHARADATA MY_CDATA, 20\n")
+            .AddFile("ERH/MY_CDATA.ERD", "7,SPECIAL_FLAG\n")
+            .AddFile("ERB/MAIN.ERB", """
+                @MAIN
+                ADDCHARA 0
+                TARGET = 0
+                TALENT:小悪魔 = 1
+                A:0 = TALENT:0:86
+                A:1 = TALENT:TARGET:小悪魔
+                A:2 = GETVAR("TALENT:小悪魔")
+                SETVAR "TALENT:小悪魔", 3
+                A:3 = TALENT:0:86
+                RELATION:小悪魔 = 150
+                A:4 = RELATION:0:5514
+                A:5 = RELATION:0:小悪魔
+                MY_CDATA:SPECIAL_FLAG = 42
+                A:6 = MY_CDATA:0:7
+                A:7 = MY_CDATA:0:SPECIAL_FLAG
+                RETURN 0
+                """);
+
+        var options = CompilerOptions.Default with { UseERD = true };
+        GameData gameData = CsvGameDataLoader.Default.Load(vfs, options);
+        CompilerExternalContext ext = CompilerExternalContext.FromGameData(gameData, options.IgnoreCase);
+
+        ExecutedRun run = CompilerTestHarness.CompileAndRunVfs(vfs, options: options, external: ext, gameData: gameData);
+        Assert.Null(run.Engine.FaultException);
+        Assert.Equal(1L, run.GetInt("A", 0));
+        Assert.Equal(1L, run.GetInt("A", 1));
+        Assert.Equal(1L, run.GetInt("A", 2));
+        Assert.Equal(3L, run.GetInt("A", 3));
+        Assert.Equal(150L, run.GetInt("A", 4));
+        Assert.Equal(150L, run.GetInt("A", 5));
+        Assert.Equal(42L, run.GetInt("A", 6));
+        Assert.Equal(42L, run.GetInt("A", 7));
+    }
 }

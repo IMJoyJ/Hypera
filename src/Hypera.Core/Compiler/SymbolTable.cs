@@ -36,7 +36,8 @@ public sealed record CompilerExternalContext
 
         foreach (ErdDefinition erd in gameData.ErdDefinitions)
         {
-            erdLookup[(erd.VariableName.ToUpperInvariant(), erd.DimensionIndex)] = erd;
+            int normalizedDim = erd.DimensionIndex <= 0 ? 1 : erd.DimensionIndex;
+            erdLookup[(erd.VariableName.ToUpperInvariant(), normalizedDim)] = erd;
             foreach (string key in erd.NameToIndex.Keys)
             {
                 erdAllIdentifiers.Add(key);
@@ -51,24 +52,37 @@ public sealed record CompilerExternalContext
                 effectiveKeyword = aliased;
             }
 
-            // 1. User ERD definitions (1-based DimensionIndex in ErdDefinition or 0-based)
-            if (erdLookup.TryGetValue((varName.ToUpperInvariant(), dimIdx + 1), out ErdDefinition? erd1) && erd1.TryGetIndex(effectiveKeyword, out int idx1))
+            bool hasBuiltin = BuiltinVariableCatalog.TryGet(varName, ignoreCase: true, out BuiltinVariableSpec? spec) && spec is not null;
+            bool isBuiltinChara = hasBuiltin && spec!.IsCharaData;
+
+            // Dimension 0 of a character variable is always the runtime CHARANUM slot index, never a CSV/ERD/Chara keyword.
+            if (isBuiltinChara && dimIdx == 0)
             {
-                resolved = idx1;
+                resolved = 0;
+                return false;
+            }
+
+            // 1. User ERD definitions (1-based DimensionIndex: non-chara dimIdx 0->1, chara dimIdx 1->1)
+            int preferredErdDim = isBuiltinChara ? dimIdx : dimIdx + 1;
+            if (erdLookup.TryGetValue((varName.ToUpperInvariant(), preferredErdDim), out ErdDefinition? erdPreferred)
+                && erdPreferred.TryGetIndex(effectiveKeyword, out int idxPreferred))
+            {
+                resolved = idxPreferred;
                 return true;
             }
 
-            if (erdLookup.TryGetValue((varName.ToUpperInvariant(), dimIdx), out ErdDefinition? erd0) && erd0.TryGetIndex(effectiveKeyword, out int idx0))
+            if (!isBuiltinChara
+                && erdLookup.TryGetValue((varName.ToUpperInvariant(), dimIdx), out ErdDefinition? erdFallback)
+                && erdFallback.TryGetIndex(effectiveKeyword, out int idxFallback))
             {
-                resolved = idx0;
+                resolved = idxFallback;
                 return true;
             }
 
-            // 2. Built-in CSV *Name tables
-            if (BuiltinVariableCatalog.TryGet(varName, ignoreCase: true, out BuiltinVariableSpec? spec) && spec is not null)
+            // 2. Built-in CSV *Name tables & RELATION (Chara*.csv Name / CallName on dim 1 only)
+            if (hasBuiltin && spec is not null)
             {
-                // Character slot 0 on CHARADATA variables (or RELATION) can resolve character Name / CallName
-                if ((spec.IsCharaData && dimIdx == 0) || spec.Name.Equals("RELATION", StringComparison.OrdinalIgnoreCase))
+                if (spec.Name.Equals("RELATION", StringComparison.OrdinalIgnoreCase) && dimIdx == 1)
                 {
                     foreach ((int charaNo, CharacterTemplate tmpl) in gameData.Characters)
                     {
@@ -80,10 +94,18 @@ public sealed record CompilerExternalContext
                     }
                 }
 
-                string? tableKey = spec.AssociatedCsvNameTable;
+                string? tableKey = null;
                 if (spec.Name.Equals("CDFLAG", StringComparison.OrdinalIgnoreCase))
                 {
                     tableKey = dimIdx == 1 ? "CDFLAGNAME1" : dimIdx == 2 ? "CDFLAGNAME2" : null;
+                }
+                else if (spec.IsCharaData)
+                {
+                    tableKey = dimIdx == 1 ? spec.AssociatedCsvNameTable : null;
+                }
+                else if (dimIdx == 0)
+                {
+                    tableKey = spec.AssociatedCsvNameTable;
                 }
 
                 if (!string.IsNullOrEmpty(tableKey))

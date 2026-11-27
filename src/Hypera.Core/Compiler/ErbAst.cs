@@ -19,6 +19,7 @@ public sealed record StrLiteralExpr(string Value, SourceSpan Span)
     : ExprNode(VariableValueKind.Str, Span)
 {
     public VariableAccessExpr? ConstArraySource { get; init; }
+    public bool IsBareSubscriptIdentifier { get; init; }
 }
 
 public sealed record UnaryExpr(
